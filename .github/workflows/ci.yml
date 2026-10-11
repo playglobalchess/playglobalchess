@@ -58,7 +58,7 @@ jobs:
           # (warnings-as-errors, per engineering-conventions.md), tests. The test
           # suite includes this chunk's gate (FEN round-trip + perft(startpos,1)
           # == 20) and will grow into the full §8.1/§8.2 G-A corpus.
-          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
           cargo fmt --manifest-path engine/Cargo.toml --all -- --check
           cargo clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
