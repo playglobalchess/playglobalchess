@@ -33,6 +33,7 @@ Build each only after the prior gate it depends on is green. Propose, get approv
 
 ## 3. Where things live
 
+- `docs/ops/PROJECT-STATUS.md` — **read this first**: current phase, next step, infra/account state, outstanding human actions.
 - `docs/MASTER-PLAN.md` — authoritative plan (BRD, roadmap, ADRs, budgets, test/security/launch).
 - `docs/specs/Sx-…/` — your deep specs (write these first, approval-gated).
 - `docs/ops/` — operational runbooks (email/domain, etc.).
