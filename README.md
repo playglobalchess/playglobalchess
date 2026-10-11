@@ -35,3 +35,12 @@ Code and tickets reference the master IDs (`F-xx`, `X-x`, `G-A…F`, `ADR-x`). D
 > **`main` is protected by convention** (always PR, never direct/force push). Mechanical enforcement is pending a GitHub **Team** upgrade — see `CONTRIBUTING.md` §3.
 
 Status: **planning — P0 foundations.** Code folders are stubbed and awaiting their streams.
+
+## Working with Kiro (AI build agent)
+
+This repo is set up to be built with Kiro. Operating instructions live in `.kiro/steering/` and load automatically every session:
+- `00-build-manual.md` — scope, the spec-first/approval-gated workflow, critical-path build order.
+- `10-engineering-conventions.md` — architecture patterns, languages, coding standards, directory structure, testing.
+- `20-phases-and-gates.md` — phases, hard gates (G-A/B/C…), and Definition of Done.
+
+Use the project agent for build sessions: `kiro-cli chat --agent playglobalchess` (defined in `.kiro/agents/playglobalchess.json`; it loads the steering + `docs/MASTER-PLAN.md` and runs lifecycle hooks). The built-in default agent also auto-loads the steering files. The authoritative plan is always `docs/MASTER-PLAN.md`; steering summarizes and points to it.
