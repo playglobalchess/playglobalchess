@@ -1,0 +1,103 @@
+name: ci
+
+# Per-stream build/test. Each job is PATH-FILTERED and currently a STUB:
+# it runs only when its folder changes, and no-ops with a clear message until
+# that stream has a real build (Cargo.toml / package.json / Package.swift /
+# build.gradle). This keeps a green check honest — it never implies code was
+# tested when no build exists. Fill in the real steps as each stream lands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+      protocol: ${{ steps.filter.outputs.protocol }}
+      services: ${{ steps.filter.outputs.services }}
+      web: ${{ steps.filter.outputs.web }}
+      mobile: ${{ steps.filter.outputs.mobile }}
+      platform: ${{ steps.filter.outputs.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            engine: ['engine/**']
+            protocol: ['protocol/**']
+            services: ['services/**']
+            web: ['clients/web/**']
+            mobile: ['clients/ios/**', 'clients/android/**']
+            platform: ['platform/**']
+
+  engine:
+    needs: changes
+    if: ${{ needs.changes.outputs.engine == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test + conformance (G-A)
+        run: |
+          if [ -f engine/Cargo.toml ]; then
+            echo "TODO: cargo test --all && run perft/conformance corpus (G-A gate)"
+            # cargo test --manifest-path engine/Cargo.toml --all
+          else
+            echo "::notice::engine/ has no Cargo.toml yet — stub, no build. (S1 owns G-A.)"
+          fi
+
+  protocol:
+    needs: changes
+    if: ${{ needs.changes.outputs.protocol == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shared contract (schema lint + codegen check)
+        run: echo "::notice::protocol/ stub — add schema lint + client/server codegen drift check here."
+
+  services:
+    needs: changes
+    if: ${{ needs.changes.outputs.services == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test changed services
+        run: echo "::notice::services/ stub — per-service build/test (game-server, rating→G-C, anti-cheat→G-B, …)."
+
+  web:
+    needs: changes
+    if: ${{ needs.changes.outputs.web == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint + test + i18n-guard (NFR-11)
+        run: |
+          if [ -f clients/web/package.json ]; then
+            echo "TODO: npm ci && npm test && npm run i18n:check (no hard-coded strings)"
+          else
+            echo "::notice::clients/web/ has no package.json yet — stub, no build."
+          fi
+
+  mobile:
+    needs: changes
+    if: ${{ needs.changes.outputs.mobile == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test iOS/Android (shared Rust core — ADR-9)
+        run: echo "::notice::clients/{ios,android}/ stub — native build + shared-core FFI tests."
+
+  platform:
+    needs: changes
+    if: ${{ needs.changes.outputs.platform == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint CI tooling
+        run: python3 -c "import py_compile,glob,sys; [py_compile.compile(f,doraise=True) for f in glob.glob('platform/ci/*.py')]; print('platform/ci python compiles clean')"
