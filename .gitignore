@@ -1,0 +1,56 @@
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# ---- Rust (engine, services) ----
+target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# ---- Node / Web (clients/web, tooling) ----
+node_modules/
+dist/
+build/
+.next/
+*.log
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+coverage/
+
+# ---- Swift / iOS (clients/ios) ----
+clients/ios/**/.build/
+clients/ios/**/DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+
+# ---- Kotlin / Android (clients/android) ----
+clients/android/**/.gradle/
+clients/android/**/build/
+local.properties
+*.apk
+*.aab
+
+# ---- Python (tooling, scripts) ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# ---- Secrets / local env (NEVER commit) ----
+.env
+.env.*
+*.pem
+*.key
+secrets/
+*.local
+
+# ---- Build / infra artifacts ----
+*.tfstate
+*.tfstate.*
+.terraform/
