@@ -19,6 +19,10 @@
     "preToolUse": [
       { "matcher": "shell", "command": "bash .kiro/hooks/guard-protected-branch.sh" }
     ],
+    "postToolUse": [
+      { "matcher": "write|code", "command": "bash .kiro/hooks/engine-rust-check.sh" },
+      { "matcher": "write|code", "command": "bash .kiro/hooks/services-go-check.sh" }
+    ],
     "stop": [
       { "command": "echo 'Before ending: update the spec status, note IDs touched + tests run + open concerns, then propose the next critical-path item and wait for approval.'" }
     ]
