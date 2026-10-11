@@ -32,4 +32,6 @@ Read `docs/MASTER-PLAN.md`, then `docs/specs/README.md`, then `docs/specs/_share
 ## Conventions
 Code and tickets reference the master IDs (`F-xx`, `X-x`, `G-A…F`, `ADR-x`). Decisions beyond the master doc → add a new ADR in `docs/MASTER-PLAN.md`; never decide architecture locally. Nothing rated ships until gates G-A/G-B/G-C are green (MASTER §V.2); nothing public ships until the Part XII launch bar is met.
 
+> **`main` is protected by convention** (always PR, never direct/force push). Mechanical enforcement is pending a GitHub **Team** upgrade — see `CONTRIBUTING.md` §3.
+
 Status: **planning — P0 foundations.** Code folders are stubbed and awaiting their streams.

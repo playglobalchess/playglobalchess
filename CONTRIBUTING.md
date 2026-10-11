@@ -28,6 +28,8 @@ A change to a **shared contract** (`protocol/`, the event schema, the entity mod
 
 ## 3. Branching & commits
 
+> **`main` is protected by CONVENTION, not yet by enforcement.** GitHub branch protection and rulesets require the GitHub **Team** plan on a private repo; this org is on Free, so the guard is not yet mechanically enforced. **Rule until then: never push directly to `main`, never force-push it — always open a PR and merge through the UI.** (Agents are already blocked from pushing to `main` by the Kiro Crew safety policy.) When the org upgrades to Team, real protection — required PR, required CI, required CODEOWNERS review, no force-push/deletion — gets applied and this note goes away.
+
 - Branch from `main`: `feat/F-01-play-online`, `fix/X-2-reconnect`, `docs/adr-11-matchmaking`, `chore/ci`.
 - Never push directly to `main` — open a PR.
 - Commit messages reference the ID: `F-01.4: handle reconnect resync` / `ADR-11: add matchmaking algorithm decision`.
