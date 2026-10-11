@@ -570,6 +570,21 @@ Build **native UI** (SwiftUI/UIKit on iOS, Jetpack Compose on Android) over a **
 - *Why:* event-sourcing is the natural fit for chess (a game *is* an ordered event log) and gives replay/audit/anti-cheat for free; separating hot (Redis) / truth (events) / relational (PG) / analytics (columnar) keeps the play path fast and the query path rich without one store doing everything badly.
 - *Unblocks:* X-2, X-4, X-14, G-E; defines the storage contract every stream builds against.
 
+## ADR-11 (delegated) · Engine / shared-core language — **DECIDED: Rust**
+The chess engine (X-1) and the shared client core (ADR-9) are written in **Rust**. Decision delegated by the owner to Kiro and recorded here.
+- *Why:* memory safety without GC (no stop-the-world pause during a live game), C-comparable move-generation performance, and first-class FFI so the *same* engine binds into iOS (Swift) and Android (Kotlin) via UniFFI and compiles to the server — one authoritative rules implementation, three consumers (closes the NFR-5 drift risk). Strong test tooling for the perft corpus (G-A); reference crates exist (`shakmaty`, `cozy-chess`).
+- *Rejected:* C++ (max perf but unsafe + painful mobile FFI reuse, no memory-safety guarantee); Go (GC pauses unacceptable on the hot move path); any GC language for the engine.
+- *Unblocks:* S1 start, G-A. Build order: engine first.
+
+## ADR-12 (delegated) · Backend service language — **DECIDED: Go for services, Rust for engine/core**
+Backend **services** (game-server X-2, accounts/rating X-3/X-4, anti-cheat X-5, puzzles/content X-7/X-8) are written in **Go**; the engine/core stays Rust (ADR-11). Delegated to Kiro, recorded here.
+- *Why:* Go gives fast iteration, excellent concurrency for the real-time/WebSocket tier (goroutines map naturally to many concurrent live games), static-binary deployment, and a large hiring pool — ideal where throughput + developer velocity beat raw single-thread perf. The one perf- and correctness-critical component (the engine) stays Rust and is consumed by Go services across a thin FFI/gRPC boundary or sidecar.
+- *Rejected:* Rust everywhere (steeper, slower iteration for orchestration/CRUD services, smaller hiring pool — not worth it outside the engine); Node/JS for the real-time tier (GC + single-thread limits at IX.2 scale).
+- *Boundary rule:* a service NEVER reimplements chess logic — it calls the Rust engine. Rules logic in a Go service is a bug (violates NFR-5 single-source-of-truth).
+- *Unblocks:* S2/S3/S6/S7 service scaffolding.
+
+### ADR summary
+
 
 
 | ADR | Open | Decision | Status | Owner |
@@ -584,6 +599,8 @@ Build **native UI** (SwiftUI/UIKit on iOS, Jetpack Compose on Android) over a **
 | ADR-8 | OPEN-10 | Freemium membership; entitlements hook P0 | **DECIDED** | S8 |
 | ADR-9 | deferred | Native (Swift+Kotlin) over shared Rust core | **DECIDED** | S5/S1 |
 | ADR-10 | new | Postgres + event store + Redis + columnar; WS binary protocol | **DECIDED** | S2/S3 |
+| ADR-11 | delegated | Rust for engine + shared client core | **DECIDED** | S1/S5 |
+| ADR-12 | delegated | Go for services, Rust for engine/core | **DECIDED** | S2/S3/S6/S7 |
 
 ---
 
