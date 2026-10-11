@@ -23,14 +23,14 @@
 
 In Cloudflare → your domain → **DNS → Records**. Add these. **Set every mail record's proxy status to "DNS only" (grey cloud), NOT proxied (orange)** — mail must not go through Cloudflare's proxy.
 
-### MX (receive mail) — exact Zoho values
+### MX (receive mail) — India DC (`.zoho.in`), confirmed for this account
 | Type | Name | Mail server | Priority | Proxy |
 |---|---|---|---|---|
-| MX | `@` | `mx.zoho.com` | 10 | DNS only |
-| MX | `@` | `mx2.zoho.com` | 20 | DNS only |
-| MX | `@` | `mx3.zoho.com` | 50 | DNS only |
+| MX | `@` | `mx.zoho.in` | 10 | DNS only |
+| MX | `@` | `mx2.zoho.in` | 20 | DNS only |
+| MX | `@` | `mx3.zoho.in` | 50 | DNS only |
 
-> If your Zoho data center is EU/IN/AU, Zoho may give region-specific hosts (e.g. `mx.zoho.eu`, `mx.zoho.in`). **Use whatever the Zoho admin console shows for your account** — verify against the console, don't blindly trust this table.
+> This account is in Zoho's **India data center** (verification record resolved as `...zoho.in`), so the MX hosts are `.zoho.in`, not `.zoho.com`. Always confirm against the Zoho admin console.
 
 ### SPF (authorize senders) — TXT
 | Type | Name | Content |
@@ -92,3 +92,55 @@ The point of the domain email: company assets shouldn't hang off a personal addr
 - Propagation is usually minutes on Cloudflare; MX/DKIM can take up to a few hours.
 - Do **not** proxy (orange-cloud) any mail record.
 - When the app sends bulk/transactional mail, use a dedicated subdomain (e.g. `mail.playglobalchess.com`) and a sending provider so app-mail reputation is isolated from your human mailboxes — plan this in with the F-49 Notifications spec (S8).
+
+> **Data center = India (`.zoho.in`).** The verification record resolved as `...zmverify.zoho.in`, so this account lives in Zoho's India DC. Your **MX hosts are the `.in` variants** (`mx.zoho.in`, `mx2.zoho.in`, `mx3.zoho.in`), **not** the `.com` hosts in the MX table above. Always use exactly what the Zoho India-DC admin console shows.
+
+---
+
+## Phase 6 — Zoho Groups (shared addresses)
+
+A Zoho **Group** is a shared email address that delivers to multiple members, with: an **access level** (who may send to it), an optional **shared inbox** (Streams), and **moderation**. Create these in **Zoho Admin → Groups**. Getting the *access level* right per group is the important part.
+
+### Groups to create
+
+| Group address | Members | Access level (who can email it) | Shared inbox? | Purpose |
+|---|---|---|---|---|
+| `support@` | support/ops staff | **Anyone** (external users must reach it) | Yes | User help desk |
+| `abuse@` | S6 Trust & Safety | **Anyone** (external cheat/DMCA reports) | Yes | Fair-play / cheating / DMCA reports |
+| `security@` | S6 + eng leads | **Anyone** (responsible disclosure) | Yes | Vulnerability reports |
+| `legal@` | founder + legal | **Anyone** (GDPR/COPPA data requests — ADR-6) | Yes | Legal / compliance / data-subject requests |
+| `privacy@` | founder + legal | **Anyone** | Yes | (Optional alias of legal@ for GDPR data requests) |
+| `billing@` | founder/finance | **Organization only** | No | Vendor/billing (keep external spam out) |
+| `team@` | all staff | **Organization only** | No | Internal all-hands announcements |
+| `eng@` | all engineers | **Organization only** | No | Engineering-wide internal |
+| `dmarc@` | admin | **Anyone** (receives DMARC aggregate/forensic reports) | Yes (or auto-filter) | DMARC `rua`/`ruf` reports from §Phase 2 |
+| `noreply@` | — (no members) | **No delivery / send-only** | No | Outbound transactional FROM address (F-49). Create as an address that discards or auto-replies "unmonitored"; do NOT make it a real inbox people email. |
+
+### Per-stream internal groups (create as the team grows)
+Mirror the delivery streams so each squad has an internal list — matches the repo's `docs/specs/Sx-…/` ownership:
+
+| Group | Maps to |
+|---|---|
+| `engine@` | S1 Core Engine |
+| `realtime@` | S2 Real-time Play |
+| `platform-team@` | S3 Platform (name avoids clash with PE) |
+| `web@` | S4 Web |
+| `mobile@` | S5 Mobile |
+| `trust@` | S6 Trust & Safety |
+| `content@` | S7 Learn/Content |
+| `community@` | S8 Community/Watch/Commerce |
+
+> Keep these **Organization-only** access. Don't over-create on day one — add a stream group when that squad actually has members.
+
+### Access-level cheat sheet
+- **Anyone** → public-facing addresses that external users/attackers/regulators must reach: `support`, `abuse`, `security`, `legal`, `dmarc`.
+- **Organization only** → internal lists: `team`, `eng`, `billing`, all per-stream groups. Blocks external spam.
+- **Members only / Moderated** → use for a group where even internal non-members shouldn't post, or where you want a human to approve external mail (e.g. moderate `abuse@` if it gets spammy).
+- **Send-only / no inbox** → `noreply@` — it sends app mail but is not a destination.
+
+### Settings to set on each group
+- **Moderation:** off for internal; consider "moderate external senders" on high-spam public groups later.
+- **Streams (shared inbox):** on for `support`/`abuse`/`security`/`legal` so the team collaborates on threads instead of forwarding.
+- **Reply behavior:** reply-to the group for shared inboxes; reply-to-sender for announcement lists (`team@`).
+- **Anti-spoofing:** ensure SPF/DKIM/DMARC (Phase 2) are passing so inbound to these groups isn't easily spoofed.
+
