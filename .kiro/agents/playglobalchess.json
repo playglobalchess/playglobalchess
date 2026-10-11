@@ -17,7 +17,7 @@
       { "command": "echo '=== PlayGlobalChess ===' && git branch --show-current 2>/dev/null && git status -s | head -20 && echo '--- steering: .kiro/steering/ | plan: docs/MASTER-PLAN.md | workflow: SPEC-FIRST, approval-gated ---'" }
     ],
     "preToolUse": [
-      { "matcher": "shell", "command": "echo \"${KIRO_TOOL_INPUT:-}\" | grep -Eq 'git[[:space:]]+push' && echo 'GUARD: never push to main directly — push a feature branch and open a PR.' || true" }
+      { "matcher": "shell", "command": "bash .kiro/hooks/guard-protected-branch.sh" }
     ],
     "stop": [
       { "command": "echo 'Before ending: update the spec status, note IDs touched + tests run + open concerns, then propose the next critical-path item and wait for approval.'" }
