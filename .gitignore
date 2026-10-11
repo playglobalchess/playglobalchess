@@ -54,3 +54,9 @@ secrets/
 *.tfstate
 *.tfstate.*
 .terraform/
+
+# ---- KiroCrew local agent/CLI state (NOT project source) ----
+# Per-developer CLI config + lock written by the KiroCrew agent runtime.
+# The rest of .kiro/ (steering/, hooks/, agents/) IS tracked project infra —
+# only this per-user settings dir is machine-local and must stay out.
+.kiro/settings/
