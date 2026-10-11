@@ -1,0 +1,45 @@
+# CODEOWNERS — auto-requests the owning stream as reviewer per path.
+# Teams are placeholders in the @playglobalchess org; create them (Step: teams)
+# and add members. Until a team exists, GitHub ignores its entry (no error),
+# so this file is safe to commit now and "activate" as teams are created.
+#
+# Syntax: <path>  <owner(s)>.  Last matching rule wins.
+
+# ---- Default: platform-eng owns anything unclaimed ----
+*                                   @playglobalchess/platform-eng
+
+# ---- Docs: shared; each stream owns its own spec folder ----
+/docs/                              @playglobalchess/platform-eng
+/docs/MASTER-PLAN.md                @playglobalchess/architecture
+/docs/specs/S1-engine/             @playglobalchess/engine
+/docs/specs/S2-realtime/           @playglobalchess/realtime
+/docs/specs/S3-platform/           @playglobalchess/platform-team
+/docs/specs/S4-web/                @playglobalchess/web
+/docs/specs/S5-mobile/             @playglobalchess/mobile
+/docs/specs/S6-trust-safety/       @playglobalchess/trust-safety
+/docs/specs/S7-learn-content/      @playglobalchess/learn-content
+/docs/specs/S8-community-watch-commerce/  @playglobalchess/community
+/docs/specs/PE-platform-eng/       @playglobalchess/platform-eng
+
+# ---- Code: path → owning stream ----
+/engine/                            @playglobalchess/engine
+/protocol/                          @playglobalchess/architecture @playglobalchess/platform-eng
+/platform/                          @playglobalchess/platform-eng
+/clients/web/                       @playglobalchess/web
+/clients/ios/                       @playglobalchess/mobile
+/clients/android/                   @playglobalchess/mobile
+/services/game-server/              @playglobalchess/realtime
+/services/accounts/                 @playglobalchess/platform-team
+/services/rating/                   @playglobalchess/platform-team
+/services/anti-cheat/               @playglobalchess/trust-safety
+/services/puzzles/                  @playglobalchess/learn-content
+/services/content/                  @playglobalchess/learn-content
+
+# ---- Cross-cutting mandatory reviewers ----
+# Anything touching rated-play fairness → S6 has review (fair-play veto, per CONTRIBUTING).
+/services/rating/                   @playglobalchess/platform-team @playglobalchess/trust-safety
+/services/anti-cheat/               @playglobalchess/trust-safety
+
+# ---- Repo-wide guards ----
+/.github/                           @playglobalchess/platform-eng
+/CONTRIBUTING.md                    @playglobalchess/architecture
