@@ -1,0 +1,29 @@
+[package]
+name = "pgc-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "PlayGlobalChess core chess rules engine (X-1). Standard chess: board representation, position model, FEN, perft. Spec: docs/specs/S1-engine/ENGINE-CORE.md (SPEC-S1-ENGINE-CORE)."
+license = "UNLICENSED"
+publish = false
+
+# OPEN-A (ENGINE-CORE §10): own bitboard implementation (owner-decided), not a
+# wrapped reference crate. Reference crates (shakmaty/cozy-chess) are reserved
+# for differential testing only (§8.7) and are NOT runtime dependencies.
+[dependencies]
+thiserror = "1.0.69"   # library error types per engineering-conventions.md
+
+[dev-dependencies]
+# Property-based testing for the §8.6 round-trip properties (FEN/UCI/SAN,
+# make/unmake inverse). Pinned per "pin dependency versions" convention.
+proptest = "1.5.0"
+
+[lib]
+name = "pgc_engine"
+path = "src/lib.rs"
+
+# Correctness before speed (§1.4.3), but perft/benches need release opt levels
+# to hit the sub-ms targets (§6.1) when that work lands in later chunks.
+[profile.release]
+opt-level = 3
+lto = "thin"
