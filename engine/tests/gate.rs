@@ -12,7 +12,7 @@ use proptest::prelude::*;
 /// Gate 2: the opening position has exactly 20 legal moves.
 #[test]
 fn gate_perft_startpos_depth_1() {
-    assert_eq!(perft(&Position::startpos(), 1), 20);
+    assert_eq!(perft(&mut Position::startpos(), 1), 20);
 }
 
 /// Gate 1 (fixed cases): round-trip a representative set of FENs through
@@ -48,7 +48,7 @@ fn gate_fen_roundtrip_fixed_positions() {
 // which is a stronger generator than random piece scatter (which could place
 // two kings in check, etc.).
 
-use pgc_engine::{legal_moves, movegen::apply_move};
+use pgc_engine::{legal_moves, make, movegen::apply_move, unmake};
 
 prop_compose! {
     fn random_reachable_position(max_plies: usize)(seed in any::<u64>()) -> Position {
@@ -88,7 +88,22 @@ proptest! {
     #[test]
     fn prop_perft_1_equals_legal_move_count(pos in random_reachable_position(30)) {
         // §8.6 cheap cross-check: perft(p,1) == legal_moves(p).len().
-        prop_assert_eq!(perft(&pos, 1), legal_moves(&pos).len() as u64);
+        let n = legal_moves(&pos).len() as u64;
+        let mut p = pos;
+        prop_assert_eq!(perft(&mut p, 1), n);
+    }
+
+    /// Stage 2a (§3.6): make/unmake is a perfect inverse — `unmake(make(p,m))
+    /// == p` for every legal move from a reachable position, bit-for-bit.
+    #[test]
+    fn prop_make_unmake_is_inverse(pos in random_reachable_position(40)) {
+        let before = pos.clone();
+        let mut p = pos;
+        for &m in legal_moves(&before).iter() {
+            let undo = make(&mut p, m);
+            unmake(&mut p, m, undo);
+            prop_assert_eq!(&p, &before, "make/unmake not inverse for move {}", m.to_uci());
+        }
     }
 }
 
@@ -102,8 +117,8 @@ proptest! {
 /// localisation) is wired as the dedicated G-A conformance suite in chunk 2.
 #[test]
 fn smoke_perft_startpos_shallow() {
-    assert_eq!(perft(&Position::startpos(), 2), 400);
-    assert_eq!(perft(&Position::startpos(), 3), 8902);
+    assert_eq!(perft(&mut Position::startpos(), 2), 400);
+    assert_eq!(perft(&mut Position::startpos(), 3), 8902);
 }
 
 #[test]

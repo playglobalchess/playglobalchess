@@ -1,25 +1,27 @@
 //! Move generation — pseudo-legal generation then a legality filter
 //! (ENGINE-CORE §3.5).
 //!
-//! # Scope for this chunk (chunk 1 of 4 toward G-A)
+//! # Scope (chunk 2 stage 2a toward G-A)
 //! This module implements the **two-stage design of §3.5** end to end — all six
-//! piece types, castling, en passant, and promotion — because the gate
-//! `perft(startpos, 1) == 20` cannot be met honestly without a real generator.
-//! It is deliberately the **simple, correct** form §3.5 prescribes ("the
-//! clearest correct design; optimize later only if perft timing demands"):
-//! pseudo-legal + make/unmake + `is_square_attacked`, no magic bitboards and no
-//! pin-aware fast path.
+//! piece types, castling, en passant, and promotion — plus **make/unmake with
+//! an [`Undo`] token** (§3.6), a perfect inverse (`unmake(make(p,m)) == p`,
+//! property-tested). It is deliberately the **simple, correct** form §3.5
+//! prescribes ("the clearest correct design; optimize later only if perft
+//! timing demands"): pseudo-legal + make/unmake + `is_square_attacked`, no
+//! magic bitboards and no pin-aware fast path. The legality filter still uses
+//! copy-make ([`apply_move`] = `make` with the `Undo` discarded, over a clone),
+//! which is correct because it tests a king-safety predicate, not a hot loop.
 //!
-//! What is **explicitly deferred to chunk 2** (NOT claimed verified here):
+//! What is **still deferred** (NOT claimed verified here):
 //! - the full §8.1 perft corpus (Kiwipete / Positions 3–6 at depth 5–6) and
-//!   perft parity at depth ≥ 2;
+//!   perft parity at depth ≥ 2 [stage 2b];
 //! - the exhaustive E-1..E-14 edge-case assertions (§8.2), incl. the horizontal
-//!   ep-pin (E-2) and the castling-through-check matrix (E-4/E-5);
-//! - SAN encode/decode (§4.2), magic bitboards, and the §6.1 benchmarks.
+//!   ep-pin (E-2) and the castling-through-check matrix (E-4/E-5) [stage 2c];
+//! - game-end/draw detection + Zobrist (§3.7) [stage 2d], SAN (§4.2) [stage 2e];
+//! - magic bitboards and the §6.1 benchmarks [later chunk].
 //!
-//! Only `perft(startpos, 1) == 20` and the FEN round-trip are gated now; deeper
-//! correctness is proven when the corpus lands. The code is structured so
-//! chunk 2 extends it rather than replacing it.
+//! Gated now: `perft(startpos, 1) == 20`, the FEN round-trip, and the
+//! make/unmake inverse. Deeper correctness is proven when the corpus lands.
 
 use crate::bitboard::BitIter;
 use crate::castling::CastlingRights;
@@ -324,31 +326,74 @@ pub fn legal_moves(pos: &Position) -> MoveList {
     legal
 }
 
-/// Apply a move to a position in place (copy-make target). Handles captures,
-/// en passant, castling rook movement, promotion, and all FEN-carried state
-/// updates (castling-right loss, ep target, clocks, side-to-move, fullmove).
+/// Apply a move to a position in place (copy-make convenience). A thin wrapper
+/// over [`make`] that discards the [`Undo`] token — for immutable-style callers
+/// (clients, the legality filter) that clone first and never roll back
+/// (ENGINE-CORE §3.6 / OPEN-C "copy-make for clients").
 ///
-/// Precondition: `m` is pseudo-legal for `pos`. This is the §3.5 "make" used by
-/// the legality filter and perft skeleton this chunk; the returning
-/// `make -> Undo` / `unmake` pair (§3.6) is chunk 2.
+/// Precondition: `m` is pseudo-legal for `pos`.
 pub fn apply_move(pos: &mut Position, m: Move) {
+    let _ = make(pos, m);
+}
+
+/// The information [`unmake`] needs to restore a position to exactly its state
+/// before [`make`] (ENGINE-CORE §3.6). Everything `make` destroys is captured
+/// here so `unmake(make(p,m)) == p` holds bit-for-bit.
+#[derive(Debug, Clone, Copy)]
+pub struct Undo {
+    /// Piece captured by this move (normal or en passant), with the square it
+    /// stood on — restored on unmake. `None` for a non-capture.
+    captured: Option<(Square, Piece)>,
+    /// The moving piece *as it was before the move* (pre-promotion type), so a
+    /// promotion is undone by putting the pawn back, not the promoted piece.
+    moved: Piece,
+    /// Position scalars as they were before `make`.
+    prev_castling: CastlingRights,
+    prev_ep: Option<Square>,
+    prev_halfmove: u16,
+    prev_fullmove: u32,
+}
+
+/// Make a move in place and return the [`Undo`] token to reverse it
+/// (ENGINE-CORE §3.6 — the perft / S2-validation hot path). Handles captures,
+/// en passant, castling rook movement, promotion, and every FEN-carried state
+/// update (castling-right loss, ep target, clocks, side-to-move, fullmove).
+///
+/// Precondition: `m` is pseudo-legal for `pos`. `make` + `unmake` are a perfect
+/// inverse — asserted by the `unmake(make(p,m)) == p` property test (§8.6).
+pub fn make(pos: &mut Position, m: Move) -> Undo {
     let us = pos.side_to_move;
     let them = us.flip();
     let mover = pos.piece_at(m.from).expect("move from an occupied square");
     let is_pawn = mover.kind == PieceType::Pawn;
-    let prev_ep = pos.ep_target;
+
+    let undo = Undo {
+        captured: None, // filled below if a capture occurs
+        moved: mover,
+        prev_castling: pos.castling_rights,
+        prev_ep: pos.ep_target,
+        prev_halfmove: pos.halfmove_clock,
+        prev_fullmove: pos.fullmove_number,
+    };
+    let prev_ep = undo.prev_ep;
 
     // En-passant capture: the captured pawn is behind the destination square.
+    let mut captured_sq_piece: Option<(Square, Piece)> = None;
     let mut captured = pos.piece_at(m.to);
     if is_pawn && Some(m.to) == prev_ep && captured.is_none() {
         let cap_rank = m.from.rank(); // captured pawn shares the mover's rank
         let cap_sq = Square::from_file_rank(m.to.file(), cap_rank).expect("ep captured square");
-        captured = pos.take_piece(cap_sq);
+        if let Some(p) = pos.take_piece(cap_sq) {
+            captured = Some(p);
+            captured_sq_piece = Some((cap_sq, p));
+        }
     }
 
     // Remove any piece on the destination (normal capture).
-    if captured.is_some() && pos.piece_at(m.to).is_some() {
-        pos.take_piece(m.to);
+    if captured.is_some() && captured_sq_piece.is_none() {
+        if let Some(p) = pos.take_piece(m.to) {
+            captured_sq_piece = Some((m.to, p));
+        }
     }
 
     // Move the piece (promotion swaps the piece type on arrival).
@@ -408,7 +453,61 @@ pub fn apply_move(pos: &mut Position, m: Move) {
         pos.debug_check();
         true
     });
-    let _ = them;
+
+    Undo {
+        captured: captured_sq_piece,
+        ..undo
+    }
+}
+
+/// Reverse a [`make`] using its [`Undo`] token, restoring the position exactly
+/// (ENGINE-CORE §3.6). Precondition: `undo` was produced by `make(pos, m)` and
+/// `pos` has not changed since — the perfect inverse the §8.6 property asserts.
+pub fn unmake(pos: &mut Position, m: Move, undo: Undo) {
+    // The side that *made* the move is the opposite of the current side to move
+    // (make flipped it). Restore turn first so helpers read the right color.
+    let us = pos.side_to_move.flip();
+
+    // Lift the arrived piece off the destination (promoted piece or the mover).
+    pos.take_piece(m.to);
+    // Put the original moving piece back on its from-square (undoes promotion:
+    // `undo.moved` is the pre-promotion pawn).
+    pos.put_piece(m.from, undo.moved);
+
+    // Undo castling rook movement (king moved two files).
+    if undo.moved.kind == PieceType::King {
+        let delta = m.to.file() as i8 - m.from.file() as i8;
+        let rank = m.from.rank();
+        if delta == 2 {
+            // king side: rook f->h
+            if let Some(r) = pos.take_piece(Square::from_file_rank(5, rank).unwrap()) {
+                pos.put_piece(Square::from_file_rank(7, rank).unwrap(), r);
+            }
+        } else if delta == -2 {
+            // queen side: rook d->a
+            if let Some(r) = pos.take_piece(Square::from_file_rank(3, rank).unwrap()) {
+                pos.put_piece(Square::from_file_rank(0, rank).unwrap(), r);
+            }
+        }
+    }
+
+    // Restore any captured piece on the square it stood on (ep restores it on
+    // the pawn's square, not the destination — hence the stored square).
+    if let Some((sq, piece)) = undo.captured {
+        pos.put_piece(sq, piece);
+    }
+
+    // Restore scalars and turn.
+    pos.castling_rights = undo.prev_castling;
+    pos.ep_target = undo.prev_ep;
+    pos.halfmove_clock = undo.prev_halfmove;
+    pos.fullmove_number = undo.prev_fullmove;
+    pos.side_to_move = us;
+
+    debug_assert!({
+        pos.debug_check();
+        true
+    });
 }
 
 /// Clear castling rights invalidated by this move (ENGINE-CORE E-6).
@@ -490,5 +589,59 @@ mod tests {
             let pc = p.piece_at(m.from).unwrap();
             assert!(matches!(pc.kind, PieceType::Pawn | PieceType::Knight));
         }
+    }
+
+    /// make/unmake round-trips every legal move of a hand-built position back to
+    /// the exact starting state (§3.6). Used to pin special-move paths the
+    /// random reachable-position generator may not reliably reach.
+    fn assert_make_unmake_restores(fen: &str) {
+        let base = Position::from_fen(fen).expect("valid test FEN");
+        for &m in legal_moves(&base).iter() {
+            let mut p = base.clone();
+            let undo = make(&mut p, m);
+            unmake(&mut p, m, undo);
+            assert_eq!(
+                p,
+                base,
+                "make/unmake not inverse for {} in {fen}",
+                m.to_uci()
+            );
+        }
+    }
+
+    #[test]
+    fn make_unmake_inverse_en_passant() {
+        // White pawn e5, Black just played d7-d5 → ep target d6, exd6 ep available.
+        assert_make_unmake_restores("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3");
+    }
+
+    #[test]
+    fn make_unmake_inverse_promotion_and_capture() {
+        // White pawn b7 can push b8=Q/R/B/N or capture axb8/cxb8 with promotion.
+        assert_make_unmake_restores("r1b1k2r/pPp5/8/8/8/8/8/4K3 w kq - 0 1");
+    }
+
+    #[test]
+    fn make_unmake_inverse_castling_both_sides() {
+        // White may castle both sides; exercises the rook-movement undo path.
+        assert_make_unmake_restores("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+    }
+
+    #[test]
+    fn make_unmake_inverse_rook_capture_loses_right() {
+        // Rook capture of a home rook clears a castling right (E-6); unmake must
+        // restore it. White rook a7 can play Rxa8, capturing Black's a8 rook and
+        // clearing Black's queen-side right — verified to be a real capture.
+        let fen = "r3k3/R7/8/8/8/8/8/4K3 w q - 0 1";
+        let base = Position::from_fen(fen).unwrap();
+        let a8 = Square::from_coord("a8").unwrap();
+        let has_rook_capture = legal_moves(&base)
+            .iter()
+            .any(|m| m.to == a8 && base.piece_at(a8).is_some());
+        assert!(
+            has_rook_capture,
+            "test FEN must offer the Rxa8 rook capture"
+        );
+        assert_make_unmake_restores(fen);
     }
 }

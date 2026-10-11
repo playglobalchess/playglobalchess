@@ -15,7 +15,7 @@
 //! paths, never game outcomes: it does **not** short-circuit on checkmate,
 //! stalemate, or any draw (§8.1).
 
-use crate::movegen::{apply_move, legal_moves};
+use crate::movegen::{legal_moves, make, unmake};
 use crate::moves::Move;
 use crate::position::Position;
 
@@ -23,8 +23,13 @@ use crate::position::Position;
 ///
 /// `perft(pos, 0) == 1` (the position itself is the single leaf). Draw/mate
 /// detection is intentionally ignored — perft counts reachable move paths only.
+///
+/// Uses make/unmake (§3.6) on a single mutable position — the zero-allocation
+/// hot path — rather than cloning per node. `pos` is restored exactly on
+/// return (every `make` is paired with its `unmake`), so the `&mut` is an
+/// internal optimization invisible to callers.
 #[must_use]
-pub fn perft(pos: &Position, depth: u32) -> u64 {
+pub fn perft(pos: &mut Position, depth: u32) -> u64 {
     if depth == 0 {
         return 1;
     }
@@ -36,9 +41,9 @@ pub fn perft(pos: &Position, depth: u32) -> u64 {
     }
     let mut nodes = 0u64;
     for &m in moves.iter() {
-        let mut child = pos.clone();
-        apply_move(&mut child, m);
-        nodes += perft(&child, depth - 1);
+        let undo = make(pos, m);
+        nodes += perft(pos, depth - 1);
+        unmake(pos, m, undo);
     }
     nodes
 }
@@ -46,16 +51,18 @@ pub fn perft(pos: &Position, depth: u32) -> u64 {
 /// Per-root-move perft breakdown (ENGINE-CORE §4.4). For each legal move from
 /// `pos`, the number of leaf nodes under it at `depth`. `depth == 0` yields an
 /// empty vector (no root moves counted). Used to localize mismatches.
+///
+/// Restores `pos` exactly on return (make/unmake paired per root move).
 #[must_use]
-pub fn perft_divide(pos: &Position, depth: u32) -> Vec<(Move, u64)> {
+pub fn perft_divide(pos: &mut Position, depth: u32) -> Vec<(Move, u64)> {
     if depth == 0 {
         return Vec::new();
     }
     let mut out = Vec::new();
     for &m in legal_moves(pos).iter() {
-        let mut child = pos.clone();
-        apply_move(&mut child, m);
-        let count = perft(&child, depth - 1);
+        let undo = make(pos, m);
+        let count = perft(pos, depth - 1);
+        unmake(pos, m, undo);
         out.push((m, count));
     }
     out
@@ -67,28 +74,43 @@ mod tests {
 
     #[test]
     fn perft_depth_0_is_one() {
-        assert_eq!(perft(&Position::startpos(), 0), 1);
+        assert_eq!(perft(&mut Position::startpos(), 0), 1);
     }
 
     /// This chunk's gate: `perft(startpos, 1) == 20`.
     #[test]
     fn perft_startpos_depth_1_is_20() {
-        assert_eq!(perft(&Position::startpos(), 1), 20);
+        assert_eq!(perft(&mut Position::startpos(), 1), 20);
     }
 
     #[test]
     fn perft_divide_sums_to_perft() {
         // At depth 1 each root move contributes exactly 1 leaf, so the divide
         // has 20 entries each counting 1, summing to perft(_,1) = 20.
-        let p = Position::startpos();
-        let divide = perft_divide(&p, 1);
+        let mut p = Position::startpos();
+        let divide = perft_divide(&mut p, 1);
         assert_eq!(divide.len(), 20);
         let sum: u64 = divide.iter().map(|(_, n)| n).sum();
-        assert_eq!(sum, perft(&p, 1));
+        assert_eq!(sum, perft(&mut p, 1));
     }
 
     #[test]
     fn perft_divide_depth_0_is_empty() {
-        assert!(perft_divide(&Position::startpos(), 0).is_empty());
+        assert!(perft_divide(&mut Position::startpos(), 0).is_empty());
+    }
+
+    /// make/unmake inside perft must leave the root position untouched (§3.6):
+    /// a deeper perft run restores `pos` exactly, so a FEN snapshot is stable.
+    #[test]
+    fn perft_restores_root_position() {
+        let mut p = Position::startpos();
+        let before = p.to_fen();
+        let _ = perft(&mut p, 3);
+        assert_eq!(
+            p.to_fen(),
+            before,
+            "perft did not restore the root position"
+        );
+        assert_eq!(p, Position::startpos());
     }
 }

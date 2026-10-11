@@ -13,16 +13,22 @@
 //!   target, strict exported FEN.
 //! - A **pseudo-legal + legality-filter** move generator (§3.5) — the simple,
 //!   correct form; sufficient to make the chunk gate green.
-//! - The **perft harness skeleton** (§4.4): [`perft`] and [`perft_divide`].
+//! - **make/unmake** with an [`Undo`] token (§3.6, chunk 2 stage 2a): the
+//!   zero-clone perft / validation hot path, a perfect inverse
+//!   (`unmake(make(p,m)) == p`, property-tested). [`movegen::apply_move`] is
+//!   the copy-make convenience over it.
+//! - The **perft harness** (§4.4): [`perft`] and [`perft_divide`], now driven
+//!   by make/unmake on a single mutable position.
 //!
-//! Gated now: the FEN round-trip property (`parse_fen(to_fen(p)) == p`, §8.6)
-//! and `perft(startpos, 1) == 20`.
+//! Gated now: the FEN round-trip property (`parse_fen(to_fen(p)) == p`, §8.6),
+//! `perft(startpos, 1) == 20`, and the make/unmake inverse (§8.6).
 //!
-//! **Deferred to later chunks (NOT yet verified):** the full §8.1 perft corpus
-//! (Kiwipete / Positions 3–6, deep perft), the E-1..E-14 edge-case corpus
-//! (§8.2), game-end/draw detection (§3.7), SAN (§4.2), make/unmake with `Undo`
-//! (§3.6), Zobrist/repetition (§3.7, OPEN-B), magic bitboards, benchmarks
-//! (§6.1), and mobile parity (§8.8). The variant seam (§3.9) is forward-looking.
+//! **Deferred to later chunk-2 stages / chunks (NOT yet verified):** the full
+//! §8.1 perft corpus (Kiwipete / Positions 3–6, deep perft) [2b], the
+//! E-1..E-14 edge-case corpus (§8.2) [2c], game-end/draw detection + Zobrist
+//! (§3.7, OPEN-B) [2d], SAN (§4.2) [2e]; and in later chunks: magic bitboards,
+//! benchmarks (§6.1), full golden replay (§8.5), mobile parity (§8.8). The
+//! variant seam (§3.9) is forward-looking.
 //!
 //! Design tenets honored: pure, deterministic, no RNG / clock / global state
 //! (§1.4.1); stable move order by (from, to, promotion) (§3.8).
@@ -46,7 +52,9 @@ pub mod types;
 
 pub use castling::CastlingRights;
 pub use fen::{parse_fen, to_fen, FenError};
-pub use movegen::{is_in_check, is_square_attacked, legal_moves, pseudo_legal_moves};
+pub use movegen::{
+    is_in_check, is_square_attacked, legal_moves, make, pseudo_legal_moves, unmake, Undo,
+};
 pub use moves::{Move, MoveList};
 pub use perft::{perft, perft_divide};
 pub use position::Position;
