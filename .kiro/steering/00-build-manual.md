@@ -12,6 +12,7 @@ You are building **PlayGlobalChess**, a competitive chess platform (web + iOS + 
 - **Make no silent assumptions.** If scope, tech, priority, or a rule is unclear or missing, STOP and ask the owner. A wrong assumption in a multi-year build is expensive.
 - **One source of truth.** Reference master IDs (`F-xx`, `X-x`, `G-A…G-F`, `ADR-x`, `NFR-x`); never invent IDs or redefine them. A new architecture decision = a new ADR appended to `docs/MASTER-PLAN.md`, approved, then implemented — never decided ad hoc in code.
 - **Gates are hard.** Nothing rated ships until **G-A** (engine correct), **G-B** (fair-play baseline), **G-C** (rating integrity) are green. Nothing public ships until the **Part XII launch bar** is met.
+- **Recursive self-review (MANDATORY).** At the start of every new session and after every unit of work, do a critical self-review before declaring done: (1) **state your concerns** — correctness traps, internal contradictions, unverified assumptions, gaps against the master plan, risks; (2) **fix each one** you can; (3) **repeat** — re-read the result and surface new concerns the fixes introduced — looping until you reach diminishing returns (a pass that finds nothing material). Do this on your own initiative, not only when asked. Verify facts (run it, cite it) rather than asserting them; don't present an assumption as settled. See §4 for how to close out.
 
 ## 1. Scope in one screen (detail: MASTER §I–III)
 
@@ -41,4 +42,11 @@ Build each only after the prior gate it depends on is green. Propose, get approv
 
 ## 4. When you finish a unit of work
 
-State what you did, the IDs touched, tests run, and open concerns. Update the spec status. If you changed behavior, update the spec. If you made/need an architecture decision, write/propose the ADR. Then propose the next critical-path item and wait for approval.
+First run the **recursive self-review** from §0: state your concerns, fix them, and loop until diminishing returns. Then update the spec status; if you changed behavior, update the spec; if you made or need an architecture decision, write/propose the ADR.
+
+Close out with a **final summary** that states:
+1. **What was done** — the work, the master IDs touched (`F-xx`/`X-x`/`ADR-x`/`G-x`/`NFR-x`), and how it was verified (tests run, facts checked/cited; or an explicit note that it could not be verified and why).
+2. **Concerns you could not fix** — anything unresolved after the self-review loop, and why.
+3. **Human intervention needed** — approvals (specs are approval-gated), owner-only decisions, external/infra actions, or anything on the `docs/ops/PROJECT-STATUS.md` outstanding list.
+
+Then propose the next critical-path item and wait for approval.
