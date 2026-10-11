@@ -10,6 +10,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly slow-tier run (ENGINE-CORE §8.8): the #[ignore]d deep perft corpus
+    # (startpos d6, Kiwipete d5, …) — hundreds of millions of nodes, too slow
+    # for the per-commit path. 03:17 UTC daily (off-peak, jittered minute).
+    - cron: "17 3 * * *"
 
 # dorny/paths-filter calls the GitHub API to list a PR's changed files, which
 # needs pull-requests:read. The default GITHUB_TOKEN is otherwise minimal, so
@@ -63,6 +68,24 @@ jobs:
           cargo fmt --manifest-path engine/Cargo.toml --all -- --check
           cargo clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
           cargo test --manifest-path engine/Cargo.toml --all
+
+  # Nightly ONLY (schedule event): the slow #[ignore]d perft tier (§8.8) — the
+  # full §8.1 target depths (startpos d6=119,060,324; Kiwipete d5=193,690,690;
+  # Positions 3–6 d5–d6). Hundreds of millions of nodes; minutes-long; never on
+  # the per-commit path. Independent of `changes` because a scheduled run has no
+  # PR for paths-filter to inspect.
+  engine-nightly-perft:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Slow perft corpus (--ignored, G-A pre-gate)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          # --release so the deep perft finishes in reasonable CI time (§6.1
+          # opt levels); -- --ignored runs ONLY the slow-tier corpus tests.
+          cargo test --manifest-path engine/Cargo.toml --release --test perft_corpus -- --ignored --nocapture
 
   protocol:
     needs: changes
