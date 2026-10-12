@@ -17,10 +17,19 @@ thiserror = "1.0.69"   # library error types per engineering-conventions.md
 # Property-based testing for the §8.6 round-trip properties (FEN/UCI/SAN,
 # make/unmake inverse). Pinned per "pin dependency versions" convention.
 proptest = "1.5.0"
+# Micro-benchmarks for the §6.1 performance gate (legal_moves < 1 ms,
+# is_legal < 10 µs). Statistics-driven, release build, median of N.
+criterion = "0.5.1"
 
 [lib]
 name = "pgc_engine"
 path = "src/lib.rs"
+
+# §6.1 performance benches (NFR-1 / G-A sub-ms move gen). `harness = false` so
+# criterion's own main() runs instead of libtest. Run: cargo bench.
+[[bench]]
+name = "movegen"
+harness = false
 
 # Correctness before speed (§1.4.3), but perft/benches need release opt levels
 # to hit the sub-ms targets (§6.1) when that work lands in later chunks.

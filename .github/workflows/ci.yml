@@ -87,6 +87,25 @@ jobs:
           # opt levels); -- --ignored runs ONLY the slow-tier corpus tests.
           cargo test --manifest-path engine/Cargo.toml --release --test perft_corpus -- --ignored --nocapture
 
+  # Nightly ONLY: the §6.1 performance benches (NFR-1 / G-A sub-ms move gen).
+  # criterion runs are seconds-long and noisy on shared runners, so they are
+  # kept off the per-commit path. check_bench.py fails the job on a regression
+  # past the §6.1 ceilings (legal_moves < 1 ms, is_legal < 10 µs).
+  engine-perf-bench:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bench + §6.1 threshold check
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo bench --manifest-path engine/Cargo.toml --bench movegen
+          python3 platform/ci/check_bench.py
+
   protocol:
     needs: changes
     if: ${{ needs.changes.outputs.protocol == 'true' }}
