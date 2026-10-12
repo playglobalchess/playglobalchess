@@ -67,6 +67,23 @@ fn de_exact<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T, Code
     Ok(value)
 }
 
+/// Validate every entry of a decoded `result_vector` against the frozen §4A.3
+/// domain (`0`/`1`/`2`). Rejects an out-of-contract byte with a typed error
+/// rather than passing garbage to the server/clients (§8). Shared by the
+/// GAME_END wire message and the GameEnded event.
+fn check_result_vector(rv: &[u8]) -> Result<(), CodecError> {
+    if let Some(bad) = rv
+        .iter()
+        .copied()
+        .find(|&v| !crate::types::is_known_result(v))
+    {
+        return Err(CodecError::MalformedPayload(format!(
+            "result_vector entry 0x{bad:02x} is not a frozen result value (0=loss,1=draw,2=win)"
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble a frame from its header bytes and a payload, enforcing the §4A.1
 /// 4 KB cap against the ACTUAL encoded size (PLAN-CODEC §3).
 fn frame(ver: u8, type_code: u8, payload: Vec<u8>) -> Result<Vec<u8>, CodecError> {
@@ -302,6 +319,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, CodecError> {
                     p.termination.value()
                 )));
             }
+            check_result_vector(&p.result_vector)?;
             Ok(ServerMsg::GameEnd {
                 game_id: p.game_id,
                 result_vector: p.result_vector,
@@ -452,6 +470,16 @@ fn decode_event_body(type_byte: u8, bytes: &[u8]) -> Result<GameEvent, CodecErro
     // so we compare the raw byte against each frozen value's `.value()`.
     let ev = if type_byte == EventType::GameCreated.value() {
         let b: GameCreatedBody = de_exact(bytes)?;
+        if let Some(bad) = b
+            .seats
+            .iter()
+            .map(|s| s.color)
+            .find(|&c| !crate::types::is_known_color(c))
+        {
+            return Err(CodecError::MalformedPayload(format!(
+                "seat color 0x{bad:02x} is not a frozen v1 color value (0=white,1=black)"
+            )));
+        }
         GameEvent::GameCreated {
             pool_id: b.pool_id,
             rated: b.rated,
@@ -510,6 +538,7 @@ fn decode_event_body(type_byte: u8, bytes: &[u8]) -> Result<GameEvent, CodecErro
                 b.termination.value()
             )));
         }
+        check_result_vector(&b.result_vector)?;
         GameEvent::GameEnded {
             result_vector: b.result_vector,
             termination: b.termination,

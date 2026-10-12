@@ -235,6 +235,14 @@ pub const RESULT_DRAW: SeatResult = 1;
 /// `win` result-vector value (§4A.3).
 pub const RESULT_WIN: SeatResult = 2;
 
+/// True iff `v` is a frozen `result_vector` value (`0`/`1`/`2`, §4A.3). The
+/// decode path uses this to reject an out-of-domain result byte — the same
+/// "reject rather than accept garbage" rule the enum8 tables get (§8), applied
+/// to this closed-domain `[u8]` field (a mis-decoded result mis-rules a game).
+pub fn is_known_result(v: SeatResult) -> bool {
+    matches!(v, RESULT_LOSS | RESULT_DRAW | RESULT_WIN)
+}
+
 /// `color` value inside `GameCreated.seats` (§4A.8): `0 = white, 1 = black`
 /// (N-seat variants extend). Raw `u8` to pin the wire byte.
 pub type Color = u8;
@@ -243,6 +251,16 @@ pub type Color = u8;
 pub const COLOR_WHITE: Color = 0;
 /// Black color value (§4A.8).
 pub const COLOR_BLACK: Color = 1;
+
+/// True iff `c` is a frozen v1 `color` value (`0`/`1`, §4A.8). Validated on
+/// decode for the same reason as [`is_known_result`]. Note: §4A.8 says "N-seat
+/// variants extend" the color space — but v1 is Standard 2-seat (§1), and a
+/// variant that adds colors is a versioned change (§5), so v1 decode rejects
+/// anything outside {0,1} rather than silently accepting a value no v1 consumer
+/// can interpret.
+pub fn is_known_color(c: Color) -> bool {
+    matches!(c, COLOR_WHITE | COLOR_BLACK)
+}
 
 /// `Aborted.by` sentinel for a system-initiated abort (§4A.8): `0xFF`.
 pub const ABORT_BY_SYSTEM: u8 = 0xFF;
