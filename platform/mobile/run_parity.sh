@@ -30,15 +30,18 @@ DYLD_LIBRARY_PATH="$FFI/target/debug" "$FFI/target/swift_parity"
 echo "== Kotlin binding type-check (host) =="
 JNA="$(find "$HOME/.ivy2" "$HOME/.gradle" -name 'jna-*.jar' 2>/dev/null | sort | tail -1 || true)"
 if [[ -z "$JNA" ]]; then
-  echo "WARN: no JNA jar found — skipping Kotlin type-check. Install JNA or run via Gradle." >&2
-else
-  kotlinc -classpath "$JNA" \
-    "$BIND/kotlin/uniffi/pgc_engine_ffi/pgc_engine_ffi.kt" \
-    -d "$FFI/target/kotlin_binding.jar" >/dev/null
-  echo "OK  Kotlin binding compiles"
+  echo "ERROR: no JNA jar found — the Kotlin binding type-check is a REQUIRED" >&2
+  echo "host-parity step (README lists JNA as a prerequisite), not optional." >&2
+  echo "Install JNA (e.g. via Gradle/Maven, or run the Android target via Gradle" >&2
+  echo "which supplies it) and re-run. Refusing to report PASS with a step skipped." >&2
+  exit 1
 fi
+kotlinc -classpath "$JNA" \
+  "$BIND/kotlin/uniffi/pgc_engine_ffi/pgc_engine_ffi.kt" \
+  -d "$FFI/target/kotlin_binding.jar" >/dev/null
+echo "OK  Kotlin binding compiles"
 
 echo
-echo "Host-provable parity: PASS."
+echo "Host-provable parity: PASS (Swift run byte-identical to oracle; Kotlin binding compiles)."
 echo "DEVICE-GATED (not run here): the Kotlin parity RUN on an Android"
 echo "emulator/device — see platform/mobile/README.md."

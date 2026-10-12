@@ -30,12 +30,13 @@ cargo build --manifest-path "$FFI_DIR/Cargo.toml" --target aarch64-linux-android
 echo "== generate bindings =="
 # A host dylib drives bindgen (platform-independent interface extraction).
 cargo build --manifest-path "$FFI_DIR/Cargo.toml"
-DYLIB="$FFI_DIR/target/debug/libpgc_engine_ffi.dylib"
 mkdir -p "$OUT/swift" "$OUT/kotlin"
+# Path relative to $FFI_DIR (the subshells cd there). Single source of truth.
+DYLIB_REL="target/debug/libpgc_engine_ffi.dylib"
 ( cd "$FFI_DIR" && cargo run --bin uniffi-bindgen -- generate \
-    --library target/debug/libpgc_engine_ffi.dylib --language swift --out-dir target/bindings/swift )
+    --library "$DYLIB_REL" --language swift --out-dir target/bindings/swift )
 ( cd "$FFI_DIR" && cargo run --bin uniffi-bindgen -- generate \
-    --library target/debug/libpgc_engine_ffi.dylib --language kotlin --out-dir target/bindings/kotlin )
+    --library "$DYLIB_REL" --language kotlin --out-dir target/bindings/kotlin )
 
 echo "OK — libs + bindings built. Run the parity tests:"
 echo "  platform/mobile/run_parity.sh"
