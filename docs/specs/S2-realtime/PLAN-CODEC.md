@@ -32,7 +32,7 @@ protocol/
   vectors/                  NEW — the frozen golden-vector corpus (shared by all consumers)
 ```
 
-**Rationale for a new `pgc-protocol` crate (not folding into `pgc-engine`):** the engine crate is deliberately dependency-free and "adds no chess logic / nothing but chess" (its Cargo.toml). The codec is not chess logic; putting it in `pgc-engine` would pull a serialization dependency into the rules core and blur the single-responsibility line G-A was built on. A sibling crate keeps the engine pristine and matches the repo's existing `protocol/` folder (currently a placeholder). **This is the §6 decision to confirm.**
+**Rationale for a new `pgc-protocol` crate (not folding into `pgc-engine`):** the engine crate is deliberately dependency-free and "adds no chess logic / nothing but chess" (its Cargo.toml). The codec is not chess logic; putting it in `pgc-engine` would pull a serialization dependency into the rules core and blur the single-responsibility line G-A was built on. A sibling crate keeps the engine pristine and matches the repo's existing `protocol/` folder (currently a placeholder). **Path DECIDED: `protocol/codec/` (OPEN-C3, owner 2026-10-12).**
 
 ## 3. Codec choice (ADR-14 sub-choice) — DECIDED: `postcard` + golden-vector freeze guard
 
@@ -89,7 +89,7 @@ The golden-vector corpus is the single source of truth across languages — the 
 
 **OPEN-C1 — Web/TypeScript codec path — DECIDED (a) wasm, owner, 2026-10-12.** The web client runs the **same compiled `pgc-protocol` Rust codec via `wasm-pack`/WebAssembly** — one implementation everywhere (server, iOS, Android, web), parity by construction rather than by test. Accepted cost: a wasm build step in the web pipeline and a ~tens-of-KB wasm payload in the bundle. Step 4.4 builds this; the hand-written-TS alternative is rejected (it reintroduces the NFR-10 drift risk ADR-14 exists to kill).
 
-Secondary: **OPEN-C2 — codec library — DECIDED `postcard`** (§3), with the golden-vector corpus as the field-order freeze guard; Protobuf/FlatBuffers kept as a documented API-compatible fallback. **OPEN-C3 — `pgc-protocol` crate placement under `protocol/codec/` (§2)** — confirm (non-blocking; cosmetic path choice). **OPEN-C4 — the concrete cgo build wiring for the Go server (§4.5)** — the *decision* is in-process cgo over the staticlib; the header-gen/link-flags/cross-compile detail is owned by the `services/game-server` spec, not this plan.
+Secondary: **OPEN-C2 — codec library — DECIDED `postcard`** (§3), with the golden-vector corpus as the field-order freeze guard; Protobuf/FlatBuffers kept as a documented API-compatible fallback. **OPEN-C3 — `pgc-protocol` crate placement — DECIDED `protocol/codec/` (owner, 2026-10-12).** **OPEN-C4 — the concrete cgo build wiring for the Go server (§4.5)** — the *decision* is in-process cgo over the staticlib; the header-gen/link-flags/cross-compile detail is owned by the `services/game-server` spec, not this plan.
 
 ## 7. What this plan does NOT do
 - No chess logic (engine owns it); no server behavior (game-server owns clocks/matchmaking/reconnection); no REST (that's JSON, SPEC-PE-API-CONTRACT); no persistence engine. The codec serializes the frozen §4A shapes and nothing more.
