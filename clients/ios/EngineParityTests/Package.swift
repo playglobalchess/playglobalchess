@@ -8,8 +8,9 @@
 // is the stable scaffold they slot into.
 //
 // Run (needs the xcframework present under ./Frameworks):
-//   xcodebuild test -scheme EngineParityTests \
-//     -destination 'platform=iOS Simulator,name=iPhone 15'
+//   xcodebuild test -scheme EngineParityTests-Package \
+//     -destination 'platform=iOS Simulator,name=iPhone 16'
+//   (SwiftPM auto-names the scheme `<package>-Package`; `xcodebuild -list` confirms.)
 
 import PackageDescription
 

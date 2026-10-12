@@ -99,5 +99,5 @@ cp "$OUT/kotlin/uniffi/pgc_engine_ffi/pgc_engine_ffi.kt" \
 
 echo "OK — libs + bindings built and packaged into the test targets. Run:"
 echo "  platform/mobile/run_parity.sh                          # host-provable (Swift run + Kotlin compile)"
-echo "  xcodebuild test -scheme EngineParityTests ...          # iOS Simulator (clients/ios/EngineParityTests)"
+echo "  xcodebuild test -scheme EngineParityTests-Package ...   # iOS Simulator (clients/ios/EngineParityTests)"
 echo "  ./gradlew :engine-parity:connectedAndroidTest          # Android emulator (clients/android)"

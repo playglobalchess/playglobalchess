@@ -52,7 +52,8 @@ The device-run harnesses are scaffolded and wired to the artifacts
 
   platform/mobile/build_mobile.sh
   cd clients/ios/EngineParityTests
-  xcodebuild test -scheme EngineParityTests \
+  # SwiftPM auto-names the scheme `<package>-Package` — list with `xcodebuild -list`.
+  xcodebuild test -scheme EngineParityTests-Package \
     -destination 'platform=iOS Simulator,name=iPhone 16'   # Xcode 16.x device
   ```
 - **Android** — `clients/android/engine-parity/` (Gradle library module):
