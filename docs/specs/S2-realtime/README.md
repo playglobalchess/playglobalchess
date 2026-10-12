@@ -9,11 +9,14 @@
 
 See `../README.md` for how specs relate to `../../MASTER-PLAN.md`, and `../_shared/` for templates + conventions. Cite master IDs; never redefine them. Decisions beyond the master doc → propose a new ADR there.
 
-## First specs to write (P0)
-- GAME-SERVER.md — lifecycle, clock, reconnection
-- WS-PROTOCOL.md — binary frame layout (cites MASTER VIII.4)
-- MATCHMAKING.md
-- F-01-play-online.md (first vertical slice)
+## Specs in this stream
+- **PROTOCOL.md** — WS binary frame + event-store schema + entity model (SPEC-S2-PROTOCOL, **RATIFIED**; the frozen §4A contract, feeds G-D). Covers the WS frame layout (MASTER §VIII.4) — no separate WS-PROTOCOL.md needed.
+- **PLAN-CODEC.md** — the ADR-14 wire codec implementation plan (**RATIFIED**).
+- **GAME-SERVER.md** — lifecycle, clock, matchmaking, reconnection, codec consumption / OPEN-C4 (SPEC-S2-GAME-SERVER, **REVIEW**; feeds G-E).
+
+## Still to write (P0+)
+- MATCHMAKING.md (if the §3.4 model needs more depth than GAME-SERVER carries)
+- F-01-play-online.md (the first vertical slice, feature template)
 
 ## How to add a spec
 1. Copy `../_shared/SPEC-TEMPLATE.md` (system/component) or `../_shared/FEATURE-SPEC-TEMPLATE.md` (an F-xx module) into this folder.
