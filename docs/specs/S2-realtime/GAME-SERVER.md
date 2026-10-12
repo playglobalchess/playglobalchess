@@ -4,10 +4,10 @@
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER |
 | Owner | S2 Real-time (stream lead — fill in); co-reviewed by Architecture group (shared-contract + NFR) + S6 Trust-safety (rated play, ADR-2 veto) |
-| Status | REVIEW |
-| Version | 0.1 |
-| Last updated | 2026-10-13 |
-| Implements (master IDs) | X-2; F-01 (Play Online), F-01.3/.4/.5; NFR-1 (move latency), NFR-2 (availability / no game loss), NFR-3 (scale), NFR-7 (durability), NFR-5 (one engine), NFR-10 (one codec); MASTER §VIII.1 (server-authoritative, event-sourced), §VIII.4 (wire messages), §IX.1 (latency), §IX.2 (capacity); ADR-10, ADR-12, ADR-14, ADR-15 (cgo boundary, PROPOSED) |
+| Status | RATIFIED |
+| Version | 1.0 |
+| Last updated | 2026-10-13 (RATIFIED; Q-GS1 DECIDED, ADR-15 DECIDED) |
+| Implements (master IDs) | X-2; F-01 (Play Online), F-01.3/.4/.5; NFR-1 (move latency), NFR-2 (availability / no game loss), NFR-3 (scale), NFR-7 (durability), NFR-5 (one engine), NFR-10 (one codec); MASTER §VIII.1 (server-authoritative, event-sourced), §VIII.4 (wire messages), §IX.1 (latency), §IX.2 (capacity); ADR-10, ADR-12, ADR-14, ADR-15 (cgo boundary, DECIDED) |
 | Depends on | SPEC-S1-ENGINE-CORE (G-A, GREEN) — legality authority · SPEC-S2-PROTOCOL (RATIFIED §4A) — wire + event contract, cited not copied · PLAN-S2-CODEC (RATIFIED) — the `pgc-protocol` codec this server links · SPEC-S3-DATA-MODEL (event store + entities) · SPEC-PE-API-CONTRACT (REST surface, G-D sibling) |
 | Gates it feeds | **G-E** (scale proven, NFR-3) — the primary gate this component carries. Also the F-01 vertical-slice exit (P1). Does NOT feed G-D (that is the protocol/API freeze; this consumes it). |
 
@@ -101,7 +101,7 @@ The event stream is the fair-play signal source; the server must keep per-move t
 
 ## 4. Interfaces & contracts — codec consumption over cgo (resolves OPEN-C4)
 
-The server links the **`pgc-protocol-cgo`** sibling crate's **`staticlib`** and calls encode/decode as C-ABI functions **in-process** (PLAN-S2-CODEC §4.5, v1.1: in-process cgo, no sidecar, no network hop on the move path). Per the amended plan, `codec-cgo` is a thin delegate-only wrapper over the pure `pgc-protocol` core — the same sibling pattern as `codec-ffi` (UniFFI) and `codec-wasm` (wasm), under the uniform cgo mechanism of ADR-15 (PROPOSED) — so the unavoidable `unsafe` C-ABI seam is quarantined there and the core stays `#![forbid(unsafe_code)]`. This section fixes the Go-side consumption detail PLAN-S2-CODEC §4.5 / OPEN-C4 delegates to this spec; the plan owns the crate's existence + C-ABI shape.
+The server links the **`pgc-protocol-cgo`** sibling crate's **`staticlib`** and calls encode/decode as C-ABI functions **in-process** (PLAN-S2-CODEC §4.5, v1.1: in-process cgo, no sidecar, no network hop on the move path). Per the amended plan, `codec-cgo` is a thin delegate-only wrapper over the pure `pgc-protocol` core — the same sibling pattern as `codec-ffi` (UniFFI) and `codec-wasm` (wasm), under the uniform cgo mechanism of ADR-15 (DECIDED) — so the unavoidable `unsafe` C-ABI seam is quarantined there and the core stays `#![forbid(unsafe_code)]`. This section fixes the Go-side consumption detail PLAN-S2-CODEC §4.5 / OPEN-C4 delegates to this spec; the plan owns the crate's existence + C-ABI shape.
 
 **4.1 C-ABI surface (`protocol/codec-cgo`, `pgc-protocol-cgo`).** A new sibling crate: `crate-type = ["staticlib", "rlib"]`, delegate-only over `pgc-protocol`, with a `#[no_mangle] extern "C"` module (the one place `unsafe` lives — each fn carries a safety comment) and a `cbindgen`-generated C header. Surface is byte-in / byte-out (mirroring the proven shape of the other consumers — decode→re-encode and true encode/decode over frames):
 ```c
@@ -164,7 +164,7 @@ Part XI threats on this component:
 
 ## 9. Acceptance criteria (Definition of Done)
 
-- [ ] Spec reviewed by S2 + Architecture group (shared cgo contract + NFR budgets) + **S6** (rated-play / anti-cheat feed, ADR-2 veto); RATIFIED.
+- [x] Spec reviewed by S2 + Architecture group (shared cgo contract + NFR budgets) + **S6** (rated-play / anti-cheat feed, ADR-2 veto); RATIFIED (2026-10-13).
 - [ ] `protocol/codec-cgo` (`pgc-protocol-cgo`) sibling crate exists — `staticlib` + `#[no_mangle] extern "C"` + cbindgen header, delegate-only over the pure core — with the §8 cgo contract + safety (fuzz + leak) tests green. **(Consumes PLAN-S2-CODEC v1.1 §4.5 / OPEN-C4; the plan owns the crate, this spec owns the Go-side wiring.)**
 - [ ] `services/game-server` links it and the Go golden-vector parity test passes byte-for-byte (the Go leg of NFR-10).
 - [ ] Game lifecycle, clock (incl. flag + drift), matchmaking, reconnection implemented for F-01 Standard 2-seat, with their §8 unit/integration suites green.
@@ -178,7 +178,7 @@ Part XI threats on this component:
 - **Q-GS1 — cgo decode return shape — DECIDED (a), owner 2026-10-13.** The C-ABI is **byte-oriented** — `decode` validates and returns the canonical frame bytes, `encode` takes a built frame — plus a small set of typed scalar accessors for the few fields the server acts on (`game_id`, `ply_expected`, `uci`, message type/direction). Not a flattened C struct per message type. Rationale: smallest `unsafe` surface at the one hand-written seam (no ~19 per-message structs with nested `Vec`/sub-struct ownership to leak or mis-free — the fuzz+leak test can cover the whole surface); matches what the server actually does (relay frames, read a few routing/authz fields); same shape as the proven wasm `reencode_*` consumer, so parity is one assertion across all four. Reversible behind the same C-ABI — if profiling ever shows a scalar accessor is a measurable cost at 50k moves/sec, add a single `MOVE`-only fast-path struct, not a general marshaller. Not an ADR (an internal access-path detail of one crate); the uniform cgo *mechanism* it rides on is ADR-15.
 - **Q-GS2 — sharding/routing substrate.** Consistent-hash on `game_id` vs a routing table in Redis vs a service mesh. Deferred to the G-E design; does not block F-01 single-node bring-up. Flag if it should be an ADR.
 - **Q-GS3 — matchmaking fairness policy.** Rating-window widening schedule, provisional-rating handling, anti-sniping. Needs X-4 (rating) input; parked until the rating service spec lands.
-- **Q-GS4 — engine's own Go cgo seam — ROUTED TO ADR-15 (PROPOSED).** The server validates every move via the S1 engine (NFR-5), but the engine has only a UniFFI (mobile) seam today and no Go path — so this is a real gap on the F-01 critical path, not hypothetical. Rather than design a second, divergent cgo setup, **ADR-15** (MASTER-PLAN, PROPOSED) generalizes PLAN-S2-CODEC v1.1's `codec-cgo` into one uniform pattern: every Rust crate Go consumes gets a `<crate>-cgo` sibling (staticlib + extern "C" + cbindgen, delegate-only), same buffer-ownership + build + fuzz/leak discipline. So `pgc-engine → engine-cgo` reuses `codec-cgo`'s pattern. **Scope guard:** `engine-cgo` is NOT part of codec chunk 4.5 — it is built later when the game-server wires move validation; ADR-15 only ensures it does not diverge. Blocks on architecture-group DECIDED of ADR-15.
+- **Q-GS4 — engine's own Go cgo seam — DECIDED via ADR-15.** The server validates every move via the S1 engine (NFR-5), but the engine has only a UniFFI (mobile) seam today and no Go path — so this is a real gap on the F-01 critical path, not hypothetical. Rather than design a second, divergent cgo setup, **ADR-15** (MASTER-PLAN, DECIDED) generalizes PLAN-S2-CODEC v1.1's `codec-cgo` into one uniform pattern: every Rust crate Go consumes gets a `<crate>-cgo` sibling (staticlib + extern "C" + cbindgen, delegate-only), same buffer-ownership + build + fuzz/leak discipline. So `pgc-engine → engine-cgo` reuses `codec-cgo`'s pattern. **Scope guard:** `engine-cgo` is NOT part of codec chunk 4.5 — it is built later when the game-server wires move validation; ADR-15 only ensures it does not diverge. ADR-15 is now DECIDED (architecture group, 2026-10-13); engine-cgo follows that pattern when built.
 
 ---
 
