@@ -1,0 +1,27 @@
+[package]
+name = "pgc-protocol-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "UniFFI bindings for the PlayGlobalChess wire + event codec (ADR-14, X-2). Exposes the §4A encode/decode surface to Swift (iOS) and Kotlin (Android) so both clients run the SAME codec as the server (NFR-5, NFR-10). The pure codec crate (../codec, pgc-protocol) stays FFI-free; all FFI machinery lives here. Delegate-only — no codec logic."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "pgc_protocol_ffi"
+# cdylib: the native lib iOS/Android load. staticlib: for the iOS static link.
+# rlib (lib): so the uniffi-bindgen bin below can depend on this crate.
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+# The pure codec — the single wire/event codec (ADR-14: one codec, many
+# consumers). This crate only re-exposes it over FFI; it adds no codec logic.
+pgc-protocol = { path = "../codec" }
+uniffi = { version = "0.32.2", features = ["cli"] }
+thiserror = "1.0.69"
+
+# The bindgen binary (UniFFI 0.32 ships bindgen as a library invoked by a tiny
+# per-crate bin, not a published CLI): `cargo run --bin uniffi-bindgen -- ...`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"

@@ -1,0 +1,18 @@
+# Cross-compilation config for the codec mobile-parity targets (SPEC-S2-PROTOCOL
+# §8, PLAN-CODEC §4.3, ADR-9). The Android targets need the NDK's clang as
+# linker; the path is derived from ANDROID_NDK_HOME at build time via the runner
+# script (platform/mobile/build_codec_mobile.sh), which exports these before
+# `cargo build`. iOS needs no linker override (Xcode's clang is found via the
+# active developer dir). API level 24 (Android 7.0) is the project's minSdk
+# floor — matches the engine FFI.
+#
+# NOTE: the Android linker is an ABSOLUTE path that varies per machine/NDK
+# version, so it is NOT hard-coded here — the runner script sets
+# CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER / _CC env vars instead. This file
+# documents the target set and keeps iOS reproducible.
+
+[target.aarch64-apple-ios]
+# Xcode toolchain resolves the linker; no override needed.
+
+[target.aarch64-apple-ios-sim]
+# iOS simulator (Apple silicon); Xcode toolchain.

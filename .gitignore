@@ -70,6 +70,15 @@ clients/ios/EngineParityTests/Frameworks/
 clients/android/engine-parity/src/main/jniLibs/
 clients/android/engine-parity/src/main/kotlin/uniffi/
 
+# ---- Generated codec parity artifacts (§8/PLAN-CODEC 4.3, build_codec_mobile.sh) ----
+# Same rule as the engine parity block above: the test-target scaffolds + the
+# hand-written parity tests are committed; the generated bindings, cross-compiled
+# native libs, and the xcframework are build outputs and are not.
+clients/ios/CodecParityTests/Sources/
+clients/ios/CodecParityTests/Frameworks/
+clients/android/codec-parity/src/main/jniLibs/
+clients/android/codec-parity/src/main/kotlin/uniffi/
+
 # ---- Gradle (root Android build) ----
 # (build/ and clients/android/**/build/ already covered above.) Root cache +
 # ensure the committed wrapper jar is NOT ignored by the generic *.jar rules.
