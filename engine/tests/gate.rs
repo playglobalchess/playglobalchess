@@ -1,13 +1,13 @@
 //! Chunk-1 gate tests (ENGINE-CORE §8.6, §8.1).
 //!
-//! The two conditions this chunk must satisfy before the PR is green:
-//! 1. the FEN round-trip property `parse_fen(to_fen(p)) == p`;
-//! 2. `perft(startpos, 1) == 20`.
-//!
-//! The deep §8.1 perft corpus and the §8.2 edge-case library land in chunk 2.
+//! The two conditions chunk 1 had to satisfy, kept as permanent regression
+//! guards: the FEN round-trip property on fixed positions and
+//! `perft(startpos, 1) == 20`, plus a shallow perft smoke check and the
+//! no-panic fuzz. The §8.6 PROPERTY net (make/unmake inverse, UCI/SAN/FEN
+//! round-trips, perft(·,1)==len over random reachable positions) now lives in
+//! its single home `tests/properties.rs` (stage 2f).
 
 use pgc_engine::{parse_fen, perft, Position};
-use proptest::prelude::*;
 
 /// Gate 2: the opening position has exactly 20 legal moves.
 #[test]
@@ -41,80 +41,9 @@ fn gate_fen_roundtrip_fixed_positions() {
     }
 }
 
-// --- Property-based FEN round-trip (ENGINE-CORE §8.6) -----------------------
-// Generate random *legal-ish* positions by replaying random legal moves from
-// the start position, then assert the round-trip property on each. Replaying
-// legal moves keeps every generated position reachable and self-consistent,
-// which is a stronger generator than random piece scatter (which could place
-// two kings in check, etc.).
-
-use pgc_engine::{legal_moves, make, movegen::apply_move, unmake};
-
-prop_compose! {
-    fn random_reachable_position(max_plies: usize)(seed in any::<u64>()) -> Position {
-        // Deterministic PRNG from the seed (xorshift) so failures shrink/replay.
-        let mut state = seed | 1;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let plies = (next() as usize) % (max_plies + 1);
-        let mut pos = Position::startpos();
-        for _ in 0..plies {
-            let moves = legal_moves(&pos);
-            if moves.is_empty() {
-                break; // checkmate or stalemate reached
-            }
-            let idx = (next() as usize) % moves.len();
-            let m = moves.as_slice()[idx];
-            apply_move(&mut pos, m);
-        }
-        pos
-    }
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    #[test]
-    fn prop_fen_roundtrip(pos in random_reachable_position(40)) {
-        let text = pos.to_fen();
-        let reparsed = parse_fen(&text).expect("emitted FEN must re-parse");
-        prop_assert_eq!(reparsed, pos);
-    }
-
-    #[test]
-    fn prop_perft_1_equals_legal_move_count(pos in random_reachable_position(30)) {
-        // §8.6 cheap cross-check: perft(p,1) == legal_moves(p).len().
-        let n = legal_moves(&pos).len() as u64;
-        let mut p = pos;
-        prop_assert_eq!(perft(&mut p, 1), n);
-    }
-
-    /// Stage 2a (§3.6): make/unmake is a perfect inverse — `unmake(make(p,m))
-    /// == p` for every legal move from a reachable position, bit-for-bit.
-    #[test]
-    fn prop_make_unmake_is_inverse(pos in random_reachable_position(40)) {
-        let before = pos.clone();
-        let mut p = pos;
-        for &m in legal_moves(&before).iter() {
-            let undo = make(&mut p, m);
-            unmake(&mut p, m, undo);
-            prop_assert_eq!(&p, &before, "make/unmake not inverse for move {}", m.to_uci());
-        }
-    }
-}
-
-/// Shallow perft **smoke check** (NOT the chunk gate; NOT the §8.1 corpus).
-///
-/// The only *gated* perft condition this chunk is `perft(startpos, 1) == 20`
-/// (see `gate_perft_startpos_depth_1`). These two extra shallow startpos counts
-/// are a cheap confidence probe that the generator is correct beyond depth 1 —
-/// kept deliberately small. The full §8.1 reference corpus (Kiwipete and
-/// Positions 3–6 to depth 5–6, startpos to depth 6, with `perft_divide`
-/// localisation) is wired as the dedicated G-A conformance suite in chunk 2.
+/// Shallow perft **smoke check** (NOT the §8.1 corpus, which lives in
+/// `tests/perft_corpus.rs`). A cheap confidence probe that the generator is
+/// correct beyond depth 1.
 #[test]
 fn smoke_perft_startpos_shallow() {
     assert_eq!(perft(&mut Position::startpos(), 2), 400);
