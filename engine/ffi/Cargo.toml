@@ -1,0 +1,27 @@
+[package]
+name = "pgc-engine-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "UniFFI bindings for the PlayGlobalChess engine (X-1, ADR-9). Exposes the §8.8 mobile-parity surface (perft, startpos FEN, golden-slice replay) to Swift (iOS) and Kotlin (Android). The pure engine crate (../, pgc-engine) stays dependency-free; all FFI machinery lives here."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "pgc_engine_ffi"
+# cdylib: the native lib iOS/Android load. staticlib: for the iOS static link.
+# rlib: so the uniffi-bindgen bin below can depend on this crate.
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+# The pure engine — the single source of chess truth (ADR-9: one engine, three
+# consumers). This crate only re-exposes it over FFI; it adds no chess logic.
+pgc-engine = { path = ".." }
+uniffi = { version = "0.32.2", features = ["cli"] }
+thiserror = "1.0.69"
+
+# The bindgen binary (UniFFI 0.32 ships bindgen as a library invoked by a tiny
+# per-crate bin, not a published CLI): `cargo run --bin uniffi-bindgen -- ...`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"

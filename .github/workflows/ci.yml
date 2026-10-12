@@ -68,6 +68,13 @@ jobs:
           cargo fmt --manifest-path engine/Cargo.toml --all -- --check
           cargo clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
           cargo test --manifest-path engine/Cargo.toml --all
+          # pgc-engine-ffi (ADR-9 UniFFI bindings, §8.8). Host build + the
+          # binding-surface unit tests + the parity oracle run here; the iOS/
+          # Android cross-builds + device parity run need the mobile toolchains
+          # (platform/mobile/build_mobile.sh), not the per-commit path.
+          cargo fmt --manifest-path engine/ffi/Cargo.toml --all -- --check
+          cargo clippy --manifest-path engine/ffi/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path engine/ffi/Cargo.toml
 
   # Nightly ONLY (schedule event): the slow #[ignore]d perft tier (§8.8) — the
   # full §8.1 target depths (startpos d6=119,060,324; Kiwipete d5=193,690,690;

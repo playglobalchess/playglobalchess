@@ -70,14 +70,28 @@ the consolidated §8.6 property net.
 
 ### Remaining for G-A
 
-- **Mobile parity §8.8 (stage 3d):** UniFFI bindings; perft+golden slice byte-
-  identical on iOS/Android. Toolchain-gated.
+- **Mobile parity §8.8 (stage 3d):** `pgc-engine-ffi` (UniFFI, ADR-9) exposes
+  the parity slice (perft, startpos FEN, SAN replay) to Swift + Kotlin.
+  **Proven host-side:** the engine cross-compiles for `aarch64-apple-ios`,
+  `-ios-sim`, and `aarch64-linux-android` (NDK); UniFFI generates Swift + Kotlin
+  bindings; the **Swift parity test RUNS and matches the host oracle
+  byte-for-byte** (startpos d5 = 4,865,609 + golden-slice FEN); the Kotlin
+  binding type-checks. Oracle: `engine/tests/mobile_parity_oracle.rs`. Harness:
+  `platform/mobile/`. **Device-gated remainder:** the Kotlin parity RUN on an
+  Android emulator/device (the arm64 `.so` cannot load on a host JVM) and the
+  iOS run on a simulator Xcode test target.
+
+### Remaining for G-A
+
+- **Mobile parity §8.8 — device run:** wire the Swift/Kotlin tests into Xcode
+  (iOS sim) and an Android instrumented-test target. Engine/binding correctness
+  is already host-proven; this is the last-mile device confirmation.
 - **Human sign-off:** §4 public API reviewed by S2 + architecture group; spec
   status advanced to RATIFIED with reviews recorded.
 
 OPEN-A resolved: **own bitboard implementation**. OPEN-B resolved: **own
-Zobrist, pinned seed**. **G-A is not green yet** — mobile parity + the human
-sign-off boxes remain.
+Zobrist, pinned seed**. **G-A is not green yet** — the mobile device run + the
+human sign-off boxes remain.
 
 ## Develop
 
