@@ -56,14 +56,26 @@ edge cases, §8.3 game-end detection (threefold-by-position, the castling-rights
 E-11 distinction, the K+N+N non-draw E-12), the §4.2 SAN/UCI round-trips, and
 the consolidated §8.6 property net.
 
-### Deferred to later chunks (not yet verified) — the rest of G-A
+**Chunk 3 (in progress) — the rest of G-A:**
+- **Performance §6.1 (stage 3a):** measured — `legal_moves` ~1.9 µs (< 1 ms),
+  dedicated `is_legal` ~0.28 µs (< 10 µs). Magic bitboards NOT needed (see
+  `PERF.md`). criterion benches + nightly threshold gate.
+- **Golden-game replay §8.5 (stage 3c):** `tests/golden_games.rs` — curated
+  games (Scholar's mate, castling both sides, en passant, promotion-by-capture,
+  threefold shuffle) replayed through `make`, FEN asserted at **every ply**,
+  final FEN anchored to an external value. Regression net: every bug found adds
+  a golden case before its fix merges.
 
-Magic bitboards and the §6.1 performance gate (`legal_moves` < 1 ms, `is_legal`
-< 10 µs); full golden-game replay (§8.5); mobile parity (§8.8, UniFFI); the
-differential tier as a standing gate (§8.7). OPEN-A resolved: **own bitboard
-implementation**. OPEN-B resolved: **own Zobrist, pinned seed**. **G-A is not
-green yet** — chunk 2 makes the engine correctness-complete for Standard; the
-performance, golden-replay, and mobile-parity work remain.
+### Remaining for G-A
+
+- **Mobile parity §8.8 (stage 3d):** UniFFI bindings; perft+golden slice byte-
+  identical on iOS/Android. Toolchain-gated.
+- **Human sign-off:** §4 public API reviewed by S2 + architecture group; spec
+  status advanced to RATIFIED with reviews recorded.
+
+OPEN-A resolved: **own bitboard implementation**. OPEN-B resolved: **own
+Zobrist, pinned seed**. **G-A is not green yet** — mobile parity + the human
+sign-off boxes remain.
 
 ## Develop
 
