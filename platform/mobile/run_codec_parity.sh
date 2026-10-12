@@ -39,24 +39,43 @@ JNA_DIR="$FFI/target/jna"
 JNA="$JNA_DIR/jna-${JNA_VERSION}.jar"
 JNA_URL="https://repo1.maven.org/maven2/net/java/dev/jna/jna/${JNA_VERSION}/jna-${JNA_VERSION}.jar"
 JNA_SHA256="34ed1e1f27fa896bca50dbc4e99cf3732967cec387a7a0d5e3486c09673fe8c6"
-if [[ ! -f "$JNA" ]]; then
+
+# Verify a file against the pinned checksum. Returns non-zero on mismatch.
+jna_ok() { [[ -f "$1" ]] && [[ "$(shasum -a 256 "$1" | awk '{print $1}')" == "$JNA_SHA256" ]]; }
+
+# Atomic, verified fetch: download to a temp file, checksum it BEFORE moving it
+# into place, and clean the temp up on any failure. A partial/truncated download
+# never becomes $JNA.
+jna_fetch() {
   mkdir -p "$JNA_DIR"
+  local tmp; tmp="$(mktemp "$JNA_DIR/jna.XXXXXX.tmp")"
   echo "   fetching JNA ${JNA_VERSION} from Maven Central (pinned, verified)…"
-  if ! curl -fsSL "$JNA_URL" -o "$JNA.tmp"; then
-    echo "ERROR: could not download JNA ${JNA_VERSION} from Maven Central." >&2
+  if ! curl -fsSL "$JNA_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! jna_ok "$tmp"; then
+    echo "ERROR: JNA ${JNA_VERSION} checksum mismatch on download (got $(shasum -a 256 "$tmp" | awk '{print $1}'))." >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$JNA"
+}
+
+# ALWAYS verify the jar we are about to use, no matter how it got here. A cache
+# HIT is re-checked (a stale/partial/tampered build-local jar from a prior run is
+# not trusted on its mere existence); only an unverified-or-absent jar triggers a
+# single re-fetch. This is what makes "tamper-checked" true on every path, not
+# just the download path.
+if ! jna_ok "$JNA"; then
+  rm -f "$JNA"   # discard a bad/partial cached jar before re-fetching
+  if ! jna_fetch || ! jna_ok "$JNA"; then
+    echo "ERROR: could not obtain a verified JNA ${JNA_VERSION} jar." >&2
     echo "The Kotlin binding type-check is a REQUIRED host-parity step; refusing" >&2
     echo "to report PASS with it skipped. Check network access to repo1.maven.org" >&2
-    echo "or pre-place the jar at $JNA." >&2
+    echo "or pre-place the verified jar at $JNA." >&2
     exit 1
   fi
-  # Verify the pinned checksum so a tampered/wrong download can't poison the gate.
-  GOT="$(shasum -a 256 "$JNA.tmp" | awk '{print $1}')"
-  if [[ "$GOT" != "$JNA_SHA256" ]]; then
-    echo "ERROR: JNA ${JNA_VERSION} checksum mismatch (got $GOT)." >&2
-    rm -f "$JNA.tmp"
-    exit 1
-  fi
-  mv "$JNA.tmp" "$JNA"
 fi
 kotlinc -classpath "$JNA" \
   "$BIND/kotlin/uniffi/${LIB}/${LIB}.kt" \
