@@ -4,13 +4,18 @@
 //! replayed move-by-move through `san_to_move` + `make`, asserting the FEN at
 //! **every ply**. Two kinds of assertion per game:
 //!
-//! 1. **Correctness anchor** — the FINAL FEN of each game is an externally-known
-//!    value (not engine-derived), so the replay is checked against an outside
-//!    oracle, not just against itself.
-//! 2. **Regression lock** — the full per-ply FEN sequence is asserted; once a
-//!    game is in the suite, any future change that alters a single ply's FEN
-//!    fails here. This is the §8.5 regression net: **every bug found becomes a
-//!    new golden case before its fix merges.**
+//! 1. **Correctness anchor (external oracle) — the FINAL FEN only.** Each game's
+//!    final FEN is a human-verified, externally-known value (not engine-derived),
+//!    so the end of the replay is checked against an outside oracle.
+//! 2. **Regression lock (NOT an external oracle) — the per-ply FENs.** The full
+//!    per-ply sequence is engine-GENERATED and committed: it asserts "the engine
+//!    still does what it did when this game was added," catching FUTURE drift. It
+//!    does NOT independently verify the intermediate positions — their current
+//!    correctness rests on the perft/edge-case/property suites, not on this file.
+//!    This is the §8.5 regression net: **every bug found becomes a new golden
+//!    case before its fix merges**, and when the engine's behaviour legitimately
+//!    changes, the per-ply locks must be **re-derived**, with the final anchor
+//!    re-verified against an outside source — they are not self-certifying.
 //!
 //! The games are deliberately chosen to exercise the special-move paths §8.5
 //! names: en passant, promotion, castling both sides, and a threefold-repetition
@@ -39,8 +44,10 @@ fn replay(sans: &[&str]) -> Vec<String> {
     fens
 }
 
-/// Assert the full per-ply FEN sequence AND that the final FEN matches the
-/// externally-known anchor.
+/// Assert the per-ply FEN sequence (the engine-generated REGRESSION LOCK) AND
+/// that the final FEN matches `final_anchor` (the human-verified EXTERNAL
+/// oracle). Only the final anchor is independently verified; the intermediate
+/// plies lock current behaviour, they do not certify it (see the module header).
 fn assert_game(name: &str, sans: &[&str], expected_per_ply: &[&str], final_anchor: &str) {
     let got = replay(sans);
     assert_eq!(

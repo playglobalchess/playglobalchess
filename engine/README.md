@@ -62,9 +62,11 @@ the consolidated §8.6 property net.
   `PERF.md`). criterion benches + nightly threshold gate.
 - **Golden-game replay §8.5 (stage 3c):** `tests/golden_games.rs` — curated
   games (Scholar's mate, castling both sides, en passant, promotion-by-capture,
-  threefold shuffle) replayed through `make`, FEN asserted at **every ply**,
-  final FEN anchored to an external value. Regression net: every bug found adds
-  a golden case before its fix merges.
+  threefold shuffle) replayed through `make`, FEN asserted at **every ply**. The
+  **final** FEN of each game is a human-verified external oracle; the
+  intermediate per-ply FENs are an engine-generated **regression lock** (catch
+  future drift; re-derive them when behaviour legitimately changes). Regression
+  net: every bug found adds a golden case before its fix merges.
 
 ### Remaining for G-A
 
