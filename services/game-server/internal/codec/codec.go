@@ -6,13 +6,19 @@
 // consumer (NFR-10). This package adds no codec logic; it is the Go leg of the
 // one codec.
 //
-// The staticlib + header are produced by `make lib` (see the Makefile), which
-// drops them into ./lib/ — a gitignored build output. The cgo directives below
-// resolve against that directory.
+// The staticlib (libpgc_protocol_cgo.a) is produced by `make lib` (see the
+// Makefile) and staged into ./lib/ — a gitignored build output the cgo LDFLAGS
+// below resolve against. The C header is NOT copied: cgo includes it directly
+// from the canonical crate source (protocol/codec-cgo/include) via the CFLAGS
+// -I below, so there is no second header copy to drift out of sync.
+//
+// If you run `go build/test/vet ./...` directly and see a linker error like
+// "library 'pgc_protocol_cgo' not found", the staticlib has not been built yet
+// — run `make lib` (or `make test`) first. CI runs `make test`, which builds it.
 package codec
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/lib
+#cgo CFLAGS: -I${SRCDIR}/../../../../protocol/codec-cgo/include
 #cgo LDFLAGS: -L${SRCDIR}/lib -lpgc_protocol_cgo
 #include <stdlib.h>
 #include "pgc_protocol_cgo.h"

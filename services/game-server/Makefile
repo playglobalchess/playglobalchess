@@ -25,7 +25,8 @@ lib:
 	cargo build $(CARGO_FLAGS)
 	mkdir -p $(LIB_DST)
 	cp $(RUST_OUT)/libpgc_protocol_cgo.a $(LIB_DST)/
-	cp $(CODEC_CGO_DIR)/include/pgc_protocol_cgo.h $(LIB_DST)/
+	# The C header is NOT copied — cgo includes it from the canonical crate dir
+	# (protocol/codec-cgo/include) via CFLAGS, so there is no copy to drift.
 
 test: lib
 	go test ./...
