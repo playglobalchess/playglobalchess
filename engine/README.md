@@ -27,17 +27,25 @@ Implemented against the ratified spec:
   (see Develop). Fast tier (≤ a few million nodes) runs every commit; the deep
   target depths (startpos d6, Kiwipete d5, …) are `#[ignore]`d to the nightly
   tier.
+- **E-1..E-14 edge-case library** (§8.2, stage 2c): explicit legal-move-set
+  assertions for the move-generation edge cases — ep horizontal-pin (E-2),
+  ep-only-immediate (E-3), castling through/into/out of check incl. the
+  queenside b-file nuance (E-4/E-5), castling-right loss by rook capture (E-6),
+  all four under/promotions on push + capture (E-7), absolute pin (E-8),
+  double-check king-only (E-9), halfmove-clock reset (E-13), the 218-move
+  position (E-14).
 
-**Gates green:** FEN round-trip (§8.6), make/unmake inverse (§8.6), and the
-**full §8.1 perft corpus** — every position exact to its stated depth (slow tier
-run in nightly / pre-G-A).
+**Gates green:** FEN round-trip (§8.6), make/unmake inverse (§8.6), the full
+§8.1 perft corpus (every position exact to its stated depth; slow tier in
+nightly), and the §8.2 move-set edge cases.
 
 ### Deferred to later chunk-2 stages / chunks (not yet verified)
 
-E-1..E-14 edge-case library (§8.2) [2c]; game-end & draw detection + Zobrist
-(§3.7, OPEN-B) [2d]; SAN (§4.2) [2e]; the §8.6 full property net [2f]; magic
-bitboards and the §6.1 benchmarks; full golden replay (§8.5); mobile parity
-(§8.8); the variant seam (§3.9). OPEN-A resolved: **own bitboard
+Game-end classification cases — E-10 (mate vs stalemate), E-11 (repetition
+identity incl. castling/ep), E-12 (insufficient material) — land with `status()`
++ Zobrist (§3.7, OPEN-B) [2d]; SAN (§4.2) [2e]; the §8.6 full property net [2f];
+magic bitboards and the §6.1 benchmarks; full golden replay (§8.5); mobile
+parity (§8.8); the variant seam (§3.9). OPEN-A resolved: **own bitboard
 implementation** (no wrapped crate). **G-A is not green yet.**
 
 ## Develop
