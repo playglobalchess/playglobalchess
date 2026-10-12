@@ -67,6 +67,11 @@ the consolidated §8.6 property net.
   intermediate per-ply FENs are an engine-generated **regression lock** (catch
   future drift; re-derive them when behaviour legitimately changes). Regression
   net: every bug found adds a golden case before its fix merges.
+- **Differential tier §8.7 (dev-only):** `tests/differential.rs` cross-checks
+  our `perft` against the `shakmaty` reference crate on the §8.1 corpus. Behind
+  the `difftest` feature (`cargo test --features difftest`), so `shakmaty` is
+  **never** in the default/release build (OPEN-A). Runs in the nightly tier; an
+  independent engine agreeing is strong evidence against a self-masking bug.
 
 ### Remaining for G-A
 
