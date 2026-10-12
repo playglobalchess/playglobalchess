@@ -20,8 +20,8 @@
 //! becomes live if/when a pin-aware generator is added as an optimization.)
 
 use pgc_engine::{
-    legal_moves, make, move_to_san, move_to_uci, parse_fen, perft, san_to_move, uci_to_move,
-    unmake, Position,
+    is_legal, legal_moves, make, move_to_san, move_to_uci, parse_fen, perft, san_to_move,
+    uci_to_move, unmake, Move, Position, Square,
 };
 use proptest::prelude::*;
 
@@ -98,5 +98,35 @@ proptest! {
         let n = legal_moves(&pos).len() as u64;
         let mut p = pos;
         prop_assert_eq!(perft(&mut p, 1), n);
+    }
+
+    /// `is_legal(p, m)` must agree with `legal_moves(p).contains(m)` for ALL
+    /// moves (§4.1): true for exactly the generated set, false for everything
+    /// else. We check every legal move (must be is_legal) and a sweep of all
+    /// 64×64 from/to pairs (is_legal iff in the legal set) — so a from an empty
+    /// square, an enemy piece, or a non-generated destination is all rejected.
+    #[test]
+    fn prop_is_legal_agrees_with_legal_moves(pos in reachable_position(40)) {
+        let legal = legal_moves(&pos);
+        let in_set = |m: Move| legal.iter().any(|&l| l == m);
+
+        for &m in legal.iter() {
+            prop_assert!(is_legal(&pos, m), "legal move {} rejected by is_legal", m.to_uci());
+        }
+        // Sweep a sample of arbitrary from/to pairs; is_legal must equal set
+        // membership. (Promotion moves carry promotion=None here, matching how
+        // non-promoting generated moves compare; a promotion in the legal set
+        // with promotion=None is never produced, so equality still holds.)
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                let m = Move::new(Square::new(from).unwrap(), Square::new(to).unwrap());
+                prop_assert_eq!(
+                    is_legal(&pos, m),
+                    in_set(m),
+                    "is_legal disagrees with legal set for {}",
+                    m.to_uci()
+                );
+            }
+        }
     }
 }
