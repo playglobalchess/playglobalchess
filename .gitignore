@@ -84,3 +84,10 @@ clients/android/codec-parity/src/main/kotlin/uniffi/
 # ensure the committed wrapper jar is NOT ignored by the generic *.jar rules.
 .gradle/
 !gradle/wrapper/gradle-wrapper.jar
+
+# ---- Generated web codec wasm artifacts (PLAN-CODEC 4.4, build_codec_web.sh) ----
+# wasm-pack output + wasm target dirs are BUILD OUTPUTS, not source — the crate,
+# tests, scripts and README are committed; these generated drop-ins are not.
+protocol/codec-wasm/pkg/
+protocol/codec-wasm/pkg-node/
+protocol/codec-wasm/target-wasm/
