@@ -589,7 +589,7 @@ Backend **services** (game-server X-2, accounts/rating X-3/X-4, anti-cheat X-5, 
 
 **Context.** ADR-10 fixed "WebSocket **binary** frame" for live play but not *which* binary encoding. SPEC-S2-PROTOCOL §3.1 defines the frame envelope (`ver | type | payload`) and leaves the payload codec as its open item Q-P2. The codec is a shared contract: web (TS), iOS (Swift), Android (Kotlin) and the Go server must all encode/decode the *same* bytes (NFR-10), and a per-platform hand-rolled codec is a drift risk (NFR-5 spirit — one encoding, many consumers).
 
-**Decision (proposed).** Use **one schema-defined binary codec compiled into the shared Rust core (ADR-9/11)**, exposed as `encode(msg)->bytes` / `decode(bytes)->msg` and bound into all three clients via UniFFI; the Go server calls the same codec across the ADR-12 FFI/gRPC boundary rather than reimplementing it. Candidate codecs to pick between at RATIFIED (a bounded, reversible sub-choice): a compact self-describing schema codec (`postcard`/`bincode`-family from the Rust ecosystem) vs a cross-language IDL codec (Protobuf/FlatBuffers). Leaning `postcard`-family: smallest frames, zero external IDL toolchain, and it lives natively in the Rust core we already ship — the clients get it for free through the existing FFI, with no second build system.
+**Decision.** Use **one schema-defined binary codec compiled into the shared Rust core (ADR-9/11)**, exposed as `encode(msg)->bytes` / `decode(bytes)->msg` and bound into all three clients via UniFFI; the Go server calls the same codec across the ADR-12 FFI/gRPC boundary rather than reimplementing it. Candidate codecs to pick between at RATIFIED (a bounded, reversible sub-choice): a compact self-describing schema codec (`postcard`/`bincode`-family from the Rust ecosystem) vs a cross-language IDL codec (Protobuf/FlatBuffers). Leaning `postcard`-family: smallest frames, zero external IDL toolchain, and it lives natively in the Rust core we already ship — the clients get it for free through the existing FFI, with no second build system.
 
 **Why.**
 - **One codec, three clients (NFR-10).** The engine-FFI parity discipline already proved byte-identical behavior across iOS+Android from one Rust core; the wire codec rides the same path, so parity is structural, not tested-in-after-the-fact.
@@ -604,6 +604,32 @@ Backend **services** (game-server X-2, accounts/rating X-3/X-4, anti-cheat X-5, 
 **Scope / boundary.** This ADR fixes *that there is one codec in the core*; the exact codec library and the byte-level field layout are pinned in SPEC-S2-PROTOCOL §4.3 (its byte-value appendix) at RATIFIED. REST/JSON (non-realtime) is unaffected — it stays JSON (SPEC-PE-API-CONTRACT).
 
 **Unblocks.** SPEC-S2-PROTOCOL RATIFIED (its Q-P2), the §4.3 byte appendix, and the shared-core codec implementation. **DECIDED by the owner 2026-10-12.**
+
+## ADR-15 (new) · Go↔Rust boundary — **DECIDED: one uniform in-process cgo/staticlib C-ABI, via a sibling wrapper crate per Rust crate Go consumes**
+
+> Refines ADR-12's "thin FFI/gRPC boundary or sidecar" into a single concrete, uniform mechanism for every Rust crate the Go tier consumes. **DECIDED by the architecture group, 2026-10-13.** (Reviewed alongside SPEC-S2-GAME-SERVER + PLAN-S2-CODEC v1.1.)
+
+**Context.** ADR-12 put the Go services on a "thin FFI/gRPC boundary or sidecar" to the Rust engine/core but did not fix *which* boundary. Two Rust crates now need Go consumption on the per-move hot path: the **codec** (`pgc-protocol`, every move = decode-intent → encode-event) and the **engine** (`pgc-engine`, server-side legality — NFR-5 forbids reimplementing rules in Go). PLAN-S2-CODEC v1.1 already DECIDED in-process cgo over a sibling `codec-cgo` staticlib for the codec. The engine has only a UniFFI (mobile) seam today and no Go path. Left undecided, the two seams would be designed independently → two buffer-ownership conventions, two `*_free` idioms, two cbindgen/build setups, two fuzz harnesses, in the two most safety-critical FFI boundaries in the system.
+
+**Decision.** Every Rust crate the Go tier consumes gets a **thin, delegate-only sibling C-ABI crate** (`<crate>-cgo`: `crate-type=["staticlib","rlib"]`, `#[no_mangle] extern "C"`, a `cbindgen`-generated header), consumed **in-process via cgo**. The pure crate stays `#![forbid(unsafe_code)]`; the one unavoidable `unsafe` seam is quarantined in the `-cgo` sibling. One uniform convention across all of them:
+- **Byte-oriented surface** (bytes in / bytes out) plus a small set of typed scalar accessors for the few fields the caller acts on — smallest unsafe surface, matches the wasm/mobile sibling shape (parity by construction).
+- **Buffer ownership:** Rust allocates outputs; Go copies into Go memory and calls the crate's `*_free`; Go never frees a Rust pointer nor hands Rust a retained Go pointer (the cgo pointer rule).
+- **Shared build discipline:** a `go:generate`/Makefile step cross-compiles the staticlib per deploy target (linux/amd64, linux/arm64) with the matching Rust `--target`; each `-cgo` crate ships a fuzz + leak test.
+This covers `pgc-protocol` → `codec-cgo` (PLAN-S2-CODEC v1.1, building now) and `pgc-engine` → `engine-cgo` (built when the game-server wires move validation; same pattern, not reinvented).
+
+**Why.**
+- **One pattern, audited once (quality).** The two most dangerous FFI boundaries share one buffer-ownership contract, one fuzz/leak discipline, one build path — far cheaper to review and maintain than two bespoke setups.
+- **Hot-path fit (NFR-1).** In-process cgo is ~tens of ns/call, negligible against the move budget; a sidecar/gRPC hop on the per-move path is backwards (PLAN-S2-CODEC §4.5 rationale).
+- **Core stays pristine (NFR-5, G-A).** The pure codec and engine keep `forbid-unsafe` and their dependency-light build; the ABI machinery lives only in the siblings.
+
+**Rejected.**
+- **cgo directly against the UniFFI staticlib** — its C surface is shaped for UniFFI's runtime, not plain cgo; wrong tool.
+- **gRPC/sidecar for codec or engine** — adds a network hop + failure mode to the operation that must be tiny and reliable (the move path). Sidecar stays the right call only for independently-scaled, own-lifecycle workers (e.g. a heavy analysis/NNUE service) — unchanged from ADR-12.
+- **A C-ABI inside the pure crates** — would relax `forbid-unsafe` on the single-source codec/engine; rejected in PLAN-S2-CODEC v1.1 for the codec, generalized here.
+
+**Scope / boundary.** This ADR fixes the *mechanism and its uniformity*. The per-crate C-ABI shape is pinned in each crate's owning spec (codec: PLAN-S2-CODEC v1.1 §4.5; engine: a later ENGINE-CGO note in SPEC-S1-ENGINE-CORE or SPEC-S2-GAME-SERVER §4 when move validation is wired). Does not change any wire/REST contract.
+
+**Unblocks.** SPEC-S2-GAME-SERVER §4 (Q-GS4) and the engine's Go consumption. **DECIDED by the architecture group 2026-10-13.**
 
 ### ADR summary
 
@@ -624,6 +650,7 @@ Backend **services** (game-server X-2, accounts/rating X-3/X-4, anti-cheat X-5, 
 | ADR-11 | delegated | Rust for engine + shared client core | **DECIDED** | S1/S5 |
 | ADR-12 | delegated | Go for services, Rust for engine/core | **DECIDED** | S2/S3/S6/S7 |
 | ADR-14 | new | One schema-defined binary wire codec in the shared Rust core | **DECIDED** | S2/S4/S5 |
+| ADR-15 | new | Go↔Rust via one uniform in-process cgo/staticlib C-ABI (a `<crate>-cgo` sibling per consumed crate) | **DECIDED** | S2/S1 + Architecture |
 
 ---
 
