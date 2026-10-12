@@ -204,6 +204,16 @@ impl Position {
         crate::fen::to_fen(self)
     }
 
+    /// The Zobrist key over this position's repetition-identity fields (§3.7,
+    /// OPEN-B): placement + side + castling rights + ep availability. Clocks are
+    /// excluded. Stable across builds (pinned seed). Used as the hash key for
+    /// repetition detection — a claim re-checks full equality to guard against
+    /// hash collisions.
+    #[must_use]
+    pub fn zobrist(&self) -> u64 {
+        crate::zobrist::zobrist(self)
+    }
+
     // --- debug invariant (§3.2: bitboards and mailbox must never disagree) ---
 
     /// Debug-build consistency check: every mailbox entry agrees with the
