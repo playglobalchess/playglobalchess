@@ -44,9 +44,21 @@ rules engine) ever demands it.
   give. Given the 500× headroom this is well within budget; tightening it is a
   non-goal unless a future measurement regresses.
 
-## CI
+## CI — two tiers, reconciling §8.8
 
-The nightly `engine-perf-bench` job runs `cargo bench` and fails if either headline
-metric regresses past its §6.1 threshold (checked in `platform/ci/check_bench.py`).
-Benches do NOT run on the per-commit path (criterion runs are seconds-long and noisy
-on shared runners); they run in the nightly tier alongside the slow perft corpus.
+§8.8's fast tier names an "`is_legal`/`legal_moves` micro-bench threshold" as a
+**per-commit** gate; the slow tier runs the full statistical bench nightly. Both halves
+now exist, so the implementation matches the spec:
+
+- **Per-commit** (`engine` job, every PR): `tests/perf_smoke.rs` — ordinary `#[test]`s
+  that time `legal_moves`/`is_legal` with a GENEROUS order-of-magnitude ceiling (debug
+  profile), catching a catastrophic regression (accidental O(n²), allocation storm)
+  without criterion's seconds-long, noise-prone run. A green here is a smoke signal, not
+  a to-spec measurement.
+- **Nightly** (`engine-perf-bench`, schedule-only): `cargo bench` + `check_bench.py`
+  against the precise §6.1 ceilings (legal_moves < 1 ms, is_legal < 10 µs). This is the
+  authoritative gate; criterion runs are kept off the per-commit path because they are
+  seconds-long and noisy on shared runners.
+
+The split honours §8.8 literally (a per-commit threshold exists) while keeping precise
+measurement where it is reliable.
