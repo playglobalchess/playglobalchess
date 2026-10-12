@@ -12,6 +12,15 @@ publish = false
 # for differential testing only (§8.7) and are NOT runtime dependencies.
 [dependencies]
 thiserror = "1.0.69"   # library error types per engineering-conventions.md
+# §8.7 differential testing (D3): reference crate used ONLY to cross-check our
+# perft during bring-up. OPTIONAL + behind the `difftest` feature, so a normal
+# or release build never pulls it — OPEN-A (own implementation) is unaffected.
+shakmaty = { version = "0.30.2", optional = true }
+
+[features]
+# Enable the §8.7 differential tier: `cargo test --features difftest`. Dev-only;
+# never enabled by default, never in a shipped build.
+difftest = ["dep:shakmaty"]
 
 [dev-dependencies]
 # Property-based testing for the §8.6 round-trip properties (FEN/UCI/SAN,

@@ -66,7 +66,10 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
           cargo fmt --manifest-path engine/Cargo.toml --all -- --check
-          cargo clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
+          # Default features only on the per-commit path: do NOT force `difftest`
+          # (which pulls the shakmaty reference crate). The §8.7 differential tier
+          # is linted + run in the nightly engine-nightly-perft job.
+          cargo clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path engine/Cargo.toml --all
 
   # Nightly ONLY (schedule event): the slow #[ignore]d perft tier (§8.8) — the
@@ -86,6 +89,11 @@ jobs:
           # --release so the deep perft finishes in reasonable CI time (§6.1
           # opt levels); -- --ignored runs ONLY the slow-tier corpus tests.
           cargo test --manifest-path engine/Cargo.toml --release --test perft_corpus -- --ignored --nocapture
+      - name: Differential tier vs shakmaty (§8.7, dev-only)
+        run: |
+          # Cross-check our perft against the reference crate. --features difftest
+          # pulls shakmaty ONLY here (never default / per-commit — OPEN-A).
+          cargo test --manifest-path engine/Cargo.toml --release --features difftest --test differential -- --nocapture
 
   # Nightly ONLY: the §6.1 performance benches (NFR-1 / G-A sub-ms move gen).
   # criterion runs are seconds-long and noisy on shared runners, so they are
