@@ -353,11 +353,11 @@ mod tests {
 
     #[test]
     fn san_check_and_mate() {
-        // Fool's mate position: White to move is already mated? No — build a mate.
-        // Scholar's-ish: Qxf7# . Use a simple back-rank mate: Ra8#.
+        // Back-rank mate: Ra8# — Black Kg8 is boxed by its own f7/g7/h7 pawns,
+        // so the rook check on the 8th rank is mate (the `#` suffix).
         let p = pos("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1");
         assert_eq!(move_to_san(&p, mv(&p, "a1a8")), "Ra8#");
-        // A checking (non-mate) rook move.
+        // Same rook check with the king able to escape ⇒ a plain check (`+`).
         let p2 = pos("4k3/8/8/8/8/8/8/R3K3 w - - 0 1");
         assert_eq!(move_to_san(&p2, mv(&p2, "a1a8")), "Ra8+");
     }
@@ -417,5 +417,68 @@ mod tests {
         // internal decoder, not a strict PGN *validator* (strict validation is
         // F-08 import's job). It is not the silent x-stripping that was fixed:
         // the `x` is still required to sit immediately before the destination.
+    }
+
+    // --- san_to_move branches reachable ONLY from external SAN (PGN import,
+    // opponent input) — never produced by move_to_san, so the round-trip
+    // property does not exercise them. These are the S2/UniFFI-bound decode
+    // paths that must survive untrusted text. ------------------------------
+
+    #[test]
+    fn san_to_move_ambiguous_without_disambiguation() {
+        // Two knights (b1, f3) both reach d2. Bare "Nd2" is ambiguous and must
+        // report it (not silently pick one) — "Nbd2"/"Nfd2" resolve uniquely.
+        let p = pos("4k3/8/8/8/8/5N2/8/1N2K3 w - - 0 1");
+        assert_eq!(
+            san_to_move(&p, "Nd2"),
+            Err(MoveError::Ambiguous("Nd2".into()))
+        );
+        assert_eq!(san_to_move(&p, "Nbd2"), Ok(mv(&p, "b1d2")));
+        assert_eq!(san_to_move(&p, "Nfd2"), Ok(mv(&p, "f3d2")));
+    }
+
+    #[test]
+    fn san_to_move_illegal_wellformed() {
+        // Well-formed SAN for a move that is not legal here ⇒ Illegal.
+        let p = Position::startpos();
+        assert_eq!(
+            san_to_move(&p, "Nf4"),
+            Err(MoveError::Illegal("Nf4".into()))
+        );
+        assert_eq!(
+            san_to_move(&p, "O-O"),
+            Err(MoveError::Illegal("O-O".into()))
+        );
+    }
+
+    #[test]
+    fn san_to_move_malformed() {
+        let p = Position::startpos();
+        for bad in ["", "Z9", "e", "=Q", "Ke2e4e4"] {
+            assert!(
+                matches!(san_to_move(&p, bad), Err(MoveError::Malformed(_))),
+                "expected Malformed for {bad:?}, got {:?}",
+                san_to_move(&p, bad)
+            );
+        }
+    }
+
+    #[test]
+    fn san_to_move_castling_spellings_and_queenside() {
+        let p = pos("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        // Letter-O and zero spellings both accepted; king-side and queenside.
+        assert_eq!(san_to_move(&p, "O-O"), Ok(mv(&p, "e1g1")));
+        assert_eq!(san_to_move(&p, "0-0"), Ok(mv(&p, "e1g1")));
+        assert_eq!(san_to_move(&p, "O-O-O"), Ok(mv(&p, "e1c1")));
+        assert_eq!(san_to_move(&p, "0-0-0"), Ok(mv(&p, "e1c1")));
+    }
+
+    #[test]
+    fn san_to_move_accepts_ep_suffix() {
+        // The optional `e.p.` suffix on an en-passant capture is tolerated.
+        let p = pos("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3");
+        let ep = mv(&p, "e5d6");
+        assert_eq!(san_to_move(&p, "exd6e.p."), Ok(ep));
+        assert_eq!(san_to_move(&p, "exd6"), Ok(ep)); // and without the suffix
     }
 }
