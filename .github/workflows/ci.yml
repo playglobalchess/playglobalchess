@@ -40,7 +40,7 @@ jobs:
         with:
           filters: |
             engine: ['engine/**']
-            protocol: ['protocol/**', 'platform/mobile/*codec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**']
+            protocol: ['protocol/**', 'platform/mobile/*[Cc]odec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**']
             services: ['services/**']
             web: ['clients/web/**']
             mobile: ['clients/ios/**', 'clients/android/**']
