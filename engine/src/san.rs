@@ -208,21 +208,44 @@ pub fn san_to_move(pos: &Position, san: &str) -> Result<Move, MoveError> {
         _ => (PieceType::Pawn, body),
     };
 
-    // The destination is the last two chars of `rest` (after dropping any `x`).
-    let rest_nox: String = rest.chars().filter(|&c| c != 'x').collect();
-    if rest_nox.len() < 2 {
+    // `rest` is `[disambiguation][x]<dest>`. The capture marker `x`, if present,
+    // must appear exactly once and immediately before the two-char destination.
+    // Reject anything else (`Nxxe4`, `e4x`, `Nx`, a stray mid-string `x`) rather
+    // than silently normalising it — important once PGN import (F-08) feeds
+    // untrusted text through this parser.
+    let x_count = rest.bytes().filter(|&b| b == b'x').count();
+    if x_count > 1 {
         return Err(MoveError::Malformed(raw.to_string()));
     }
-    let dest_str = &rest_nox[rest_nox.len() - 2..];
-    let dest = Square::from_coord(dest_str).ok_or_else(|| MoveError::Malformed(raw.to_string()))?;
-    // Whatever precedes the destination is the disambiguation hint (file/rank).
-    let hint = &rest_nox[..rest_nox.len() - 2];
+    let (hint, dest_str): (&str, &str) = if x_count == 1 {
+        // Split on the single `x`: left = disambiguation, right MUST be the dest.
+        let (lhs, rhs) = rest.split_once('x').expect("x_count == 1");
+        if rhs.len() != 2 {
+            return Err(MoveError::Malformed(raw.to_string()));
+        }
+        (lhs, rhs)
+    } else {
+        // No capture marker: destination is the trailing two chars.
+        if rest.len() < 2 {
+            return Err(MoveError::Malformed(raw.to_string()));
+        }
+        (&rest[..rest.len() - 2], &rest[rest.len() - 2..])
+    };
 
+    let dest = Square::from_coord(dest_str).ok_or_else(|| MoveError::Malformed(raw.to_string()))?;
+
+    // Whatever precedes the destination is the disambiguation hint (file/rank).
     let (mut hint_file, mut hint_rank) = (None, None);
     for c in hint.chars() {
         if ('a'..='h').contains(&c) {
+            if hint_file.is_some() {
+                return Err(MoveError::Malformed(raw.to_string())); // two file hints
+            }
             hint_file = Some(c as u8 - b'a');
         } else if ('1'..='8').contains(&c) {
+            if hint_rank.is_some() {
+                return Err(MoveError::Malformed(raw.to_string())); // two rank hints
+            }
             hint_rank = Some(c as u8 - b'1');
         } else {
             return Err(MoveError::Malformed(raw.to_string()));
@@ -372,5 +395,27 @@ mod tests {
         let m = mv(&p, "a1a8");
         assert_eq!(san_to_move(&p, "Ra8#"), Ok(m));
         assert_eq!(san_to_move(&p, "Ra8"), Ok(m)); // decoration optional on parse
+    }
+
+    #[test]
+    fn san_parse_rejects_malformed_capture_syntax() {
+        // The `x` marker must appear once, immediately before the two-char
+        // destination. These are structurally malformed and must be rejected
+        // (not silently normalised by stripping every `x`).
+        let p = pos("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3");
+        for bad in ["exxd6", "ex6d", "e5xd", "exd", "Nxxd5"] {
+            assert!(
+                matches!(san_to_move(&p, bad), Err(MoveError::Malformed(_))),
+                "expected Malformed for {bad}, got {:?}",
+                san_to_move(&p, bad)
+            );
+        }
+        // The valid capture parses.
+        assert_eq!(san_to_move(&p, "exd6"), Ok(mv(&p, "e5d6")));
+        // NOTE: a from-file-less pawn capture like `xd6` is accepted leniently
+        // when it still resolves to a unique legal move — this is a lenient
+        // internal decoder, not a strict PGN *validator* (strict validation is
+        // F-08 import's job). It is not the silent x-stripping that was fixed:
+        // the `x` is still required to sit immediately before the destination.
     }
 }
