@@ -43,14 +43,51 @@ IOS_PKG="clients/ios/EngineParityTests"
 mkdir -p "$IOS_PKG/Sources/PgcEngineFfi" "$IOS_PKG/Frameworks"
 # Generated Swift bindings → the SwiftPM target source dir.
 cp "$OUT/swift/pgc_engine_ffi.swift" "$IOS_PKG/Sources/PgcEngineFfi/"
+
+# --- C interop target: publish the `pgc_engine_ffiFFI` Clang module ----------
+# The generated pgc_engine_ffi.swift pulls its low-level FFI types (RustBuffer,
+# RustCallStatus, the uniffi_*_checksum_* / ffi_*_contract_version symbols) via
+#   #if canImport(pgc_engine_ffiFFI)
+# SwiftPM does NOT auto-promote a static-library xcframework's bundled headers
+# to an importable Clang module, so without a dedicated C target that import is
+# skipped and every FFI type is "cannot find type ... in scope". This target
+# owns the header + module.modulemap; the matching symbols link from the .a in
+# the xcframework.
+C_INC="$IOS_PKG/Sources/PgcEngineFfiC/include"
+mkdir -p "$C_INC"
+cp "$OUT/swift/pgc_engine_ffiFFI.h" "$C_INC/"
+cat > "$C_INC/module.modulemap" <<'MODMAP'
+// §8.8 iOS parity — Clang module exposing the UniFFI C ABI to Swift (ENGINE-CORE §8.8, ADR-9).
+// Module name MUST be `pgc_engine_ffiFFI` (the generated Swift gates its FFI import on it).
+// Symbols are linked from PgcEngineFfiFFI.xcframework; this only publishes declarations.
+module pgc_engine_ffiFFI {
+    header "pgc_engine_ffiFFI.h"
+    export *
+}
+MODMAP
+# SwiftPM needs at least one compilable source in a C target.
+if [[ ! -f "$IOS_PKG/Sources/PgcEngineFfiC/shim.c" ]]; then
+  cat > "$IOS_PKG/Sources/PgcEngineFfiC/shim.c" <<'SHIM'
+// Intentionally empty — the real symbols link from PgcEngineFfiFFI.xcframework.
+// This target exists only to publish the pgc_engine_ffiFFI Clang module.
+SHIM
+fi
+
 # Build the xcframework from the device + simulator static libs. (xcodebuild is
-# required; this is the step that needs full Xcode.)
-HDR="$OUT/swift"
+# required; this is the step that needs full Xcode.) The headers dir passed to
+# -create-xcframework must contain ONLY the C header: bundling the generated
+# .modulemap too would declare `module pgc_engine_ffiFFI` a SECOND time and
+# collide with PgcEngineFfiC above (duplicate-module redefinition).
+HDR="$(mktemp -d)"
+cp "$OUT/swift/pgc_engine_ffiFFI.h" "$HDR/"
+# xcodebuild -create-xcframework refuses to overwrite an existing output.
+rm -rf "$IOS_PKG/Frameworks/PgcEngineFfiFFI.xcframework"
 xcodebuild -create-xcframework \
   -library "$FFI_DIR/target/aarch64-apple-ios/release/libpgc_engine_ffi.a" -headers "$HDR" \
   -library "$FFI_DIR/target/aarch64-apple-ios-sim/release/libpgc_engine_ffi.a" -headers "$HDR" \
   -output "$IOS_PKG/Frameworks/PgcEngineFfiFFI.xcframework" 2>&1 | tail -2 || \
   echo "WARN: xcframework build skipped/failed — ensure full Xcode is active." >&2
+rm -rf "$HDR"
 
 echo "== package for the Android instrumented test (clients/android/engine-parity) =="
 AND_MOD="clients/android/engine-parity"

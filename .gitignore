@@ -65,7 +65,7 @@ secrets/
 # UniFFI-generated bindings, cross-compiled native libs, and the xcframework are
 # BUILD OUTPUTS, not source — the test-target scaffolds + the hand-written
 # parity tests are committed; these generated drop-ins are not.
-clients/ios/EngineParityTests/Sources/PgcEngineFfi/pgc_engine_ffi.swift
+clients/ios/EngineParityTests/Sources/
 clients/ios/EngineParityTests/Frameworks/
 clients/android/engine-parity/src/main/jniLibs/
 clients/android/engine-parity/src/main/kotlin/uniffi/
