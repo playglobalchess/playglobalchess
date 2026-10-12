@@ -40,7 +40,7 @@ jobs:
         with:
           filters: |
             engine: ['engine/**']
-            protocol: ['protocol/**']
+            protocol: ['protocol/**', 'platform/mobile/*codec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**']
             services: ['services/**']
             web: ['clients/web/**']
             mobile: ['clients/ios/**', 'clients/android/**']
@@ -127,8 +127,68 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate shared contract (schema lint + codegen check)
-        run: echo "::notice::protocol/ stub — add schema lint + client/server codegen drift check here."
+      - name: Codec build + test (ADR-14, SPEC-S2-PROTOCOL §8)
+        run: |
+          if [ ! -f protocol/codec/Cargo.toml ]; then
+            echo "::notice::protocol/codec has no Cargo.toml yet — stub, no build."
+            exit 0
+          fi
+          # Real codec gate, mirroring the engine job: fmt + clippy
+          # (warnings-as-errors, per engineering-conventions.md) + tests on BOTH
+          # the pure codec crate and its UniFFI wrapper. This is the automated
+          # guard that an edit to a §4A field / mirror type which breaks
+          # round-trip or the golden-vector byte-freeze fails loudly here (the
+          # golden_freeze + ffi_bytes_match_core_bytes tests), rather than
+          # silently shipping an NFR-10 wire divergence.
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          # pure codec crate (pgc-protocol): round-trip + negative + golden-freeze
+          # + property + ordering (SPEC-S2-PROTOCOL §8, PLAN-CODEC §5).
+          cargo fmt --manifest-path protocol/codec/Cargo.toml --all -- --check
+          cargo clippy --manifest-path protocol/codec/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path protocol/codec/Cargo.toml
+          # UniFFI wrapper (pgc-protocol-ffi, PLAN-CODEC §4.3): the host build +
+          # binding-surface unit tests + the codec parity oracle. The iOS/Android
+          # cross-builds + device parity run need the mobile toolchains
+          # (platform/mobile/build_codec_mobile.sh), not the per-commit path.
+          cargo fmt --manifest-path protocol/codec-ffi/Cargo.toml --all -- --check
+          cargo clippy --manifest-path protocol/codec-ffi/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path protocol/codec-ffi/Cargo.toml
+
+  # macOS host-provable parity tier (SPEC-S2-PROTOCOL §8, PLAN-CODEC §4.3): the
+  # Swift consumer RUNS against the codec dylib and reproduces the frozen golden
+  # bytes, and the Kotlin binding type-checks (kotlinc + a pinned, verified JNA).
+  # Needs a mac runner for swiftc/kotlinc, so it is a SEPARATE job from the
+  # ubuntu Rust gate above (which is the real regression gate). The on-device
+  # Simulator/emulator runs stay manual (platform/mobile/README-codec.md) — they
+  # need a booted device, which hosted runners do not provide cheaply.
+  protocol-parity:
+    needs: changes
+    if: ${{ needs.changes.outputs.protocol == 'true' || needs.changes.outputs.mobile == 'true' }}
+    runs-on: macos-latest
+    # ADVISORY until proven green on a hosted mac runner. The ubuntu `protocol`
+    # job above is the REAL regression gate (golden-freeze + ffi parity tests);
+    # this macOS tier adds the Swift-run / Kotlin-compile proof but runs on a
+    # toolchain (hosted-runner swiftc/kotlinc/brew) that has not yet been
+    # exercised here. continue-on-error so a first-run environment wrinkle
+    # informs rather than blocks every protocol PR; flip to a hard gate once a
+    # green run on main confirms the path. (No security theatre: the gate that
+    # actually catches a wire divergence is the required ubuntu job.)
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host-provable codec parity (Swift run + Kotlin binding compile)
+        run: |
+          if [ ! -f protocol/codec-ffi/Cargo.toml ]; then
+            echo "::notice::protocol/codec-ffi has no Cargo.toml yet — stub, no parity."
+            exit 0
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          # kotlinc for the Kotlin binding type-check; JNA is fetched + verified
+          # by the script itself (pinned 5.14.0), so no primed cache is needed.
+          brew install kotlin >/dev/null
+          platform/mobile/run_codec_parity.sh
 
   services:
     needs: changes
