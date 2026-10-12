@@ -68,18 +68,14 @@ the consolidated §8.6 property net.
   future drift; re-derive them when behaviour legitimately changes). Regression
   net: every bug found adds a golden case before its fix merges.
 
-### Remaining for G-A
-
-- **Mobile parity §8.8 (stage 3d):** `pgc-engine-ffi` (UniFFI, ADR-9) exposes
-  the parity slice (perft, startpos FEN, SAN replay) to Swift + Kotlin.
-  **Proven host-side:** the engine cross-compiles for `aarch64-apple-ios`,
-  `-ios-sim`, and `aarch64-linux-android` (NDK); UniFFI generates Swift + Kotlin
-  bindings; the **Swift parity test RUNS and matches the host oracle
-  byte-for-byte** (startpos d5 = 4,865,609 + golden-slice FEN); the Kotlin
-  binding type-checks. Oracle: `engine/tests/mobile_parity_oracle.rs`. Harness:
-  `platform/mobile/`. **Device-gated remainder:** the Kotlin parity RUN on an
-  Android emulator/device (the arm64 `.so` cannot load on a host JVM) and the
-  iOS run on a simulator Xcode test target.
+- **Mobile parity §8.8 (stage 3d) — host-proven:** `pgc-engine-ffi` (UniFFI,
+  ADR-9) exposes the parity slice (perft, startpos FEN, SAN replay) to Swift +
+  Kotlin. The engine cross-compiles for `aarch64-apple-ios`, `-ios-sim`, and
+  `aarch64-linux-android` (NDK); UniFFI generates Swift + Kotlin bindings; the
+  **Swift parity test RUNS and matches the host oracle byte-for-byte** (startpos
+  d5 = 4,865,609 + golden-slice FEN); the Kotlin binding type-checks. Oracle:
+  `engine/tests/mobile_parity_oracle.rs`. Harness: `platform/mobile/`. The
+  on-device run is the remaining last mile (below).
 
 ### Remaining for G-A
 
