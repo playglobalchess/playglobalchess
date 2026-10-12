@@ -5,8 +5,8 @@
 | Doc ID | PLAN-S2-CODEC |
 | Owner | S2 Real-time |
 | Status | RATIFIED |
-| Version | 1.0 |
-| Last updated | 2026-10-12 (owner-approved; OPEN-C1=wasm, OPEN-C2=postcard, Go consumption=cgo/staticlib all DECIDED) |
+| Version | 1.1 |
+| Last updated | 2026-10-13 (v1.1 amendment: Go consumption via a sibling `codec-cgo` crate, not the core — §4.5, OPEN-C4; corrects the v1.0 "pure crate emits the staticlib" wording. v1.0 2026-10-12: OPEN-C1=wasm, OPEN-C2=postcard, Go consumption=cgo/staticlib DECIDED.) |
 | Implements | ADR-14 (DECIDED); SPEC-S2-PROTOCOL §3.1 + §4A (RATIFIED); NFR-5, NFR-10, NFR-1 |
 | Depends on | SPEC-S2-PROTOCOL (frozen byte layout §4A); the existing `engine/ffi` UniFFI pattern (pgc-engine-ffi) |
 
@@ -29,10 +29,14 @@ engine/
 protocol/
   codec/  (pgc-protocol)    NEW — the pure codec crate: §4A types + encode/decode
   codec-ffi/ (pgc-protocol-ffi)  NEW — UniFFI wrapper (Swift/Kotlin), mirrors engine/ffi
+  codec-wasm/ (pgc-protocol-wasm) NEW — wasm-bindgen wrapper (web, OPEN-C1), via wasm-pack
+  codec-cgo/ (pgc-protocol-cgo)  NEW — C-ABI (staticlib + cbindgen header) for the Go server (§4.5, cgo)
   vectors/                  NEW — the frozen golden-vector corpus (shared by all consumers)
 ```
 
 **Rationale for a new `pgc-protocol` crate (not folding into `pgc-engine`):** the engine crate is deliberately dependency-free and "adds no chess logic / nothing but chess" (its Cargo.toml). The codec is not chess logic; putting it in `pgc-engine` would pull a serialization dependency into the rules core and blur the single-responsibility line G-A was built on. A sibling crate keeps the engine pristine and matches the repo's existing `protocol/` folder (currently a placeholder). **Path DECIDED: `protocol/codec/` (OPEN-C3, owner 2026-10-12).**
+
+**One binding pattern for every consumer (v1.1).** The pure `pgc-protocol` crate stays `#![forbid(unsafe_code)]`, dependency-light, and a plain `lib` — it owns the §4A types + encode/decode and nothing ABI-specific. **Every foreign-ABI consumer is a thin sibling wrapper** that depends on it and adds only its own `crate-type` + binding machinery: `codec-ffi` (UniFFI, mobile), `codec-wasm` (wasm, web), and `codec-cgo` (C-ABI, the Go server). This mirrors `pgc-engine → pgc-engine-ffi` and keeps the single unavoidable `unsafe` seam (the `extern "C"` C-ABI) **quarantined in `codec-cgo`**, so the core's forbid-unsafe guarantee — a property G-D's single-source-of-truth leans on — is never relaxed, and the `staticlib`/`cdylib` build cost never lands on the consumers that don't need it. (v1.0 §4.5 wrongly said the Go path links the *core* crate's staticlib "the crate already emits it"; the core emits no staticlib and no C-ABI, and adding them there would break forbid-unsafe. v1.1 corrects this to the sibling pattern — the architecturally consistent reading of this very section.)
 
 ## 3. Codec choice (ADR-14 sub-choice) — DECIDED: `postcard` + golden-vector freeze guard
 
@@ -67,9 +71,9 @@ ADR-14 DECIDED "one schema-defined binary codec in the shared Rust core" and lef
 
 **4.4 Web/TypeScript binding — `wasm-pack` (OPEN-C1 = (a) DECIDED).** Compile `pgc-protocol` to WebAssembly via `wasm-pack`; the web client imports the generated JS/wasm and calls the *same* `encode`/`decode` the server and mobile run. A thin typed TS wrapper exposes the message/event types to the web app. Its parity test runs the §4.2 golden vectors in the web test runner and asserts byte-identical decode→re-encode.
 
-**4.5 Go server consumption — DECIDED: cgo over the static library, in-process.** The Go game-server (X-2, ADR-12) links the `pgc-protocol` **`staticlib`** (the crate already emits it) and calls `encode`/`decode` as C-ABI functions **in-process** — no network hop, no second serialization boundary. Rationale: the codec is on the hottest path (every move = decode-intent → validate → encode-event, at IX.2's 50k moves/sec within the §IX.1 50 ms p50 / 300 ms ceiling); a **sidecar would add a network hop + a failure mode to the one operation that must be tiny and reliable** — backwards. cgo's per-call overhead (~tens of ns) is negligible against a move's budget; the Go↔Rust toolchain coupling was already accepted when the engine became Rust-consumed-by-Go (ADR-12).
+**4.5 Go server consumption — DECIDED: cgo over a sibling `codec-cgo` static library, in-process (v1.1).** The Go game-server (X-2, ADR-12) links the **`pgc-protocol-cgo`** sibling crate's **`staticlib`** — a thin, delegate-only C-ABI wrapper over `pgc-protocol` (the `codec/` pure crate, mirroring how `codec-ffi` and `codec-wasm` wrap it) — and calls `encode`/`decode` as C-ABI functions **in-process** — no network hop, no second serialization boundary. `codec-cgo` emits `crate-type = ["staticlib", "rlib"]`, a `#[no_mangle] extern "C"` surface (the one place `unsafe` lives — carries safety comments), and a `cbindgen`-generated C header; the pure core stays `#![forbid(unsafe_code)]` (see §2 "one binding pattern"). Rationale: the codec is on the hottest path (every move = decode-intent → validate → encode-event, at IX.2's 50k moves/sec within the §IX.1 50 ms p50 / 300 ms ceiling); a **sidecar would add a network hop + a failure mode to the one operation that must be tiny and reliable** — backwards. cgo's per-call overhead (~tens of ns) is negligible against a move's budget; the Go↔Rust toolchain coupling was already accepted when the engine became Rust-consumed-by-Go (ADR-12).
 
-**ADR-12 "FFI/gRPC boundary or sidecar" read by path:** the codec + engine (hot, per-move, latency-critical) → **in-process FFI (cgo/staticlib)**; a service that scales independently with its own lifecycle (e.g. a heavy analysis/NNUE worker) → gRPC/sidecar. Do not sidecar the move path. The concrete cgo build wiring (header generation, link flags, cross-compile) is specified in the `services/game-server` spec (OPEN-C4); this plan fixes the *decision* (in-process cgo) and guarantees the `staticlib` + C-ABI surface the game-server links against. Its contract test decodes the golden vectors too.
+**ADR-12 "FFI/gRPC boundary or sidecar" read by path:** the codec + engine (hot, per-move, latency-critical) → **in-process FFI (cgo/staticlib)**; a service that scales independently with its own lifecycle (e.g. a heavy analysis/NNUE worker) → gRPC/sidecar. Do not sidecar the move path. **This plan owns the existence + shape of the `codec-cgo` sibling crate and its C-ABI surface** (§2, §4.5); the `services/game-server` spec (OPEN-C4) owns only the *consumption* detail on the Go side — link flags, cross-compile, buffer-ownership rules, and the Go contract test. Its contract test decodes the golden vectors too.
 
 **4.6 Wire the CI job.** Add a path-filtered `protocol` job to `.github/workflows/ci.yml` (mirrors the engine job): `cargo test` on `pgc-protocol` + `pgc-protocol-ffi`, and the golden-vector cross-check. Add the web + mobile vector checks as those toolchains are wired.
 
@@ -89,7 +93,7 @@ The golden-vector corpus is the single source of truth across languages — the 
 
 **OPEN-C1 — Web/TypeScript codec path — DECIDED (a) wasm, owner, 2026-10-12.** The web client runs the **same compiled `pgc-protocol` Rust codec via `wasm-pack`/WebAssembly** — one implementation everywhere (server, iOS, Android, web), parity by construction rather than by test. Accepted cost: a wasm build step in the web pipeline and a ~tens-of-KB wasm payload in the bundle. Step 4.4 builds this; the hand-written-TS alternative is rejected (it reintroduces the NFR-10 drift risk ADR-14 exists to kill).
 
-Secondary: **OPEN-C2 — codec library — DECIDED `postcard`** (§3), with the golden-vector corpus as the field-order freeze guard; Protobuf/FlatBuffers kept as a documented API-compatible fallback. **OPEN-C3 — `pgc-protocol` crate placement — DECIDED `protocol/codec/` (owner, 2026-10-12).** **OPEN-C4 — the concrete cgo build wiring for the Go server (§4.5)** — the *decision* is in-process cgo over the staticlib; the header-gen/link-flags/cross-compile detail is owned by the `services/game-server` spec, not this plan.
+Secondary: **OPEN-C2 — codec library — DECIDED `postcard`** (§3), with the golden-vector corpus as the field-order freeze guard; Protobuf/FlatBuffers kept as a documented API-compatible fallback. **OPEN-C3 — `pgc-protocol` crate placement — DECIDED `protocol/codec/` (owner, 2026-10-12).** **OPEN-C4 — Go-server cgo consumption — DECIDED (v1.1): a sibling `protocol/codec-cgo` crate (staticlib + cbindgen C-ABI) wrapping the pure core, consumed in-process via cgo.** This plan owns the crate + C-ABI shape (§4.5); the Go-side build wiring (link flags, cross-compile, buffer ownership, Go contract test) is owned by the `services/game-server` spec. (v1.0 scoped OPEN-C4 to "wiring detail, not a new crate" over the core's own staticlib — corrected here because the core emits none and a sibling preserves forbid-unsafe; see §2.)
 
 ## 7. What this plan does NOT do
 - No chess logic (engine owns it); no server behavior (game-server owns clocks/matchmaking/reconnection); no REST (that's JSON, SPEC-PE-API-CONTRACT); no persistence engine. The codec serializes the frozen §4A shapes and nothing more.
