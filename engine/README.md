@@ -41,20 +41,22 @@ Implemented against the ratified spec:
   (OPEN-B, pinned seed) over exactly the identity fields backs repetition; full
   equality remains the collision guard. The engine reports *availability* only
   and never ends a game (§4.1).
+- **Move encoding** (§4.2, stage 2e): `move_to_san` / `san_to_move` with
+  disambiguation (`Nbd2`/`N1d2`/`Nb1d2`), `x` capture, `+`/`#`, `O-O`/`O-O-O`,
+  `=Q` promotion; position-aware `uci_to_move` / `move_to_uci` (validated
+  against the legal set). SAN & UCI round-trip for every legal move (§8.6).
 
 **Gates green:** FEN round-trip (§8.6), make/unmake inverse (§8.6), the full
-§8.1 perft corpus (every position exact to its stated depth; slow tier in
-nightly), the §8.2 move-set edge cases, and §8.3 game-end detection (incl.
-threefold-by-position via different move orders, the castling-rights distinction
-E-11, and the K+N+N non-draw E-12).
+§8.1 perft corpus (slow tier in nightly), the §8.2 move-set edge cases, §8.3
+game-end detection (incl. threefold-by-position, the castling-rights E-11
+distinction, the K+N+N non-draw E-12), and the §4.2 SAN/UCI round-trips.
 
-### Deferred to later chunk-2 stages / chunks (not yet verified)
+### Deferred to later chunk-2 stage / chunks (not yet verified)
 
-SAN (§4.2) [2e]; the §8.6 full property net [2f]; magic bitboards and the §6.1
+The §8.6 full property-net consolidation [2f]; magic bitboards and the §6.1
 benchmarks; full golden replay (§8.5); mobile parity (§8.8); the variant
-seam (§3.9). OPEN-A resolved: **own bitboard implementation** (no wrapped
-crate). OPEN-B resolved: **own Zobrist, pinned seed**. **G-A is not green
-yet.**
+seam (§3.9). OPEN-A resolved: **own bitboard implementation**. OPEN-B resolved:
+**own Zobrist, pinned seed**. **G-A is not green yet.**
 
 ## Develop
 

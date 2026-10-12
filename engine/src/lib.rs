@@ -24,13 +24,15 @@
 //! `perft(startpos, 1) == 20`, and the make/unmake inverse (§8.6).
 //!
 //! Implemented since: the full §8.1 perft corpus [2b], the E-1..E-14 edge-case
-//! corpus (§8.2) [2c], and game-end/draw detection with a Zobrist key
-//! (§3.7, §4.1, OPEN-B) [2d] — [`status`], [`status_with_history`], [`zobrist`].
+//! corpus (§8.2) [2c], game-end/draw detection with a Zobrist key
+//! (§3.7, §4.1, OPEN-B) [2d] — [`status`], [`status_with_history`], [`zobrist`]
+//! — and move encoding (§4.2) [2e]: [`move_to_san`], [`san_to_move`],
+//! position-aware [`uci_to_move`] / [`move_to_uci`].
 //!
-//! **Deferred to later chunk-2 stages / chunks (NOT yet verified):** SAN
-//! (§4.2) [2e], the §8.6 full property net [2f]; and in later chunks: magic
-//! bitboards, benchmarks (§6.1), full golden replay (§8.5), mobile parity
-//! (§8.8). The variant seam (§3.9) is forward-looking.
+//! **Deferred to later chunk-2 stage / chunks (NOT yet verified):** the §8.6
+//! full property net consolidation [2f]; and in later chunks: magic bitboards,
+//! benchmarks (§6.1), full golden replay (§8.5), mobile parity (§8.8). The
+//! variant seam (§3.9) is forward-looking.
 //!
 //! Design tenets honored: pure, deterministic, no RNG / clock / global state
 //! (§1.4.1); stable move order by (from, to, promotion) (§3.8).
@@ -45,14 +47,14 @@ pub mod movegen;
 pub mod moves;
 pub mod perft;
 pub mod position;
+pub mod san;
 pub mod status;
 pub mod types;
 pub mod zobrist;
 
 // --- Public API surface (ENGINE-CORE §4) ------------------------------------
 // Flat re-exports so consumers (S2 via FFI/gRPC, the client core via UniFFI)
-// bind a stable top-level API, as §4 specifies. SAN and
-// uci_to_move/move_to_uci-on-Position arrive in stage 2e.
+// bind a stable top-level API, as §4 specifies.
 
 pub use castling::CastlingRights;
 pub use fen::{parse_fen, to_fen, FenError};
@@ -62,6 +64,7 @@ pub use movegen::{
 pub use moves::{Move, MoveList};
 pub use perft::{perft, perft_divide};
 pub use position::Position;
+pub use san::{move_to_san, move_to_uci, san_to_move, uci_to_move, MoveError};
 pub use status::{is_insufficient_material, status, status_with_history, DrawClaim, GameStatus};
 pub use types::{Color, Piece, PieceType, Square};
 pub use zobrist::zobrist;
