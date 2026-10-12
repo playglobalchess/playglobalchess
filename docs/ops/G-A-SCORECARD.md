@@ -29,7 +29,7 @@ off; **all engine CODE is complete and merged to `main`.**
 ## What remains for G-A — three items, none are agent code
 
 1. **⬜ Mobile device run (completes box 8).** Execute the scaffolded targets on a booted sim/emulator:
-   - iOS: `platform/mobile/build_mobile.sh && cd clients/ios/EngineParityTests && xcodebuild test -scheme EngineParityTests -destination 'platform=iOS Simulator,name=iPhone 15'`
+   - iOS: `xcodebuild -downloadPlatform iOS` (one-time, if no iOS sim runtime) then `platform/mobile/build_mobile.sh && cd clients/ios/EngineParityTests && xcodebuild test -scheme EngineParityTests -destination 'platform=iOS Simulator,name=iPhone 16'`
    - Android: `platform/mobile/build_mobile.sh && ./gradlew :engine-parity:connectedAndroidTest`
    Engine + binding correctness is already host-proven byte-identical; this is device confirmation.
 2. **⬜ §4 public API review (box 10)** — S2 + architecture group sign off on the engine as the shared contract they bind.
