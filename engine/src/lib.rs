@@ -61,7 +61,7 @@ pub mod zobrist;
 pub use castling::CastlingRights;
 pub use fen::{parse_fen, to_fen, FenError};
 pub use movegen::{
-    is_in_check, is_square_attacked, legal_moves, make, pseudo_legal_moves, unmake, Undo,
+    is_in_check, is_legal, is_square_attacked, legal_moves, make, pseudo_legal_moves, unmake, Undo,
 };
 pub use moves::{Move, MoveList};
 pub use perft::{perft, perft_divide};

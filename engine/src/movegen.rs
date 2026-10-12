@@ -326,8 +326,37 @@ pub fn legal_moves(pos: &Position) -> MoveList {
     legal
 }
 
-/// Apply a move to a position in place (copy-make convenience). A thin wrapper
-/// over [`make`] that discards the [`Undo`] token — for immutable-style callers
+/// Is a single move legal in `pos`? (ENGINE-CORE §4.1 — the S2 per-intent hot
+/// path.)
+///
+/// Dedicated single-move validation that does NOT build the whole legal set:
+/// `m` must be pseudo-legal for the side to move (membership in
+/// [`pseudo_legal_moves`] — the correctness anchor, so this can never accept a
+/// move the generator would not produce), and then making it must not leave the
+/// mover's king in check. One `make`/`unmake` on a scratch clone, versus
+/// `legal_moves`' clone-per-candidate across every move.
+///
+/// `is_legal(p, m)` is exactly `legal_moves(p).contains(m)` by construction —
+/// asserted by a property test — but far cheaper for the "validate this one
+/// intent" call S2 makes on every move (§6.1).
+#[must_use]
+pub fn is_legal(pos: &Position, m: Move) -> bool {
+    // Pseudo-legal membership first: rejects moves from an empty/enemy square,
+    // non-moves, and anything the generator would not emit (e.g. a castle
+    // without rights). This is what makes `is_legal` agree with `legal_moves`.
+    if !pseudo_legal_moves(pos).iter().any(|&pm| pm == m) {
+        return false;
+    }
+    let us = pos.side_to_move;
+    let mut scratch = pos.clone();
+    let undo = make(&mut scratch, m);
+    let safe = match scratch.king_square(us) {
+        Some(k) => !is_square_attacked(&scratch, k, us.flip()),
+        None => false,
+    };
+    unmake(&mut scratch, m, undo);
+    safe
+}
 /// (clients, the legality filter) that clone first and never roll back
 /// (ENGINE-CORE §3.6 / OPEN-C "copy-make for clients").
 ///

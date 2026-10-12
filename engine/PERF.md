@@ -7,13 +7,16 @@ Spec: `docs/specs/S1-engine/ENGINE-CORE.md` §6.1. Benches: `engine/benches/move
 
 | Metric | §6.1 target | Measured (median) | Verdict |
 |---|---|---|---|
-| `legal_moves` — Kiwipete (dense middlegame) | **< 1 ms** (goal: tens of µs) | **~1.94 µs** | ✅ ~500× under target |
-| `legal_moves` — startpos | (reference) | ~0.69 µs | — |
-| `is_legal` — single-move validation (S2 hot path) | **< 10 µs** | **~1.93 µs** | ✅ ~5× under target |
+| `legal_moves` — Kiwipete (dense middlegame) | **< 1 ms** (goal: tens of µs) | **~1.9 µs** | ✅ ~500× under target |
+| `legal_moves` — startpos | (reference) | ~0.68 µs | — |
+| `is_legal` — single-move validation (S2 hot path) | **< 10 µs** | **~0.28 µs** | ✅ ~35× under target |
+| `uci_to_move` — decode + full-set search (reference) | — | ~1.95 µs | — |
 
 Measured on the current **simple** generator: pseudo-legal generation + a copy-make
 legality filter + ray-walk `is_square_attacked`, with **no magic bitboards and no
-pin-aware fast path**.
+pin-aware fast path**. `is_legal` is a **dedicated single-move path** (pseudo-legal
+membership + one make/unmake king-safety check), ~7× faster than decoding through the
+full legal set.
 
 ## Decision: magic bitboards are NOT required for G-A (D5, measure-first)
 
@@ -27,11 +30,11 @@ rules engine) ever demands it.
 
 ## Caveats / honest notes
 
-- **`is_legal` is measured via `uci_to_move`** (decode + search the legal set), the
-  exact §4.1 call S2 makes per intent. It is ~1.9 µs because it computes the full
-  `legal_moves` set; a dedicated single-move `is_legal` (apply one move + king-safety
-  test) would be faster still, but is unnecessary — the current path already beats
-  < 10 µs by ~5×.
+- **`is_legal` is a dedicated single-move path** (`movegen::is_legal`): pseudo-legal
+  membership + one make/unmake king-safety check, NOT a decode through the full legal
+  set. It is provably equivalent to `legal_moves(p).contains(m)` (property-tested over
+  all 64×64 from/to pairs on random reachable positions) and ~7× faster than the
+  `uci_to_move` path (~0.28 µs vs ~1.95 µs). This is the §4.1 call S2 makes per intent.
 - **"Zero allocation on the move-gen hot path" (§6.1) is partially met.** `make`/
   `unmake` and `MoveList` are allocation-free, but the legality filter in `legal_moves`
   uses copy-make (`Position::clone()` per candidate), which clones the fixed-size
