@@ -5,8 +5,8 @@
 | Field | Value |
 |---|---|
 | Last updated | 2026-10-12 |
-| Phase | **Pre-P0 / P0 foundations** — scaffolding + planning complete; no product code yet |
-| Next step | Kiro drafts the **S1 engine spec** (`docs/specs/S1-engine/ENGINE-CORE.md`), sets it REVIEW, **waits for owner approval** before any Rust (spec-first workflow) |
+| Phase | **P0 foundations** — G-A (engine) GREEN; the protocol/ v1 contract (SPEC-S2-PROTOCOL + SPEC-PE-API-CONTRACT + SPEC-S3-DATA-MODEL) **RATIFIED**, ADR-14 (wire codec) DECIDED |
+| Next step | Implement the ratified protocol contract (shared-core codec per ADR-14 + golden-vector corpus on all 3 clients) → when its corpus passes, the three specs **freeze = G-D**. Then `services/game-server` (X-2, Go, ADR-12). All implementation spec-first/approval-gated. Note: RATIFIED ≠ G-D-frozen — G-D needs the contract implemented + corpus green (see each spec §9). |
 
 ## Accounts & infra (external — not in git)
 

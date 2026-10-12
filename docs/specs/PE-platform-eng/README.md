@@ -10,7 +10,7 @@
 See `../README.md` for how specs relate to `../../MASTER-PLAN.md`, and `../_shared/` for templates + conventions. Cite master IDs; never redefine them. Decisions beyond the master doc → propose a new ADR there.
 
 ## First specs to write (P0)
-- API-CONTRACT.md — freeze v1 REST+WS surface (G-D)
+- API-CONTRACT.md — freeze the v1 **REST/JSON surface + shared API conventions** (G-D). The realtime **WS + event-store** half lives in `../S2-realtime/PROTOCOL.md`; the two freeze **together** as G-D (owner decision Q-P1=(b)). This spec cites the WS surface, never redefines it.
 - CI-CD.md — pipelines, release gates (MASTER X.4)
 - ENVIRONMENTS.md
 - OBSERVABILITY.md (NFR-9)
