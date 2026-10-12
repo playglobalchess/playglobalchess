@@ -60,3 +60,12 @@ secrets/
 # The rest of .kiro/ (steering/, hooks/, agents/) IS tracked project infra —
 # only this per-user settings dir is machine-local and must stay out.
 .kiro/settings/
+
+# ---- Generated mobile parity artifacts (§8.8, produced by build_mobile.sh) ----
+# UniFFI-generated bindings, cross-compiled native libs, and the xcframework are
+# BUILD OUTPUTS, not source — the test-target scaffolds + the hand-written
+# parity tests are committed; these generated drop-ins are not.
+clients/ios/EngineParityTests/Sources/PgcEngineFfi/pgc_engine_ffi.swift
+clients/ios/EngineParityTests/Frameworks/
+clients/android/engine-parity/src/main/jniLibs/
+clients/android/engine-parity/src/main/kotlin/uniffi/

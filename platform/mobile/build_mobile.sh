@@ -38,5 +38,29 @@ DYLIB_REL="target/debug/libpgc_engine_ffi.dylib"
 ( cd "$FFI_DIR" && cargo run --bin uniffi-bindgen -- generate \
     --library "$DYLIB_REL" --language kotlin --out-dir target/bindings/kotlin )
 
-echo "OK — libs + bindings built. Run the parity tests:"
-echo "  platform/mobile/run_parity.sh"
+echo "== package for the iOS XCTest target (clients/ios/EngineParityTests) =="
+IOS_PKG="clients/ios/EngineParityTests"
+mkdir -p "$IOS_PKG/Sources/PgcEngineFfi" "$IOS_PKG/Frameworks"
+# Generated Swift bindings → the SwiftPM target source dir.
+cp "$OUT/swift/pgc_engine_ffi.swift" "$IOS_PKG/Sources/PgcEngineFfi/"
+# Build the xcframework from the device + simulator static libs. (xcodebuild is
+# required; this is the step that needs full Xcode.)
+HDR="$OUT/swift"
+xcodebuild -create-xcframework \
+  -library "$FFI_DIR/target/aarch64-apple-ios/release/libpgc_engine_ffi.a" -headers "$HDR" \
+  -library "$FFI_DIR/target/aarch64-apple-ios-sim/release/libpgc_engine_ffi.a" -headers "$HDR" \
+  -output "$IOS_PKG/Frameworks/PgcEngineFfiFFI.xcframework" 2>&1 | tail -2 || \
+  echo "WARN: xcframework build skipped/failed — ensure full Xcode is active." >&2
+
+echo "== package for the Android instrumented test (clients/android/engine-parity) =="
+AND_MOD="clients/android/engine-parity"
+mkdir -p "$AND_MOD/src/main/jniLibs/arm64-v8a" "$AND_MOD/src/main/kotlin/uniffi/pgc_engine_ffi"
+cp "$FFI_DIR/target/aarch64-linux-android/release/libpgc_engine_ffi.so" \
+   "$AND_MOD/src/main/jniLibs/arm64-v8a/"
+cp "$OUT/kotlin/uniffi/pgc_engine_ffi/pgc_engine_ffi.kt" \
+   "$AND_MOD/src/main/kotlin/uniffi/pgc_engine_ffi/"
+
+echo "OK — libs + bindings built and packaged into the test targets. Run:"
+echo "  platform/mobile/run_parity.sh                          # host-provable (Swift run + Kotlin compile)"
+echo "  xcodebuild test -scheme EngineParityTests ...          # iOS Simulator (clients/ios/EngineParityTests)"
+echo "  ./gradlew :engine-parity:connectedAndroidTest          # Android emulator (clients/android)"
