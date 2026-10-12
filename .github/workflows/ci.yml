@@ -154,6 +154,16 @@ jobs:
           cargo fmt --manifest-path protocol/codec-ffi/Cargo.toml --all -- --check
           cargo clippy --manifest-path protocol/codec-ffi/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path protocol/codec-ffi/Cargo.toml
+          # cgo C-ABI wrapper (pgc-protocol-cgo, PLAN-S2-CODEC v1.1 §4.5 / ADR-15).
+          # Runs the boundary unit tests + the 99,990-call ABI fuzz sweep against
+          # the rlib build (the Rust-side safety leg). The staticlib+header LINK
+          # proof — Go actually dlopening the .a through the C header — is the Go
+          # golden-vector parity test, gated in the `services` job below.
+          if [ -f protocol/codec-cgo/Cargo.toml ]; then
+            cargo fmt --manifest-path protocol/codec-cgo/Cargo.toml --all -- --check
+            cargo clippy --manifest-path protocol/codec-cgo/Cargo.toml --all-targets -- -D warnings
+            cargo test --manifest-path protocol/codec-cgo/Cargo.toml
+          fi
 
   # macOS host-provable parity tier (SPEC-S2-PROTOCOL §8, PLAN-CODEC §4.3): the
   # Swift consumer RUNS against the codec dylib and reproduces the frozen golden
@@ -196,8 +206,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
       - name: Build + test changed services
-        run: echo "::notice::services/ stub — per-service build/test (game-server, rating→G-C, anti-cheat→G-B, …)."
+        run: |
+          # game-server (X-2, Go, ADR-12): the move/event hot path links the
+          # pgc-protocol codec in-process via cgo (ADR-14/ADR-15). `make test`
+          # cross-compiles protocol/codec-cgo into a staticlib and runs the Go
+          # golden-vector parity test THROUGH the actual .a + C header link —
+          # the Go leg of NFR-10 and the staticlib/header-drift guard that the
+          # Rust-only `protocol` job cannot reach. Honest stub-guard: no-op until
+          # the Go module exists.
+          if [ -f services/game-server/go.mod ]; then
+            rustup toolchain install stable --profile minimal
+            rustup default stable
+            make -C services/game-server test
+          else
+            echo "::notice::services/game-server has no go.mod yet — stub, no build."
+          fi
+          # Other services (rating→G-C, anti-cheat→G-B, …) build/test here as they land.
 
   web:
     needs: changes

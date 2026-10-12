@@ -1,0 +1,19 @@
+[package]
+name = "pgc-protocol-cgo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "C-ABI (cgo) binding for the PlayGlobalChess wire + event codec (ADR-14, ADR-15, PLAN-S2-CODEC v1.1 §4.5). Emits a staticlib + a hand-written C header so the Go game-server links the SAME pgc-protocol codec in-process (NFR-5, NFR-10) — the Go leg of parity alongside UniFFI (mobile) and wasm (web). The pure codec crate stays #![forbid(unsafe_code)]; the one unavoidable extern \"C\" unsafe seam is quarantined here. Delegate-only — no codec logic."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "pgc_protocol_cgo"
+# staticlib: the .a the Go server links via cgo (ADR-15 in-process C-ABI).
+# rlib: so `cargo test` can run this crate's native unit tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The pure codec — the single wire/event codec (ADR-14). This crate only
+# re-exposes it over a C ABI; it adds no codec logic.
+pgc-protocol = { path = "../codec" }

@@ -91,3 +91,9 @@ clients/android/codec-parity/src/main/kotlin/uniffi/
 protocol/codec-wasm/pkg/
 protocol/codec-wasm/pkg-node/
 protocol/codec-wasm/target-wasm/
+
+# ---- Generated Go cgo codec artifacts (PLAN-S2-CODEC 4.5) ----
+# The staticlib + header staged for cgo by `make lib` are build outputs; the
+# crate, Go wrapper/test, Makefile and header SOURCE are committed, the staged
+# copies are not.
+services/game-server/internal/codec/lib/
