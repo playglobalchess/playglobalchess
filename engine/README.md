@@ -34,19 +34,27 @@ Implemented against the ratified spec:
   all four under/promotions on push + capture (E-7), absolute pin (E-8),
   double-check king-only (E-9), halfmove-clock reset (E-13), the 218-move
   position (E-14).
+- **Game-end detection + Zobrist** (§3.7, §4.1, §8.3, stage 2d): `status(p)`
+  (checkmate, stalemate, insufficient material incl. the K+N+N non-draw E-12,
+  50-/75-move) and `status_with_history(p, &[key])` (threefold claimable /
+  fivefold automatic, by position identity E-11, not move list). A Zobrist key
+  (OPEN-B, pinned seed) over exactly the identity fields backs repetition; full
+  equality remains the collision guard. The engine reports *availability* only
+  and never ends a game (§4.1).
 
 **Gates green:** FEN round-trip (§8.6), make/unmake inverse (§8.6), the full
 §8.1 perft corpus (every position exact to its stated depth; slow tier in
-nightly), and the §8.2 move-set edge cases.
+nightly), the §8.2 move-set edge cases, and §8.3 game-end detection (incl.
+threefold-by-position via different move orders, the castling-rights distinction
+E-11, and the K+N+N non-draw E-12).
 
 ### Deferred to later chunk-2 stages / chunks (not yet verified)
 
-Game-end classification cases — E-10 (mate vs stalemate), E-11 (repetition
-identity incl. castling/ep), E-12 (insufficient material) — land with `status()`
-+ Zobrist (§3.7, OPEN-B) [2d]; SAN (§4.2) [2e]; the §8.6 full property net [2f];
-magic bitboards and the §6.1 benchmarks; full golden replay (§8.5); mobile
-parity (§8.8); the variant seam (§3.9). OPEN-A resolved: **own bitboard
-implementation** (no wrapped crate). **G-A is not green yet.**
+SAN (§4.2) [2e]; the §8.6 full property net [2f]; magic bitboards and the §6.1
+benchmarks; full golden replay (§8.5); mobile parity (§8.8); the variant
+seam (§3.9). OPEN-A resolved: **own bitboard implementation** (no wrapped
+crate). OPEN-B resolved: **own Zobrist, pinned seed**. **G-A is not green
+yet.**
 
 ## Develop
 
