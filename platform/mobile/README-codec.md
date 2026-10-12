@@ -52,7 +52,8 @@ platform/mobile/run_codec_parity.sh     # Swift run + Kotlin binding compile
   # (`xcrun simctl list runtimes`; if none, `xcodebuild -downloadPlatform iOS`).
   platform/mobile/build_codec_mobile.sh
   cd clients/ios/CodecParityTests
-  xcodebuild test -scheme CodecParityTests \
+  # SwiftPM auto-names the scheme `<package>-Package` — list with `xcodebuild -list`.
+  xcodebuild test -scheme CodecParityTests-Package \
     -destination 'platform=iOS Simulator,name=iPhone 16'
   ```
 - **Android** — `clients/android/codec-parity/` (Gradle library module):

@@ -93,5 +93,5 @@ cp "$OUT/kotlin/uniffi/${LIB}/${LIB}.kt" \
 
 echo "OK — libs + bindings built and packaged into the codec test targets. Run:"
 echo "  platform/mobile/run_codec_parity.sh                      # host-provable (Swift run + Kotlin compile)"
-echo "  xcodebuild test -scheme CodecParityTests ...             # iOS Simulator (clients/ios/CodecParityTests)"
+echo "  xcodebuild test -scheme CodecParityTests-Package ...     # iOS Simulator (clients/ios/CodecParityTests)"
 echo "  ./gradlew :codec-parity:connectedAndroidTest             # Android emulator (clients/android)"
