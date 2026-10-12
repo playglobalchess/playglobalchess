@@ -45,10 +45,15 @@ The device-run harnesses are scaffolded and wired to the artifacts
   (device + simulator slices) into `Frameworks/` (both gitignored — build
   outputs). Run on a simulator:
   ```sh
+  # One-time: install the iOS Simulator runtime if absent. Xcode ships the
+  # device TYPES (iPhone 16, …) but not the runtime — check with
+  # `xcrun simctl list runtimes`; if no iOS runtime is listed, download it:
+  xcodebuild -downloadPlatform iOS            # several GB, one-time
+
   platform/mobile/build_mobile.sh
   cd clients/ios/EngineParityTests
   xcodebuild test -scheme EngineParityTests \
-    -destination 'platform=iOS Simulator,name=iPhone 15'
+    -destination 'platform=iOS Simulator,name=iPhone 16'   # Xcode 16.x device
   ```
 - **Android** — `clients/android/engine-parity/` (Gradle library module):
   `build.gradle.kts` + the instrumented `EngineParityTest.kt`. `build_mobile.sh`
