@@ -22,11 +22,32 @@ full legal set.
 
 ENGINE-CORE §1.4.3 / §3.5 are explicit — "correctness before speed; optimize later
 **only if** perft timing demands." The measurement shows the simple generator clears
-both §6.1 targets with a ~500× margin on `legal_moves` and ~5× on `is_legal`.
+both §6.1 targets with a ~500× margin on `legal_moves` and ~35× on `is_legal`.
 Building magic bitboards now would be optimizing already-fast correct code against no
 measured need, so stage 3b (magics) is **not undertaken for G-A**. It remains available
 as a future optimization if a later workload (deep search in X-6 analysis, not the
 rules engine) ever demands it.
+
+### KNOWN, DELIBERATE spec drift (not yet reconciled — owner decision 2026-10-12)
+
+ENGINE-CORE §3.2/§3.3 ("Sliding attacks via magic bitboards (or PEXT…)") and §6.3
+("Precomputed attack/magic tables…") still describe magic bitboards in **normative
+voice**, because the spec is **RATIFIED** and this decision has deliberately NOT been
+written back into it. The owner chose to keep the magics-skip as a `PERF.md` note only
+and to **hold** the formal reconciliation (a proposed **ADR-13** was drafted and
+parked). So the spec and this decision disagree **on purpose, with the gap recorded
+here** rather than silently.
+
+Implications for a future reader of the spec:
+- §3.3/§6.3's magic-bitboard language is an *available technique*, not a shipped
+  requirement. Conformance is the §8 corpus + the §6.1 numbers, both green **without**
+  magics.
+- Do **not** read §3.3 as mandating magics, rebuild the rejected work, or file a
+  "spec non-compliance" bug on their absence — this note (and the parked ADR-13) is the
+  authority until the owner elects to ratify the reconciliation.
+- The reconciliation path, when wanted, is: approve ADR-13, append it to
+  `docs/MASTER-PLAN.md`, and add a one-line "see ADR-13" pointer in ENGINE-CORE
+  §3.3/§6.3. No spec edit is made without that approval.
 
 ## Caveats / honest notes
 
