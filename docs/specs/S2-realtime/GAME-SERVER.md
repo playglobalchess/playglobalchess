@@ -101,11 +101,9 @@ The event stream is the fair-play signal source; the server must keep per-move t
 
 ## 4. Interfaces & contracts — codec consumption over cgo (resolves OPEN-C4)
 
-The server links the `pgc-protocol` **`staticlib`** and calls encode/decode as C-ABI functions **in-process** (PLAN-S2-CODEC §4.5 DECIDED: in-process cgo, no sidecar, no network hop on the move path). PLAN-S2-CODEC scopes OPEN-C4 to **the header-gen / link-flags / cross-compile detail — explicitly "not a new crate"** — so this section fixes exactly that detail and conforms to the plan's "the crate emits [the staticlib]" model.
+The server links the **`pgc-protocol-cgo`** sibling crate's **`staticlib`** and calls encode/decode as C-ABI functions **in-process** (PLAN-S2-CODEC §4.5, v1.1: in-process cgo, no sidecar, no network hop on the move path). Per the amended plan, `codec-cgo` is a thin delegate-only wrapper over the pure `pgc-protocol` core — the same sibling pattern as `codec-ffi` (UniFFI) and `codec-wasm` (wasm) — so the unavoidable `unsafe` C-ABI seam is quarantined there and the core stays `#![forbid(unsafe_code)]`. This section fixes the Go-side consumption detail PLAN-S2-CODEC §4.5 / OPEN-C4 delegates to this spec; the plan owns the crate's existence + C-ABI shape.
 
-> **⚠ Reconciliation needed before RATIFIED (routed to the plan owner + architecture group, §4.4).** PLAN-S2-CODEC §4.5 states "links the `pgc-protocol` staticlib (**the crate already emits it**)." As implemented today that is **not yet true**: `protocol/codec/Cargo.toml` declares no `crate-type`, so `pgc-protocol` builds a plain `rlib` with **no `staticlib` and no C ABI**. (The only `staticlib` in the tree is on `pgc-protocol-ffi`, whose UniFFI C surface is shaped for UniFFI, not plain cgo.) The gap is small and additive — add `crate-type = ["staticlib", "rlib"]` plus a `#[no_mangle] extern "C"` shim + a `cbindgen` header **to `pgc-protocol` itself** (NOT a new crate, per the plan). But because it adds a C-ABI surface to the frozen codec crate, it is a change to a RATIFIED plan's premise and must be blessed by the plan owner + architecture group, not decided here. The alternatives — a separate `codec-cgo` crate, or reusing the UniFFI staticlib — both contradict PLAN-S2-CODEC §4.5 and are therefore NOT proposed.
-
-**4.1 C-ABI surface (added to `pgc-protocol`, per §4.5 "not a new crate").** Extend `protocol/codec/Cargo.toml` to `crate-type = ["staticlib", "rlib"]` and add a thin, `#[cfg(feature = "cabi")]`-gated `extern "C"` module (the one place `unsafe` is unavoidable — each fn carries a safety comment; the rest of the crate keeps `#![forbid(unsafe_code)]`). A `cbindgen` step emits the C header. Surface is byte-in / byte-out (mirroring the proven shape of the other consumers — decode→re-encode and true encode/decode over frames):
+**4.1 C-ABI surface (`protocol/codec-cgo`, `pgc-protocol-cgo`).** A new sibling crate: `crate-type = ["staticlib", "rlib"]`, delegate-only over `pgc-protocol`, with a `#[no_mangle] extern "C"` module (the one place `unsafe` lives — each fn carries a safety comment) and a `cbindgen`-generated C header. Surface is byte-in / byte-out (mirroring the proven shape of the other consumers — decode→re-encode and true encode/decode over frames):
 ```c
 // returns 0 on success and fills *out (allocated by Rust) + *out_len;
 // non-zero = the CodecError discriminant. Go copies *out, then calls pgc_free.
@@ -116,11 +114,11 @@ void    pgc_free(uint8_t* ptr, size_t len);   // Rust frees what Rust allocated
 ```
 **Buffer ownership:** Rust allocates outputs; Go copies into Go memory and calls `pgc_free` — it never frees a Rust pointer itself and never hands Rust a Go pointer Rust would retain (the cgo pointer rule). This is the single hand-written unsafe seam; it gets a dedicated fuzz + leak test (§8). The exact decode return representation is Q-GS1.
 
-**4.2 Build wiring.** `services/game-server` builds the staticlib via a `go:generate`/Makefile step (`cargo build -p pgc-protocol --features cabi --release`, dropping the `.a` + the cbindgen header into a known path), then cgo `#cgo LDFLAGS: -L<path> -lpgc_protocol`. Per deploy target (linux/amd64, linux/arm64) the Makefile parameterizes the matching Rust `--target` (mirrors the engine's mobile cross-compile discipline).
+**4.2 Build wiring.** `services/game-server` builds the staticlib via a `go:generate`/Makefile step (`cargo build -p pgc-protocol-cgo --release`, dropping the `.a` + the cbindgen header into a known path), then cgo `#cgo LDFLAGS: -L<path> -lpgc_protocol_cgo`. Per deploy target (linux/amd64, linux/arm64) the Makefile parameterizes the matching Rust `--target` (mirrors the engine's mobile cross-compile discipline).
 
 **4.3 What crosses the boundary.** Only frames (`[]byte`) and the typed Go structs the server owns. The server does NOT re-encode or inspect the §4A byte layout outside the codec call. A Go contract test decodes the committed golden vectors (`protocol/vectors/vectors.json`) and asserts byte-identical re-encode — the Go leg of NFR-10 parity (completing Rust + iOS + Android + web + **Go**).
 
-**4.4 Change control.** Adding the C-ABI surface to `pgc-protocol` touches the frozen codec crate and reconciles a factual gap in RATIFIED PLAN-S2-CODEC § 4.5 → **architecture-group + plan-owner review** (the review this spec's ⚠ note above routes to them). It does **not** change SPEC-S2-PROTOCOL §4A — the wire bytes are unchanged; this is a new *access path* to the same codec, feature-gated so it adds nothing to the existing Rust/UniFFI/wasm consumers.
+**4.4 Change control.** The `codec-cgo` crate + its C-ABI are defined by PLAN-S2-CODEC v1.1 (§2, §4.5); this spec consumes them and adds the Go-side wiring. It does **not** change SPEC-S2-PROTOCOL §4A — the wire bytes are unchanged; cgo is a new *access path* to the same codec. Because the amendment is a change to a RATIFIED plan, it + this spec's §4 are reviewed together by the architecture group (PLAN-S2-CODEC #30).
 
 ## 5. Edge cases & failure modes
 
@@ -167,7 +165,7 @@ Part XI threats on this component:
 ## 9. Acceptance criteria (Definition of Done)
 
 - [ ] Spec reviewed by S2 + Architecture group (shared cgo contract + NFR budgets) + **S6** (rated-play / anti-cheat feed, ADR-2 veto); RATIFIED.
-- [ ] `pgc-protocol` emits a `staticlib` + feature-gated C-ABI (`#[no_mangle] extern "C"` + cbindgen header) **in the crate itself** (NOT a new crate, per PLAN-S2-CODEC §4.5), with the §8 cgo contract + safety (fuzz + leak) tests green. **(Resolves OPEN-C4; the plan's "already emits it" premise is reconciled — see §4 ⚠.)**
+- [ ] `protocol/codec-cgo` (`pgc-protocol-cgo`) sibling crate exists — `staticlib` + `#[no_mangle] extern "C"` + cbindgen header, delegate-only over the pure core — with the §8 cgo contract + safety (fuzz + leak) tests green. **(Consumes PLAN-S2-CODEC v1.1 §4.5 / OPEN-C4; the plan owns the crate, this spec owns the Go-side wiring.)**
 - [ ] `services/game-server` links it and the Go golden-vector parity test passes byte-for-byte (the Go leg of NFR-10).
 - [ ] Game lifecycle, clock (incl. flag + drift), matchmaking, reconnection implemented for F-01 Standard 2-seat, with their §8 unit/integration suites green.
 - [ ] Persist-before-ack (NFR-7) demonstrated by the stall/crash tests.
