@@ -45,18 +45,25 @@ Implemented against the ratified spec:
   disambiguation (`Nbd2`/`N1d2`/`Nb1d2`), `x` capture, `+`/`#`, `O-O`/`O-O-O`,
   `=Q` promotion; position-aware `uci_to_move` / `move_to_uci` (validated
   against the legal set). SAN & UCI round-trip for every legal move (§8.6).
+- **§8.6 property net** (stage 2f): consolidated into one home
+  (`tests/properties.rs`) over a single reachable-position generator —
+  make/unmake inverse, UCI round-trip, SAN round-trip, FEN round-trip, and
+  `perft(p,1)==legal_moves(p).len()`.
 
-**Gates green:** FEN round-trip (§8.6), make/unmake inverse (§8.6), the full
-§8.1 perft corpus (slow tier in nightly), the §8.2 move-set edge cases, §8.3
-game-end detection (incl. threefold-by-position, the castling-rights E-11
-distinction, the K+N+N non-draw E-12), and the §4.2 SAN/UCI round-trips.
+**Chunk 2 is complete.** Gates green: FEN round-trip (§8.6), make/unmake inverse
+(§8.6), the full §8.1 perft corpus (slow tier in nightly), the §8.2 move-set
+edge cases, §8.3 game-end detection (threefold-by-position, the castling-rights
+E-11 distinction, the K+N+N non-draw E-12), the §4.2 SAN/UCI round-trips, and
+the consolidated §8.6 property net.
 
-### Deferred to later chunk-2 stage / chunks (not yet verified)
+### Deferred to later chunks (not yet verified) — the rest of G-A
 
-The §8.6 full property-net consolidation [2f]; magic bitboards and the §6.1
-benchmarks; full golden replay (§8.5); mobile parity (§8.8); the variant
-seam (§3.9). OPEN-A resolved: **own bitboard implementation**. OPEN-B resolved:
-**own Zobrist, pinned seed**. **G-A is not green yet.**
+Magic bitboards and the §6.1 performance gate (`legal_moves` < 1 ms, `is_legal`
+< 10 µs); full golden-game replay (§8.5); mobile parity (§8.8, UniFFI); the
+differential tier as a standing gate (§8.7). OPEN-A resolved: **own bitboard
+implementation**. OPEN-B resolved: **own Zobrist, pinned seed**. **G-A is not
+green yet** — chunk 2 makes the engine correctness-complete for Standard; the
+performance, golden-replay, and mobile-parity work remain.
 
 ## Develop
 

@@ -29,10 +29,12 @@
 //! — and move encoding (§4.2) [2e]: [`move_to_san`], [`san_to_move`],
 //! position-aware [`uci_to_move`] / [`move_to_uci`].
 //!
-//! **Deferred to later chunk-2 stage / chunks (NOT yet verified):** the §8.6
-//! full property net consolidation [2f]; and in later chunks: magic bitboards,
-//! benchmarks (§6.1), full golden replay (§8.5), mobile parity (§8.8). The
-//! variant seam (§3.9) is forward-looking.
+//! **Deferred to later chunks (NOT yet verified) — the rest of G-A:** magic
+//! bitboards and the §6.1 performance gate; full golden replay (§8.5); mobile
+//! parity (§8.8); the differential tier as a standing gate (§8.7). The variant
+//! seam (§3.9) is forward-looking. Chunk 2 is complete: the engine is
+//! correctness-complete for Standard, but G-A also needs the performance,
+//! golden-replay, and mobile-parity work.
 //!
 //! Design tenets honored: pure, deterministic, no RNG / clock / global state
 //! (§1.4.1); stable move order by (from, to, promotion) (§3.8).
