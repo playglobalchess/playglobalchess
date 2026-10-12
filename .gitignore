@@ -69,3 +69,9 @@ clients/ios/EngineParityTests/Sources/PgcEngineFfi/pgc_engine_ffi.swift
 clients/ios/EngineParityTests/Frameworks/
 clients/android/engine-parity/src/main/jniLibs/
 clients/android/engine-parity/src/main/kotlin/uniffi/
+
+# ---- Gradle (root Android build) ----
+# (build/ and clients/android/**/build/ already covered above.) Root cache +
+# ensure the committed wrapper jar is NOT ignored by the generic *.jar rules.
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
