@@ -92,28 +92,37 @@ fn fifty_claimable_seventyfive_auto() {
 fn threefold_by_position_via_shuffles() {
     let mut p = Position::startpos();
     let start_key = p.zobrist();
-    let mut history = vec![start_key];
+    // prior_keys holds the keys of positions BEFORE the current one. Seed it
+    // with the start position (occurrence #1), then push each position we leave
+    // as we shuffle. The final position `p` is the current one and is NOT added
+    // — status_with_history counts it via +1.
+    let mut prior_keys = vec![start_key];
 
-    // Ng1-f3-g1 / Ng8-f6-g8 twice returns to the start position (same key),
-    // reaching it a 3rd time total.
-    for mv in [
+    // Ng1-f3-g1 / Ng8-f6-g8 twice returns to the start position.
+    let shuffles = [
         "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
-    ] {
+    ];
+    for (i, mv) in shuffles.iter().enumerate() {
         let m = uci(&p, mv);
         make(&mut p, m);
-        history.push(p.zobrist());
+        // Record every intermediate position as a prior, EXCEPT the last move's
+        // result, which becomes the current position passed to the query.
+        if i + 1 < shuffles.len() {
+            prior_keys.push(p.zobrist());
+        }
     }
 
-    // The start position has now occurred 3 times (initial + two returns).
+    // Current position is the start position again, now its 3rd occurrence:
+    // start_key appears twice in prior_keys (seed + one mid-return) + current.
     assert_eq!(
         p.zobrist(),
         start_key,
         "shuffles must return to the start position"
     );
-    let occ = history.iter().filter(|&&k| k == start_key).count();
-    assert_eq!(occ, 3, "start position should have occurred 3 times");
+    let occ = prior_keys.iter().filter(|&&k| k == start_key).count() + 1;
+    assert_eq!(occ, 3, "start position should be on its 3rd occurrence");
     assert_eq!(
-        status_with_history(&p, &history),
+        status_with_history(&p, &prior_keys),
         GameStatus::DrawRepetition(DrawClaim::Claimable)
     );
 }
@@ -143,8 +152,9 @@ fn repetition_distinguishes_castling_rights_e11() {
 fn fivefold_is_automatic() {
     let p = Position::startpos();
     let k = p.zobrist();
+    // 4 prior occurrences + the current visit = 5 ⇒ automatic fivefold.
     assert_eq!(
-        status_with_history(&p, &[k, k, k, k, k]),
+        status_with_history(&p, &[k, k, k, k]),
         GameStatus::DrawRepetition(DrawClaim::Automatic)
     );
 }
