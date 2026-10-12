@@ -1,0 +1,32 @@
+[package]
+name = "pgc-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "PlayGlobalChess wire + event codec (ADR-14, X-2/X-13). One schema-defined binary codec (postcard) for the SPEC-S2-PROTOCOL §4A frame + event-store layout, living in the shared Rust core and consumed byte-identically by the Go server and all three clients (NFR-5, NFR-10). Pure Rust: no chess logic, no I/O, no networking. Spec: docs/specs/S2-realtime/PROTOCOL.md + PLAN-CODEC.md."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+# serde: derive-only; the codec types carry Serialize/Deserialize so postcard
+# can drive them. No std features beyond derive are needed.
+serde = { version = "1.0.210", features = ["derive"] }
+# postcard: the ADR-14 / PLAN-CODEC §3 DECIDED codec library — compact varint
+# framing, no_std-capable, pure Rust (no external IDL/codegen). We use alloc
+# (Vec<u8> output) via the default `use-std` feature.
+postcard = { version = "1.0.10", features = ["use-std"] }
+# thiserror: library error types per engineering-conventions.md (same pin as
+# the engine). CodecError is the single typed decode-failure surface.
+thiserror = "1.0.69"
+
+[dev-dependencies]
+# Property-based testing for the §8 round-trip properties. Pinned to the SAME
+# version the engine uses (engine/Cargo.toml) per "pin dependency versions".
+proptest = "1.5.0"
+# Golden-vector corpus is committed as JSON hex pairs (protocol/vectors/); the
+# golden-freeze test reads and parses it with serde_json (dev-only).
+serde_json = "1.0.128"
+
+[lib]
+name = "pgc_protocol"
+path = "src/lib.rs"
