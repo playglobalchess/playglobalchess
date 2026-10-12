@@ -19,14 +19,27 @@ let package = Package(
     targets: [
         // The native engine as a prebuilt xcframework (device + simulator
         // slices). Produced by the build script; not committed (large binary).
+        // Supplies the compiled UniFFI symbols (the static .a); its headers are
+        // NOT auto-promoted to an importable Clang module by SwiftPM, so the
+        // module itself is published by PgcEngineFfiC below.
         .binaryTarget(
             name: "PgcEngineFfiFFI",
             path: "Frameworks/PgcEngineFfiFFI.xcframework"
         ),
+        // C interop target publishing the `pgc_engine_ffiFFI` Clang module.
+        // The generated pgc_engine_ffi.swift does `#if canImport(pgc_engine_ffiFFI)`
+        // for its low-level FFI types (RustBuffer, RustCallStatus, the
+        // uniffi_*_checksum_* / ffi_*_contract_version symbols); without this
+        // module that import is skipped and every FFI type is out of scope.
+        // Header + module.modulemap are placed by platform/mobile/build_mobile.sh.
+        .target(
+            name: "PgcEngineFfiC",
+            path: "Sources/PgcEngineFfiC"
+        ),
         // The generated UniFFI Swift bindings + a module wrapper over the FFI.
         .target(
             name: "PgcEngineFfi",
-            dependencies: ["PgcEngineFfiFFI"],
+            dependencies: ["PgcEngineFfiFFI", "PgcEngineFfiC"],
             path: "Sources/PgcEngineFfi" // populated by the bindgen step
         ),
         .testTarget(

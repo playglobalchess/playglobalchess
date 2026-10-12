@@ -21,19 +21,26 @@ off; **all engine CODE is complete and merged to `main`.**
 | 5 | **Property tests §8.6** — make/unmake, UCI/SAN/FEN round-trips, perft(·,1)==len | ✅ | `engine/tests/properties.rs` (single generator), + `is_legal`==`legal_moves.contains` |
 | 6 | **Performance §6.1** — `legal_moves` < 1 ms, `is_legal` < 10 µs | ✅ | `engine/benches/movegen.rs` + `PERF.md`: legal_moves ~1.9 µs, dedicated `is_legal` ~0.28 µs; magics skipped by decision (D5), nightly threshold gate `platform/ci/check_bench.py` |
 | 7 | **No panics on malformed input** — typed errors (§5) | ✅ | `FenError`, `MoveError` (thiserror); fuzz in `gate.rs`; FFI boundary returns `FfiError`, never panics |
-| 8 | **Mobile parity §8.8** — perft+golden slice byte-identical on iOS/Android | 🟡 | `engine/ffi` (UniFFI, ADR-9) cross-compiles for iOS/iOS-sim/Android; Swift parity test RUNS byte-identical to the oracle; Kotlin binding compiles. **Device run remains** (⬜ below) |
+| 8 | **Mobile parity §8.8** — perft+golden slice byte-identical on iOS/Android | ✅ | **Device run PASSED (2026-10-12):** iOS 3/3 (iPhone 16 Simulator, iOS 18.6, `xcodebuild test`); Android 2/2 (API 34 emulator, `connectedAndroidTest`). Both clients bind the one engine and match the host oracle byte-for-byte (startpos d5 = 4,865,609 + golden-slice FEN). Fixes along the way: iOS SwiftPM C-interop module target, Android AndroidX + JVM-17 config. |
 | 9 | **No known legal-move defect** (NFR-5) | ✅ | §8.1 corpus exact to deep depths + §8.7 differential vs `shakmaty` agrees on all 6 positions — two independent correctness nets, zero known defects |
-| 10 | **Public API §4 reviewed** by S2 + architecture group | ⬜ HUMAN | The surface is final & stable on `main`; needs S2 + arch review as a shared contract |
-| 11 | **Spec → RATIFIED** with reviews recorded | ⬜ HUMAN | ENGINE-CORE is RATIFIED for the spec itself; this box is the DoD review-record step |
+| 10 | **Public API §4 reviewed** by S2 + architecture group | ✅ | **Approved 2026-10-12** by the project owner acting as S2 + architecture authority, against `docs/ops/S1-ENGINE-API-REVIEW.md` (all 5 decisions confirmed). |
+| 11 | **Spec → RATIFIED** with reviews recorded | ✅ | Review records recorded in `S1-ENGINE-API-REVIEW.md` (sign-off table) + this scorecard; ENGINE-CORE §9 boxes checked. |
 
-## What remains for G-A — three items, none are agent code
+## G-A STATUS: GREEN (2026-10-12)
 
-1. **⬜ Mobile device run (completes box 8).** Execute the scaffolded targets on a booted sim/emulator:
-   - iOS: `xcodebuild -downloadPlatform iOS` (one-time, if no iOS sim runtime) then `platform/mobile/build_mobile.sh && cd clients/ios/EngineParityTests && xcodebuild test -scheme EngineParityTests -destination 'platform=iOS Simulator,name=iPhone 16'`
-   - Android: `platform/mobile/build_mobile.sh && ./gradlew :engine-parity:connectedAndroidTest`
-   Engine + binding correctness is already host-proven byte-identical; this is device confirmation.
-2. **⬜ §4 public API review (box 10)** — S2 + architecture group sign off on the engine as the shared contract they bind.
-3. **⬜ Spec DoD review-record (box 11)** — record those reviews against the spec.
+All 11 §9 boxes are satisfied. **G-A is green** — per MASTER §V.2 this unblocks
+S2 live play, S1 variant work, and all puzzle/analysis work. Parked, non-blocking:
+ADR-13 (magics-skip) held by owner; the §3.3/§6.3 magic language is descriptive
+(see `PERF.md`).
+
+## ~~What remains for G-A~~ — DONE
+
+All three former human/infra items are complete (boxes 8/10/11 above). To
+**reproduce the device parity run**:
+- iOS: `xcodebuild -downloadPlatform iOS` (one-time, if `simctl list runtimes` is empty) then `platform/mobile/build_mobile.sh && cd clients/ios/EngineParityTests && xcodebuild test -scheme EngineParityTests-Package -destination 'platform=iOS Simulator,name=iPhone 16'` → 3/3.
+- Android: `platform/mobile/build_mobile.sh && ./gradlew :engine-parity:connectedAndroidTest` (booted emulator) → 2/2.
+
+(Note the iOS scheme is `EngineParityTests-Package` — SwiftPM's aggregate scheme name, not `EngineParityTests`.)
 
 ## Decisions on record
 

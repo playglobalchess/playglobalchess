@@ -26,6 +26,15 @@ android {
 
     // src/main/jniLibs/arm64-v8a/libpgc_engine_ffi.so — placed by build_mobile.sh.
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+
+    // Java and Kotlin must agree on the JVM target (AGP enforces this).
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 }
 
 dependencies {
