@@ -583,6 +583,28 @@ Backend **services** (game-server X-2, accounts/rating X-3/X-4, anti-cheat X-5, 
 - *Boundary rule:* a service NEVER reimplements chess logic — it calls the Rust engine. Rules logic in a Go service is a bug (violates NFR-5 single-source-of-truth).
 - *Unblocks:* S2/S3/S6/S7 service scaffolding.
 
+## ADR-14 (new) · Wire payload codec — **DECIDED: one schema-defined binary codec in the shared Rust core**
+
+> **ID note:** this is **ADR-14, not ADR-13.** ADR-13 is reserved for the owner's held *magic-bitboards skip* decision (drafted, see `engine/PERF.md` / decision D5), which is not yet written into this doc. The codec ADR takes the next free number to avoid an ID collision (steering: never redefine an ID). **DECIDED by the owner 2026-10-12.**
+
+**Context.** ADR-10 fixed "WebSocket **binary** frame" for live play but not *which* binary encoding. SPEC-S2-PROTOCOL §3.1 defines the frame envelope (`ver | type | payload`) and leaves the payload codec as its open item Q-P2. The codec is a shared contract: web (TS), iOS (Swift), Android (Kotlin) and the Go server must all encode/decode the *same* bytes (NFR-10), and a per-platform hand-rolled codec is a drift risk (NFR-5 spirit — one encoding, many consumers).
+
+**Decision (proposed).** Use **one schema-defined binary codec compiled into the shared Rust core (ADR-9/11)**, exposed as `encode(msg)->bytes` / `decode(bytes)->msg` and bound into all three clients via UniFFI; the Go server calls the same codec across the ADR-12 FFI/gRPC boundary rather than reimplementing it. Candidate codecs to pick between at RATIFIED (a bounded, reversible sub-choice): a compact self-describing schema codec (`postcard`/`bincode`-family from the Rust ecosystem) vs a cross-language IDL codec (Protobuf/FlatBuffers). Leaning `postcard`-family: smallest frames, zero external IDL toolchain, and it lives natively in the Rust core we already ship — the clients get it for free through the existing FFI, with no second build system.
+
+**Why.**
+- **One codec, three clients (NFR-10).** The engine-FFI parity discipline already proved byte-identical behavior across iOS+Android from one Rust core; the wire codec rides the same path, so parity is structural, not tested-in-after-the-fact.
+- **Tiny hot-path frames (NFR-1).** A move frame is `type + game_id + ply + uci + clock` — a compact binary codec keeps it to a few dozen bytes, inside the §IX.1 intent→ack budget.
+- **No codec drift (NFR-5 spirit).** The only legal encoder/decoder is the shared core; a client or service hand-rolling bytes is a bug, mirroring the "one rules engine" rule.
+
+**Rejected.**
+- **JSON on the hot path** — fails ADR-10's "not JSON — move frames must be tiny and fast".
+- **Per-platform hand-rolled binary** — three codecs to keep byte-identical by hand; guaranteed drift at some point (NFR-10 risk).
+- **Protobuf/FlatBuffers as the default** — viable and kept as the RATIFIED alternative, but adds an IDL toolchain + generated code in three languages when the Rust core can already serve all three through FFI; chosen against unless a concrete need (e.g. a non-FFI consumer) appears.
+
+**Scope / boundary.** This ADR fixes *that there is one codec in the core*; the exact codec library and the byte-level field layout are pinned in SPEC-S2-PROTOCOL §4.3 (its byte-value appendix) at RATIFIED. REST/JSON (non-realtime) is unaffected — it stays JSON (SPEC-PE-API-CONTRACT).
+
+**Unblocks.** SPEC-S2-PROTOCOL RATIFIED (its Q-P2), the §4.3 byte appendix, and the shared-core codec implementation. **DECIDED by the owner 2026-10-12.**
+
 ### ADR summary
 
 
@@ -601,6 +623,7 @@ Backend **services** (game-server X-2, accounts/rating X-3/X-4, anti-cheat X-5, 
 | ADR-10 | new | Postgres + event store + Redis + columnar; WS binary protocol | **DECIDED** | S2/S3 |
 | ADR-11 | delegated | Rust for engine + shared client core | **DECIDED** | S1/S5 |
 | ADR-12 | delegated | Go for services, Rust for engine/core | **DECIDED** | S2/S3/S6/S7 |
+| ADR-14 | new | One schema-defined binary wire codec in the shared Rust core | **DECIDED** | S2/S4/S5 |
 
 ---
 
