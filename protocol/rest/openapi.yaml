@@ -1,0 +1,717 @@
+openapi: 3.1.0
+# Frozen machine-readable form of SPEC-PE-API-CONTRACT (RATIFIED) — the v1 REST
+# surface, F-01 vertical slice. DERIVED from that spec's Appendix A (field-level
+# schemas), Appendix B (RFC-7807 error registry), and §3.1 conventions — it adds
+# NO endpoint, field, or error beyond them. The spec is the source of truth; this
+# file is its executable projection (the REST analogue of protocol/vectors/).
+# Any drift between this file and the spec is a bug the §R1 audit
+# (platform/ci/check_rest_contract.py) fails on.
+#
+# Scope: the F-01-slice endpoints that carry frozen Appendix A schemas.
+# Tournaments (/v1/tournaments) and clubs (/v1/clubs) are §3.2 catalog
+# placeholders WITHOUT field schemas and are intentionally absent here until
+# F-06/F-23 add them as /v1 additive changes (spec §4A note).
+info:
+  title: PlayGlobalChess v1 REST API
+  version: "1.0"
+  description: >-
+    Non-realtime client-facing REST surface (SPEC-PE-API-CONTRACT, X-13). The
+    realtime surface is WebSocket (SPEC-S2-PROTOCOL) and is NOT described here
+    (§3.3 boundary). Together the two specs are G-D.
+  license:
+    name: UNLICENSED
+
+servers:
+  - url: https://api.playglobalchess.com/v1
+    description: v1 (path-prefixed; a breaking change is /v2, never in-place — §3.1)
+
+tags:
+  - name: auth
+    description: Authentication, sessions, self account + entitlements (X-3, ADR-8).
+  - name: users
+    description: Public profiles and per-pool rating stats (F-05, F-46).
+  - name: games
+    description: Pools, game history, PGN, analysis requests (F-01/F-08/F-17).
+  - name: puzzles
+    description: Puzzle delivery and attempts (F-09, F-13).
+  - name: ratings
+    description: Leaderboards and rating distributions (F-25-27).
+  - name: social
+    description: Friends and the challenge lifecycle (F-04, F-22).
+  - name: content
+    description: Localized learn/content items (X-8).
+
+# §3.1 conventions as reusable components.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Opaque token minted by X-3 (format out of scope). Missing/invalid → 401; authed-but-forbidden → 403.
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+      description: Opaque cursor (§3.1 cursor pagination). Omit for first page.
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100 }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      schema: { type: string }
+      description: Conditional GET (ETag) → 304 when unchanged.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: Required on create writes (§3.1). Replay with same body → first result; different body → 409.
+  responses:
+    Problem:
+      description: RFC-7807 error (application/problem+json), type from Appendix B.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotModified:
+      description: 304 — ETag matched (empty body).
+  schemas:
+    # --- Appendix B: RFC-7807 problem (the frozen error envelope) ---
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Stable URI under https://api.playglobalchess.com/problems/ — closed v1 registry (Appendix B).
+          enum:
+            - https://api.playglobalchess.com/problems/unauthenticated
+            - https://api.playglobalchess.com/problems/forbidden
+            - https://api.playglobalchess.com/problems/forbidden-entitlement
+            - https://api.playglobalchess.com/problems/not-found
+            - https://api.playglobalchess.com/problems/validation
+            - https://api.playglobalchess.com/problems/stale-cursor
+            - https://api.playglobalchess.com/problems/unsupported-media
+            - https://api.playglobalchess.com/problems/conflict
+            - https://api.playglobalchess.com/problems/rate-limited
+            - https://api.playglobalchess.com/problems/internal
+            - https://api.playglobalchess.com/problems/unavailable
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string, description: Never leaks internals (NFR-6). }
+        instance: { type: string }
+
+    # --- Appendix A.1: shared value objects (verbatim shapes) ---
+    Session:
+      type: object
+      required: [token, user_id, expires_at]
+      properties:
+        token: { type: string }
+        user_id: { type: string }
+        expires_at: { type: integer, description: epoch seconds }
+    PublicUser:
+      type: object
+      required: [id, handle, created_at]
+      properties:
+        id: { type: string }
+        handle: { type: string }
+        country: { type: string }
+        title: { type: string }
+        created_at: { type: integer }
+    Profile:
+      type: object
+      required: [user_id, display_name, privacy]
+      properties:
+        user_id: { type: string }
+        display_name: { type: string }
+        avatar_ref: { type: string }
+        bio: { type: string }
+        title: { type: string }
+        privacy: { type: string, enum: [public, friends, private] }
+    RatingSummary:
+      type: object
+      required: [pool_id, rating, rd, games_played, provisional]
+      properties:
+        pool_id: { type: string }
+        rating: { type: integer }
+        rd: { type: integer }
+        volatility:
+          type: number
+          format: float
+          description: Present only on self (GET /v1/me stats); omitted for other users (T-4, S3 DATA-MODEL §4.1).
+        games_played: { type: integer }
+        provisional: { type: boolean }
+    Pool:
+      type: object
+      required: [id, format, variant, time_controls]
+      properties:
+        id: { type: string }
+        format: { type: string, enum: [bullet, blitz, rapid, daily] }
+        variant: { type: string, enum: [standard, chess960] }
+        time_controls:
+          type: array
+          items: { $ref: "#/components/schemas/TimeControl" }
+    TimeControl:
+      type: object
+      required: [id, kind, base_ms, increment_ms]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [bullet, blitz, rapid, daily, custom] }
+        base_ms: { type: integer }
+        increment_ms: { type: integer }
+        per_move_ms: { type: integer, description: daily only }
+    GameSummary:
+      type: object
+      required: [id, pool_id, rated, status, time_control, seats, started_at]
+      properties:
+        id: { type: string }
+        pool_id: { type: string }
+        rated: { type: boolean }
+        status: { type: string, enum: [live, ended, aborted] }
+        result_vector:
+          type: array
+          items: { type: integer }
+        termination: { type: string }
+        time_control: { type: string, description: time-control id (Q-A4) }
+        seats:
+          type: array
+          items: { $ref: "#/components/schemas/GameSeatPub" }
+        started_at: { type: integer }
+        ended_at: { type: integer }
+    GameSeatPub:
+      type: object
+      required: [seat_idx, color]
+      properties:
+        seat_idx: { type: integer }
+        color: { type: string, enum: [white, black] }
+        user: { $ref: "#/components/schemas/PublicUser" }
+        bot_id: { type: string }
+    MoveProjection:
+      type: object
+      required: [ply, seat_idx, uci, san, clock_after_ms, server_ts]
+      properties:
+        ply: { type: integer }
+        seat_idx: { type: integer }
+        uci: { type: string }
+        san: { type: string }
+        clock_after_ms: { type: integer }
+        server_ts: { type: integer }
+    Challenge:
+      type: object
+      required: [id, from, pool_id, time_control, color, rated, status, created_at]
+      properties:
+        id: { type: string }
+        from: { $ref: "#/components/schemas/PublicUser" }
+        to: { $ref: "#/components/schemas/PublicUser" }
+        pool_id: { type: string }
+        time_control: { type: string }
+        color: { type: string, enum: [white, black, random] }
+        rated: { type: boolean }
+        status: { type: string, enum: [pending, accepted, declined, expired] }
+        created_at: { type: integer }
+    Entitlement:
+      type: object
+      required: [capability, plan, granted_at]
+      properties:
+        capability: { type: string }
+        plan: { type: string }
+        granted_at: { type: integer }
+        expires_at: { type: integer }
+    Puzzle:
+      type: object
+      required: [id, fen, rating, themes]
+      properties:
+        id: { type: string }
+        fen: { type: string }
+        rating: { type: integer }
+        themes:
+          type: array
+          items: { type: string }
+    PuzzleResult:
+      type: object
+      required: [puzzle_id, solved, ms, rating_delta]
+      properties:
+        puzzle_id: { type: string }
+        solved: { type: boolean }
+        ms: { type: integer }
+        rating_delta: { type: integer }
+        solution_uci:
+          type: array
+          items: { type: string }
+    ContentItem:
+      type: object
+      required: [id, kind, slug, locale, body_ref, status]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        slug: { type: string }
+        locale: { type: string }
+        body_ref: { type: string }
+        status: { type: string }
+
+security: []  # per-operation; most require bearerAuth, some are public.
+
+paths:
+  /auth/register:
+    post:
+      operationId: postAuthRegister
+      tags: [auth]
+      summary: Register (auth none)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle, email]
+              properties:
+                handle: { type: string }
+                email: { type: string }
+                password: { type: string }
+                locale: { type: string }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "400": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /auth/login:
+    post:
+      operationId: postAuthLogin
+      tags: [auth]
+      summary: Login (auth none)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle_or_email, password]
+              properties:
+                handle_or_email: { type: string }
+                password: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /auth/oauth/{provider}:
+    post:
+      operationId: postAuthOauthProvider
+      tags: [auth]
+      summary: OAuth login (auth none)
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, redirect_uri]
+              properties:
+                code: { type: string }
+                redirect_uri: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /auth/logout:
+    post:
+      operationId: postAuthLogout
+      tags: [auth]
+      summary: Logout
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: No Content }
+        "401": { $ref: "#/components/responses/Problem" }
+  /me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Current user (self)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, profile, email]
+                properties:
+                  user: { $ref: "#/components/schemas/PublicUser" }
+                  profile: { $ref: "#/components/schemas/Profile" }
+                  email: { type: string, description: self only }
+        "401": { $ref: "#/components/responses/Problem" }
+  /me/entitlements:
+    get:
+      operationId: getMeEntitlements
+      tags: [auth]
+      summary: Server-verified entitlements (T-11)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Entitlement" } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /users/{handle}:
+    get:
+      operationId: getUsersHandle
+      tags: [users]
+      summary: Public profile (auth optional)
+      parameters:
+        - { name: handle, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, profile]
+                properties:
+                  user: { $ref: "#/components/schemas/PublicUser" }
+                  profile: { $ref: "#/components/schemas/Profile" }
+        "404": { $ref: "#/components/responses/Problem" }
+  /users/{handle}/stats:
+    get:
+      operationId: getUsersHandleStats
+      tags: [users]
+      summary: Per-pool rating summary (auth optional; volatility omitted unless self)
+      parameters:
+        - { name: handle, in: path, required: true, schema: { type: string } }
+        - { name: window, in: query, required: false, schema: { type: string, enum: [7d, 30d, 90d, 1y, all] } }
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        "200":
+          description: OK (ETag)
+          headers: { ETag: { schema: { type: string } } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pools]
+                properties:
+                  pools: { type: array, items: { $ref: "#/components/schemas/RatingSummary" } }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "404": { $ref: "#/components/responses/Problem" }
+  /pools:
+    get:
+      operationId: getPools
+      tags: [games]
+      summary: Rating pools + their time controls (seek-screen source, F-01.1/.2/.3)
+      parameters:
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        "200":
+          description: OK (ETag, cacheable)
+          headers: { ETag: { schema: { type: string } } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Pool" } }
+        "304": { $ref: "#/components/responses/NotModified" }
+  /games:
+    get:
+      operationId: getGames
+      tags: [games]
+      summary: Game history (cursor page, F-08)
+      parameters:
+        - { name: user, in: query, required: false, schema: { type: string } }
+        - { name: pool, in: query, required: false, schema: { type: string } }
+        - { name: result, in: query, required: false, schema: { type: string } }
+        - { name: rated, in: query, required: false, schema: { type: boolean } }
+        - { name: color, in: query, required: false, schema: { type: string } }
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        "200":
+          description: OK (ETag)
+          headers: { ETag: { schema: { type: string } } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/GameSummary" } }
+                  next_cursor: { type: string }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "400": { $ref: "#/components/responses/Problem" }
+  /games/{id}:
+    get:
+      operationId: getGamesId
+      tags: [games]
+      summary: One game + moves projection (F-08)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [game, moves]
+                properties:
+                  game: { $ref: "#/components/schemas/GameSummary" }
+                  moves: { type: array, items: { $ref: "#/components/schemas/MoveProjection" } }
+        "404": { $ref: "#/components/responses/Problem" }
+  /games/{id}.pgn:
+    get:
+      operationId: getGamesIdPgn
+      tags: [games]
+      summary: PGN download (F-08.4)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: PGN text, content: { application/x-chess-pgn: { schema: { type: string } } } }
+        "404": { $ref: "#/components/responses/Problem" }
+        "406": { $ref: "#/components/responses/Problem" }
+  /games/{id}/analysis:
+    post:
+      operationId: postGamesIdAnalysis
+      tags: [games]
+      summary: Request analysis (F-17)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { depth: { type: integer } }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id, status]
+                properties:
+                  job_id: { type: string }
+                  status: { type: string, enum: [queued, running, done] }
+        "401": { $ref: "#/components/responses/Problem" }
+  /puzzles/next:
+    get:
+      operationId: getPuzzlesNext
+      tags: [puzzles]
+      summary: Next puzzle (F-09)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: themes, in: query, required: false, schema: { type: string } }
+        - { name: rating, in: query, required: false, schema: { type: integer } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Puzzle" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /puzzles/{id}/attempt:
+    post:
+      operationId: postPuzzlesIdAttempt
+      tags: [puzzles]
+      summary: Submit a puzzle attempt (F-09/F-13)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [moves_uci, ms]
+              properties:
+                moves_uci: { type: array, items: { type: string } }
+                ms: { type: integer }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/PuzzleResult" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /leaderboards/{pool}:
+    get:
+      operationId: getLeaderboardsPool
+      tags: [ratings]
+      summary: Leaderboard page (F-25-27, cacheable)
+      parameters:
+        - { name: pool, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        "200":
+          description: OK (ETag)
+          headers: { ETag: { schema: { type: string } } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [rank, user, rating]
+                      properties:
+                        rank: { type: integer }
+                        user: { $ref: "#/components/schemas/PublicUser" }
+                        rating: { type: integer }
+                  next_cursor: { type: string }
+        "304": { $ref: "#/components/responses/NotModified" }
+  /ratings/{pool}:
+    get:
+      operationId: getRatingsPool
+      tags: [ratings]
+      summary: Pool rating distribution (F-25)
+      parameters:
+        - { name: pool, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        "200":
+          description: OK (ETag)
+          headers: { ETag: { schema: { type: string } } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pool_id, distribution]
+                properties:
+                  pool_id: { type: string }
+                  distribution:
+                    type: array
+                    items:
+                      type: object
+                      required: [bucket, count]
+                      properties:
+                        bucket: { type: integer }
+                        count: { type: integer }
+        "304": { $ref: "#/components/responses/NotModified" }
+  /friends:
+    get:
+      operationId: getFriends
+      tags: [social]
+      summary: Friends (F-22)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [user, since]
+                      properties:
+                        user: { $ref: "#/components/schemas/PublicUser" }
+                        since: { type: integer }
+                  next_cursor: { type: string }
+        "401": { $ref: "#/components/responses/Problem" }
+  /challenges:
+    get:
+      operationId: getChallenges
+      tags: [social]
+      summary: List challenges (F-04.1)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [incoming, outgoing]
+                properties:
+                  incoming: { type: array, items: { $ref: "#/components/schemas/Challenge" } }
+                  outgoing: { type: array, items: { $ref: "#/components/schemas/Challenge" } }
+        "401": { $ref: "#/components/responses/Problem" }
+    post:
+      operationId: postChallenges
+      tags: [social]
+      summary: Create a challenge (F-04; idempotency-key required)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pool_id, time_control, color, rated]
+              properties:
+                to_handle: { type: string }
+                pool_id: { type: string }
+                time_control: { type: string }
+                color: { type: string, enum: [white, black, random] }
+                rated: { type: boolean }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Challenge" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /challenges/{id}/accept:
+    post:
+      operationId: postChallengesIdAccept
+      tags: [social]
+      summary: Accept a challenge (live game then arrives via WS MATCHED, §3.3)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Accepted, content: { application/json: { schema: { $ref: "#/components/schemas/Challenge" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+  /challenges/{id}/decline:
+    post:
+      operationId: postChallengesIdDecline
+      tags: [social]
+      summary: Decline a challenge
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: No Content }
+        "401": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+  /content/{kind}/{slug}:
+    get:
+      operationId: getContentKindSlug
+      tags: [content]
+      summary: Content item (X-8, ETag, i18n)
+      parameters:
+        - { name: kind, in: path, required: true, schema: { type: string } }
+        - { name: slug, in: path, required: true, schema: { type: string } }
+        - { name: locale, in: query, required: false, schema: { type: string } }
+        - { $ref: "#/components/parameters/IfNoneMatch" }
+      responses:
+        "200":
+          description: OK (ETag; locale fallback → default, never an error)
+          headers: { ETag: { schema: { type: string } } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContentItem" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "404": { $ref: "#/components/responses/Problem" }

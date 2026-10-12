@@ -164,6 +164,18 @@ jobs:
             cargo clippy --manifest-path protocol/codec-cgo/Cargo.toml --all-targets -- -D warnings
             cargo test --manifest-path protocol/codec-cgo/Cargo.toml
           fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: REST contract audit (R1 — SPEC-PE-API-CONTRACT §8 static half)
+        run: |
+          # Frozen REST contract (protocol/rest/openapi.yaml) vs the specs:
+          # OpenAPI 3.1 validity + §3.3 WS/REST boundary + §3.2 catalog parity +
+          # Appendix B error-registry parity. Stdlib-only; the server-dependent
+          # §8 conformance suite (R2) ships with the F-01 slice (P1).
+          if [ -f protocol/rest/openapi.yaml ]; then
+            python3 platform/ci/check_rest_contract.py
+          fi
 
   # macOS host-provable parity tier (SPEC-S2-PROTOCOL §8, PLAN-CODEC §4.3): the
   # Swift consumer RUNS against the codec dylib and reproduces the frozen golden

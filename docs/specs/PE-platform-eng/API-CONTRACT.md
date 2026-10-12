@@ -297,9 +297,9 @@ Frozen = the REST half of **G-D** (jointly with SPEC-S2-PROTOCOL). DONE when:
 - [ ] §3.2 catalog is **exhaustive for the F-01 slice** — reconciled 2026-10-12 (Q-A1 added pools + challenge lifecycle); final cross-check against S4 F-01 client code at RATIFIED.
 - [x] §4A field-level request/response schemas enumerated in-spec (Appendix A) — no implementation-time discovery; reconciled with S3 `../S3-platform/DATA-MODEL.md` §4 (field-by-field; `volatility` visibility fix applied). Final sign-off at RATIFIED.
 - [x] §4B RFC-7807 error `type` registry enumerated and frozen (Appendix B).
-- [ ] §3.3 REST↔WS boundary audit passes (no overlap, no gap) against SPEC-S2-PROTOCOL.
-- [ ] Entity fields reconciled with S3 `DATA-MODEL.md` (public vs authed field sets agreed).
-- [ ] §8 contract-conformance suite exists and passes on server + web + iOS + Android (NFR-10).
+- [x] §3.3 REST↔WS boundary audit passes (no overlap, no gap) against SPEC-S2-PROTOCOL. — **automated** by `platform/ci/check_rest_contract.py` against `protocol/rest/openapi.yaml` (R1); green in CI (protocol job).
+- [ ] Entity fields reconciled with S3 `DATA-MODEL.md` (public vs authed field sets agreed). — Appendix A reconciled in-spec; a machine cross-check vs S3 field sets is a later audit extension.
+- [ ] §8 contract-conformance suite exists and passes on server + web + iOS + Android (NFR-10). — **R1 (static, done):** the frozen OpenAPI 3.1 artifact `protocol/rest/openapi.yaml` + the catalog/boundary/error-registry audits (`check_rest_contract.py`), gated in CI. **R2 (deferred to P1):** the request/response + convention + negative/abuse tests run against a real REST server + the three clients — gated on those implementations existing (ships with the F-01 vertical slice).
 - [ ] Reviewed by PE + S3 + S2 + architecture group; threat-model pass on the surface (Part XI).
 - [ ] Spec RATIFIED and frozen **together with** SPEC-S2-PROTOCOL as the G-D baseline.
 
