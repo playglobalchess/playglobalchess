@@ -184,42 +184,62 @@ func TestFlagUsesAdvancedClock(t *testing.T) {
 	}
 }
 
-// TestRepetitionAutoDraw closes Q-GS5 at the session level: a knight shuffle
-// repeated to the fivefold threshold is auto-drawn, because the session threads
-// its accumulated Zobrist history into the engine.
+// TestRepetitionAutoDraw closes Q-GS5 at the session level AND pins the
+// claimable-vs-automatic boundary (the question the independent fix-review
+// raised): a repeated position stays LIVE while it is only claimable
+// (threefold) and auto-draws only when it becomes automatic (fivefold). A
+// regression that auto-drew early, or never, fails here.
+//
+// Occurrence counting (verified empirically, not assumed): the session
+// accumulates a Zobrist key per MovePlayed RESULTING position; the game's
+// INITIAL position is never a resulting key, so it is not counted. Driving the
+// knight cycle Nf3 Nf6 Ng1 Ng8 (each 4-ply cycle returns to the start and
+// revisits the post-Nf3 position), the FIRST position to reach five counted
+// occurrences is the post-Nf3 position on the 5th cycle's opening move (ply 17).
+// So: no auto-draw through the end of cycle 4 (ply 16), auto-draw at ply 17.
 func TestRepetitionAutoDraw(t *testing.T) {
 	fc := &fakeClock{t: time.Unix(0, 0)}
 	s, _, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
 
-	// Nf3 Nf6 Ng1 Ng8 returns to the start position each full cycle.
 	cycle := []struct {
 		seat uint8
 		uci  string
 	}{{0, "g1f3"}, {1, "g8f6"}, {0, "f3g1"}, {1, "f6g8"}}
 
 	ply := uint32(0)
-	var drew bool
-	for round := 0; round < 6 && !drew; round++ {
+	drewAtPly := uint32(0)
+	for round := 1; round <= 5 && drewAtPly == 0; round++ {
 		for _, step := range cycle {
 			ply++
 			fc.add(time.Second)
 			out, err := s.SubmitMove(ctx, step.seat, ply, step.uci, uint64(ply))
 			if err != nil {
-				t.Fatalf("round %d %q: %v", round, step.uci, err)
+				t.Fatalf("cycle %d %q: %v", round, step.uci, err)
 			}
 			if !out.Accepted {
-				t.Fatalf("round %d %q not accepted: %+v", round, step.uci, out)
+				t.Fatalf("cycle %d %q not accepted: %+v", round, step.uci, out)
 			}
 			if out.Terminal != nil && *out.Terminal == game.TermRepetition {
-				drew = true
+				drewAtPly = ply
 				break
+			}
+			// Boundary: no auto-draw may occur at or before ply 16 (the position
+			// has only reached a CLAIMABLE count there; auto-draw before fivefold
+			// would mean a claimable draw was wrongly auto-ended).
+			if ply <= 16 && out.Terminal != nil {
+				t.Fatalf("ply %d auto-ended with terminal %v — a claimable repetition "+
+					"must not auto-end before fivefold", ply, *out.Terminal)
 			}
 		}
 	}
-	if !drew {
-		t.Fatal("fivefold repetition was never auto-drawn — Q-GS5 wiring broken at the session")
+	if drewAtPly == 0 {
+		t.Fatal("fivefold repetition was never auto-drawn — Q-GS5 wiring broken")
+	}
+	if drewAtPly != 17 {
+		t.Fatalf("auto-draw fired at ply %d, want ply 17 (first position to reach "+
+			"five counted occurrences = fivefold-automatic)", drewAtPly)
 	}
 }
 
