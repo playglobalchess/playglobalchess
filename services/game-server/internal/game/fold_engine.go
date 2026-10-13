@@ -8,10 +8,14 @@ import (
 // FoldWithEngine is Fold plus live-board (CurFEN) projection. The pure Fold
 // cannot derive a chess position from a UCI move (that is chess logic, owned by
 // the engine — NFR-5), so it leaves CurFEN at StartFEN. FoldWithEngine replays
-// each MovePlayed's UCI through the LegalityOracle to advance CurFEN, which is
-// what §3.5 reconnection resync (STATE{fen,...}) and §3.6 legality validation
-// need. Everything else (phase/ply/turn/clock/offers/terminal) is identical to
-// Fold — the two agree on every non-FEN field by construction.
+// each MovePlayed's UCI through the LegalityOracle to advance CurFEN.
+//
+// This is the RESUME/RESYNC path, not the move path: §3.5 reconnection and
+// node-failover must rebuild the current position from the stored stream, and
+// that is a one-time O(ply) cost per resume. The move pipeline (pipeline.go)
+// does NOT call this — it threads the position forward incrementally so each
+// move costs one engine round-trip, not O(ply). Keeping the full replay here,
+// used only on resume, is the correct place for the quadratic-free design.
 //
 // Determinism (NFR / §2 acceptance): given the same events, options, and a
 // deterministic oracle (the real engine is deterministic — G-A), the projected

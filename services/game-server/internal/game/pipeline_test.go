@@ -70,7 +70,7 @@ func TestPipelineAcceptsLegalMove(t *testing.T) {
 
 	p := &Pipeline{Oracle: o, Store: store, Opts: tc53opts()}
 	out, err := p.SubmitMove(context.Background(), MoveIntent{
-		GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", ElapsedMs: 10_000,
+		GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", CurFEN: "startpos", ElapsedMs: 10_000,
 	})
 	if err != nil {
 		t.Fatalf("submit: %v", err)
@@ -80,6 +80,14 @@ func TestPipelineAcceptsLegalMove(t *testing.T) {
 	}
 	if out.ClockAfterMs != 293_000 {
 		t.Errorf("clock_after_ms = %d, want 293000", out.ClockAfterMs)
+	}
+	if out.NewFEN != "fen-after-e4" {
+		t.Errorf("NewFEN = %q, want fen-after-e4", out.NewFEN)
+	}
+	// The move path makes exactly ONE engine round-trip (validate this move) —
+	// NOT O(ply) replays. This is the hot-path cost contract.
+	if o.calls != 1 {
+		t.Errorf("oracle.Legality called %d times, want exactly 1 (no stream replay)", o.calls)
 	}
 	// Exactly one MovePlayed appended.
 	evs, _ := store.Load(context.Background(), streamID)
@@ -190,18 +198,23 @@ func TestPipelineIdempotentRetry(t *testing.T) {
 	o.allow("e2e4", "fen-after-e4", nil)
 	p := &Pipeline{Oracle: o, Store: store, Opts: tc53opts()}
 
-	in := MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", ElapsedMs: 10_000}
+	in := MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", CurFEN: "startpos", ElapsedMs: 10_000}
 	first, err := p.SubmitMove(ctx, in)
 	if err != nil || !first.Accepted {
 		t.Fatalf("first move: %+v err=%v", first, err)
 	}
-	// Retry the same (game, ply): must re-ack, not append again.
+	callsAfterFirst := o.calls
+	// Retry the same (game, ply): must re-ack, not append again — and must NOT
+	// re-validate against the engine (the move is already persisted).
 	retry, err := p.SubmitMove(ctx, in)
 	if err != nil {
 		t.Fatalf("retry err: %v", err)
 	}
 	if !retry.Accepted || retry.Ply != 1 || retry.ClockAfterMs != first.ClockAfterMs {
 		t.Fatalf("retry outcome = %+v, want same accepted move", retry)
+	}
+	if o.calls != callsAfterFirst {
+		t.Errorf("idempotent retry made %d extra oracle call(s), want 0", o.calls-callsAfterFirst)
 	}
 	evs, _ := store.Load(ctx, streamID)
 	moves := 0
@@ -229,7 +242,7 @@ func TestPersistBeforeAck(t *testing.T) {
 	persistErr := errors.New("disk on fire")
 	store.FailNextAppend(persistErr)
 
-	out, err := p.SubmitMove(ctx, MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", ElapsedMs: 10_000})
+	out, err := p.SubmitMove(ctx, MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", CurFEN: "startpos", ElapsedMs: 10_000})
 	if err == nil {
 		t.Fatal("expected persistence error, got nil")
 	}
@@ -260,7 +273,7 @@ func TestPipelineSurfacesTerminal(t *testing.T) {
 	o.allow("e2e4", "fen-after-e4", &mate)
 	p := &Pipeline{Oracle: o, Store: store, Opts: tc53opts()}
 
-	out, err := p.SubmitMove(ctx, MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", ElapsedMs: 1_000})
+	out, err := p.SubmitMove(ctx, MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", CurFEN: "startpos", ElapsedMs: 1_000})
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
@@ -282,7 +295,7 @@ func TestPipelineFlagOnReceive(t *testing.T) {
 	// 1-second base so a 2-second move flags.
 	p := &Pipeline{Oracle: o, Store: store, Opts: FoldOptions{TimeControl: clockTC(1_000, 0)}}
 
-	out, err := p.SubmitMove(ctx, MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", ElapsedMs: 2_000})
+	out, err := p.SubmitMove(ctx, MoveIntent{GameID: gameID, SeatIdx: 0, PlyExpected: 1, UCI: "e2e4", CurFEN: "startpos", ElapsedMs: 2_000})
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
@@ -297,5 +310,54 @@ func TestPipelineFlagOnReceive(t *testing.T) {
 		if e.Type == EvMovePlayed {
 			t.Fatal("a flagged move must not append a MovePlayed")
 		}
+	}
+}
+
+// TestPipelineMovePathIsConstantOracleCost is the regression guard for the
+// O(ply^2) hot-path finding: the authoritative move path must cost exactly ONE
+// engine round-trip per move, independent of how many moves precede it (it does
+// NOT replay the stream through the oracle to rebuild the position). We play a
+// sequence of moves and assert each SubmitMove makes exactly one Legality call.
+func TestPipelineMovePathIsConstantOracleCost(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemStore()
+	gameID, _ := seedLiveGame(t, store, false)
+	o := newFakeOracle()
+	// A short alternating sequence; the FEN is opaque to the stub, we only care
+	// that each accepted move advances the position the live-session threads.
+	ucis := []string{"e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"}
+	for _, u := range ucis {
+		o.allow(u, "fen-"+u, nil)
+	}
+	p := &Pipeline{Oracle: o, Store: store, Opts: tc53opts()}
+
+	curFEN := "startpos"
+	for i, u := range ucis {
+		before := o.calls
+		out, err := p.SubmitMove(ctx, MoveIntent{
+			GameID:      gameID,
+			SeatIdx:     uint8(i % 2),
+			PlyExpected: uint32(i + 1),
+			UCI:         u,
+			CurFEN:      curFEN,
+			ElapsedMs:   1_000,
+		})
+		if err != nil {
+			t.Fatalf("move %d (%s): %v", i+1, u, err)
+		}
+		if !out.Accepted {
+			t.Fatalf("move %d (%s): outcome = %+v, want accepted", i+1, u, out)
+		}
+		if got := o.calls - before; got != 1 {
+			t.Fatalf("move %d (%s): %d oracle calls, want exactly 1 (no O(ply) replay)", i+1, u, got)
+		}
+		// The live-session advances its cached position from the verdict.
+		curFEN = out.NewFEN
+	}
+	// Total engine round-trips must be linear in move count (len(ucis)), not
+	// quadratic (sum 1..N). With the old FoldWithEngine path this would be
+	// 1+2+...+6 = 21; the correct path is exactly 6.
+	if o.calls != len(ucis) {
+		t.Errorf("total oracle calls = %d, want %d (linear, not quadratic)", o.calls, len(ucis))
 	}
 }

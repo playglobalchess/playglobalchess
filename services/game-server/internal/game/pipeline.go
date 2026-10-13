@@ -50,12 +50,23 @@ func (r RejectReason) String() string {
 // MoveIntent is a decoded C->MOVE intent (SPEC-S2-PROTOCOL §4A.3), already
 // authenticated: SeatIdx is the SESSION's bound seat (never client-supplied —
 // §3.6 step 2, T-1/T-2), not a field the client set in the frame.
+//
+// CurFEN is the authoritative current position, supplied BY THE SERVER (the
+// live-session layer, a later chunk, holds the game's position in memory and
+// advances it with each accepted move's verdict.NewFEN). It is NOT
+// client-supplied — it is server truth (NFR-5). The pipeline passes it straight
+// to the engine to validate this one move; it does NOT reconstruct the position
+// from the stream on the move path (see SubmitMove). A fresh in-memory session
+// seeds CurFEN once from FoldWithEngine (reconnection/node-failover resume,
+// §3.5/§6.2) and then advances it incrementally — so the hot path costs exactly
+// one engine round-trip per move, not O(ply).
 type MoveIntent struct {
 	GameID      string
 	SeatIdx     uint8  // the authenticated session's seat
 	PlyExpected uint32 // the client's race guard
 	UCI         string
-	ElapsedMs   int64 // server-measured think time for this move
+	CurFEN      string // server-authoritative current position (NOT from the client)
+	ElapsedMs   int64  // server-measured think time for this move
 	ServerTS    uint64
 }
 
@@ -80,7 +91,12 @@ type MoveOutcome struct {
 	AppliedSeq   uint32
 	Ply          uint32
 	ClockAfterMs uint32
-	Terminal     *Termination // engine-detected mate/stalemate/draw, or nil
+	// NewFEN is the position AFTER the accepted move (the engine's verdict). The
+	// live-session caches it as the next move's CurFEN, which is what keeps the
+	// move path at one engine round-trip (no stream replay). Empty unless
+	// Accepted.
+	NewFEN   string
+	Terminal *Termination // engine-detected mate/stalemate/draw, or nil
 }
 
 // Pipeline wires the two seams for one game-server node. No global mutable state:
@@ -97,13 +113,24 @@ type Pipeline struct {
 // returns (persist-before-ack, NFR-7). A persistence failure yields a non-nil
 // error and NO accepted outcome — the transport must not ack (§5).
 //
+// Position handling (NFR-5 + hot-path cost): the move path does NOT reconstruct
+// the board from the stream. It folds the stream with the PURE Fold (phase/ply/
+// turn/clock only — no chess logic, no engine calls) for authorization, and
+// takes the authoritative current position from in.CurFEN (held by the live-
+// session, seeded once via FoldWithEngine on resume and advanced from each
+// accepted move's NewFEN). So one move costs exactly ONE engine round-trip —
+// the legality check for this move — not O(ply) replays. Reconnection resync,
+// which genuinely must rebuild FEN from the stream, is the one place that uses
+// FoldWithEngine (§3.5), and it runs once per resume, not per move.
+//
 // Ordering (fixed, §3.6):
-//  1. load + fold the stream to the authoritative current state;
+//  1. load the stream; fold it (pure) to the authoritative phase/ply/turn/clock;
 //  2. authorize: game known, LIVE, correct seat, sequential ply (idempotent
 //     re-ack on an already-persisted ply);
-//  3. validate legality via the engine (the only authority, NFR-5);
+//  3. validate legality via the engine against in.CurFEN (the only authority,
+//     NFR-5);
 //  4. persist MovePlayed durably, waiting for the commit;
-//  5. return Accepted with the projected ply/clock/terminal.
+//  5. return Accepted with the projected ply/clock/terminal and the new FEN.
 func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, error) {
 	streamID := streamIDFor(in.GameID)
 	events, err := p.Store.Load(ctx, streamID)
@@ -114,9 +141,12 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		return reject(RejectUnknownGame, 0), nil
 	}
 
-	// Project the current state WITH the engine so CurFEN is authoritative for
-	// legality validation (§3.6 step 3 needs the position).
-	st, err := FoldWithEngine(ctx, events, p.Opts, p.Oracle)
+	// Fold the stream with the PURE fold: it gives phase/ply/turn/clock without
+	// touching the engine (no stream replay — NFR-5 keeps chess logic out of Go,
+	// and the hot path out of O(ply) oracle calls). The current board position
+	// is in.CurFEN (server truth, owned by the live-session), used only to
+	// validate this one move at step 3.
+	st, err := Fold(events, p.Opts)
 	if err != nil {
 		return MoveOutcome{}, fmt.Errorf("pipeline: fold: %w", err)
 	}
@@ -149,8 +179,9 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		return reject(RejectStalePly, st.Ply), nil
 	}
 
-	// (3) validate legality — engine is the only authority (NFR-5).
-	verdict, err := p.Oracle.Legality(ctx, st.CurFEN, in.UCI)
+	// (3) validate legality — engine is the only authority (NFR-5). The position
+	// is in.CurFEN (server-held current position), not reconstructed here.
+	verdict, err := p.Oracle.Legality(ctx, in.CurFEN, in.UCI)
 	if err != nil {
 		return MoveOutcome{}, fmt.Errorf("pipeline: legality: %w", err)
 	}
@@ -199,6 +230,7 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		AppliedSeq:   seq,
 		Ply:          ply,
 		ClockAfterMs: clockAfter,
+		NewFEN:       verdict.NewFEN,
 		Terminal:     verdict.Terminal,
 	}, nil
 }
