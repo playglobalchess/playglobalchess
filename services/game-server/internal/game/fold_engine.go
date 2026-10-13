@@ -30,13 +30,21 @@ func FoldWithEngine(ctx context.Context, events []Event, opts FoldOptions, oracl
 	if err != nil {
 		return State{}, err
 	}
-	// Then project CurFEN by replaying the moves through the engine.
+	// Then project CurFEN by replaying the moves through the engine, accumulating
+	// the Zobrist history as we go. Each replayed move is validated with the
+	// prior keys seen so far, so a persisted REPETITION projects correctly on
+	// resync, and the final `keys` is the folded history the live session seeds
+	// its PriorKeys from (Q-GS5). priorKeys excludes the CURRENT position
+	// (status_with_history's convention), so we append each resulting key AFTER
+	// using the pre-move history for that move's call.
 	fen := st.StartFEN
+	keys := make([]uint64, 0, len(events))
+	var lastTerminal *Termination
 	for i := range events {
 		if events[i].Type != EvMovePlayed || events[i].MovePlayed == nil {
 			continue
 		}
-		v, err := oracle.Legality(ctx, fen, events[i].MovePlayed.UCI)
+		v, err := oracle.Legality(ctx, fen, events[i].MovePlayed.UCI, keys)
 		if err != nil {
 			return State{}, fmt.Errorf("foldWithEngine: replay ply %d: %w", events[i].MovePlayed.Ply, err)
 		}
@@ -47,8 +55,12 @@ func FoldWithEngine(ctx context.Context, events []Event, opts FoldOptions, oracl
 			return State{}, fmt.Errorf("foldWithEngine: persisted move %q at ply %d is illegal from %q", events[i].MovePlayed.UCI, events[i].MovePlayed.Ply, fen)
 		}
 		fen = v.NewFEN
+		keys = append(keys, v.NewZobrist)
+		lastTerminal = v.Terminal // the terminal (if any) the LAST move produced
 	}
 	st.CurFEN = fen
+	st.PriorKeys = keys
+	st.LastMoveTerminal = lastTerminal
 	return st, nil
 }
 

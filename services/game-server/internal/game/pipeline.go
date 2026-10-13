@@ -68,6 +68,11 @@ type MoveIntent struct {
 	CurFEN      string // server-authoritative current position (NOT from the client)
 	ElapsedMs   int64  // server-measured think time for this move
 	ServerTS    uint64
+	// PriorKeys is the folded Zobrist-key history BEFORE the resulting position,
+	// supplied by the live session (GS-3) so the engine can detect repetition
+	// (Q-GS5). Nil for callers without history (the move path still detects every
+	// position-derived terminal; only repetition needs this).
+	PriorKeys []uint64
 }
 
 // MoveOutcome is the pipeline's decision. Exactly one of Accepted / Rejected /
@@ -95,8 +100,13 @@ type MoveOutcome struct {
 	// live-session caches it as the next move's CurFEN, which is what keeps the
 	// move path at one engine round-trip (no stream replay). Empty unless
 	// Accepted.
-	NewFEN   string
-	Terminal *Termination // engine-detected mate/stalemate/draw, or nil
+	NewFEN string
+	// NewZobrist is the Zobrist key of the position after the accepted move
+	// (engine-computed). The live session appends it to its folded history so
+	// the next move's PriorKeys can carry it — the repetition path (Q-GS5).
+	// Zero unless Accepted.
+	NewZobrist uint64
+	Terminal   *Termination // engine-detected mate/stalemate/draw, or nil
 }
 
 // Pipeline wires the two seams for one game-server node. No global mutable state:
@@ -132,7 +142,7 @@ type Pipeline struct {
 //  4. persist MovePlayed durably, waiting for the commit;
 //  5. return Accepted with the projected ply/clock/terminal and the new FEN.
 func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, error) {
-	streamID := streamIDFor(in.GameID)
+	streamID := StreamIDFor(in.GameID)
 	events, err := p.Store.Load(ctx, streamID)
 	if err != nil {
 		return MoveOutcome{}, fmt.Errorf("pipeline: load: %w", err)
@@ -181,7 +191,7 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 
 	// (3) validate legality — engine is the only authority (NFR-5). The position
 	// is in.CurFEN (server-held current position), not reconstructed here.
-	verdict, err := p.Oracle.Legality(ctx, in.CurFEN, in.UCI)
+	verdict, err := p.Oracle.Legality(ctx, in.CurFEN, in.UCI, in.PriorKeys)
 	if err != nil {
 		return MoveOutcome{}, fmt.Errorf("pipeline: legality: %w", err)
 	}
@@ -231,6 +241,7 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		Ply:          ply,
 		ClockAfterMs: clockAfter,
 		NewFEN:       verdict.NewFEN,
+		NewZobrist:   verdict.NewZobrist,
 		Terminal:     verdict.Terminal,
 	}, nil
 }
@@ -249,6 +260,7 @@ func findMove(events []Event, ply uint32) *MovePlayed {
 	return nil
 }
 
-// streamIDFor builds the stream id for a game (SPEC-S2-PROTOCOL §4A.8:
-// "game/{uuid}").
-func streamIDFor(gameID string) string { return "game/" + gameID }
+// StreamIDFor builds the stream id for a game (SPEC-S2-PROTOCOL §4A.8:
+// "game/{uuid}"). Exported because the live session (GS-3) seeds and reads the
+// same stream the pipeline writes, and both must agree on the id.
+func StreamIDFor(gameID string) string { return "game/" + gameID }

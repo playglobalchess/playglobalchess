@@ -18,9 +18,16 @@ type LegalityVerdict struct {
 	Legal bool
 	// NewFEN is the position AFTER the move (only meaningful when Legal).
 	NewFEN string
+	// NewZobrist is the Zobrist key of the position AFTER the move (only
+	// meaningful when Legal). The live session appends it to its folded history
+	// so the NEXT move's legality call can pass it as a prior key — this is how
+	// repetition (threefold/fivefold) is detected on the live path (Q-GS5,
+	// SPEC-S2-GAME-SERVER §10 / GS-3). The engine computes it; Go never hashes.
+	NewZobrist uint64
 	// Terminal, when set, is the game-ending condition the move produced
 	// (mate/stalemate/repetition/fifty-move/insufficient). Nil means the game
-	// continues. The engine — not Go — detects these (NFR-5).
+	// continues. The engine — not Go — detects these (NFR-5). REPETITION is only
+	// ever returned when a non-empty priorKeys history was supplied to Legality.
 	Terminal *Termination
 }
 
@@ -36,7 +43,15 @@ type LegalityOracle interface {
 	// Legality validates a UCI move against a FEN position. context.Context is
 	// on the method because the real implementation crosses the cgo seam and may
 	// be cancelled/timed-out on the hot path (SPEC-S2-GAME-SERVER §6.1).
-	Legality(ctx context.Context, fen, uci string) (LegalityVerdict, error)
+	//
+	// priorKeys is the folded Zobrist-key history of the game BEFORE the
+	// resulting position (status_with_history's convention: it excludes the
+	// position the move produces). The live session accumulates it from each
+	// accepted move's LegalityVerdict.NewZobrist and threads it here so the
+	// engine can detect threefold/fivefold REPETITION (Q-GS5). Callers with no
+	// history (single-move validation, or the GS-1 stub path) pass nil — the
+	// engine then detects every position-derived terminal but never repetition.
+	Legality(ctx context.Context, fen, uci string, priorKeys []uint64) (LegalityVerdict, error)
 
 	// HasSufficientMaterial reports whether the given seat has enough material to
 	// mate. Used ONLY at a flag: if the opponent of the flagged seat lacks
