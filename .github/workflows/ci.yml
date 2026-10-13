@@ -173,9 +173,10 @@ jobs:
           # OpenAPI 3.1 validity + §3.3 WS/REST boundary + §3.2 catalog parity +
           # Appendix B error-registry parity. Stdlib-only; the server-dependent
           # §8 conformance suite (R2) ships with the F-01 slice (P1).
-          if [ -f protocol/rest/openapi.yaml ]; then
-            python3 platform/ci/check_rest_contract.py
-          fi
+          # NO existence guard on purpose: the artifact is the single source of
+          # truth (NFR-10), so a missing/moved/renamed openapi.yaml MUST fail the
+          # gate (the script fail()s on it) rather than silently no-op the audit.
+          python3 platform/ci/check_rest_contract.py
 
   # macOS host-provable parity tier (SPEC-S2-PROTOCOL §8, PLAN-CODEC §4.3): the
   # Swift consumer RUNS against the codec dylib and reproduces the frozen golden
