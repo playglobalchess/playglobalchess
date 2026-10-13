@@ -4,7 +4,7 @@
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS2 (implementation slice of SPEC-S2-GAME-SERVER §3.6/§4) |
 | Owner | S2 Real-time |
-| Status | **REVIEW** |
+| Status | REVIEW |
 | Version | 0.1 |
 | Last updated | 2026-10-13 |
 | Implements (master IDs) | X-2, X-1, F-01, NFR-5 (engine is the only legality authority), ADR-11, ADR-12, **ADR-15** (uniform Go↔Rust cgo) |
