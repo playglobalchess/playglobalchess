@@ -110,6 +110,59 @@ pub fn is_insufficient_material(pos: &Position) -> bool {
     knights == 0 && !(bishop_on_light && bishop_on_dark)
 }
 
+/// Whether `color` has enough material to deliver checkmate by **some** series
+/// of legal moves (ENGINE-CORE §4.1, incremental surface per §4; the per-side
+/// companion to [`is_insufficient_material`]).
+///
+/// This answers the single question the **timeout-vs-insufficient-material**
+/// rule needs (FIDE Art. 6.9, surfaced to the game-server at SPEC-S2-GAME-SERVER
+/// §3.3): when a player flags, the game is a draw instead of a loss iff the
+/// OPPONENT "cannot checkmate the player's king by any possible series of legal
+/// moves" — i.e. the opponent (the side that still has time) lacks mating
+/// material. S2 asks `has_mating_material(pos, opponent_of_flagged)`; a `false`
+/// answer makes it `TIMEOUT_VS_INSUFFICIENT`, a `true` answer makes it `FLAG`.
+///
+/// It is a per-SIDE capacity test, distinct from [`is_insufficient_material`]'s
+/// symmetric *dead-position* test (which is true only when NEITHER side can
+/// mate). Example: in K+Q vs K+N, the knight side has no mating material
+/// (`false`) while the queen side does (`true`), yet the position is not a dead
+/// position for either call of `is_insufficient_material` (it returns `false` —
+/// a queen is present). The two functions answer different questions.
+///
+/// Definition (the settled FIDE-6.9 reading): `color` has mating material unless
+/// it holds ONLY one of — a lone king, K+one knight, or K+one bishop. Concretely
+/// `color` CAN mate iff it has any pawn, rook, or queen, OR two-or-more minors
+/// (two knights, bishop+knight, two bishops — all can force or allow mate
+/// against a cooperating king, which "any series of legal moves" permits). A
+/// lone king or a single minor cannot. This mirrors how Lichess/chess.com rule
+/// timeouts and is the capacity needed for the §3.3 split; it is NOT the
+/// dead-position rule and must not be "unified" with it.
+///
+/// The engine only reports this capacity; whether a flag ends the game as FLAG
+/// or TIMEOUT_VS_INSUFFICIENT is S2 governance (detect-don't-govern, §3.7).
+#[must_use]
+pub fn has_mating_material(pos: &Position, color: Color) -> bool {
+    use crate::types::Piece;
+
+    // Any pawn, rook, or queen ⇒ this side can mate.
+    for kind in [PieceType::Pawn, PieceType::Rook, PieceType::Queen] {
+        if pos.piece_bb(Piece::new(color, kind)) != 0 {
+            return true;
+        }
+    }
+
+    // Otherwise capacity hinges on this side's minor count. Two or more minors
+    // (NN, BN, BB — same or opposite colour) can force or allow mate against a
+    // cooperating king; a lone king or a single minor cannot.
+    let minors = pos
+        .piece_bb(Piece::new(color, PieceType::Knight))
+        .count_ones()
+        + pos
+            .piece_bb(Piece::new(color, PieceType::Bishop))
+            .count_ones();
+    minors >= 2
+}
+
 /// End-condition status of a single position (ENGINE-CORE §4.1).
 ///
 /// Precedence: terminal no-move states (checkmate / stalemate) first, then the
@@ -337,5 +390,63 @@ mod tests {
         // Checkmate detection ignores the clock entirely.
         let m = pos("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 99 3");
         assert_eq!(status(&m), GameStatus::Checkmate);
+    }
+
+    // --- has_mating_material: the per-side FIDE-6.9 timeout capacity test ------
+
+    #[test]
+    fn mating_material_lone_king_and_single_minor_cannot() {
+        // Lone king: no mating material.
+        let p = pos("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+        assert!(!has_mating_material(&p, Color::White));
+        assert!(!has_mating_material(&p, Color::Black));
+        // K + single knight: cannot mate.
+        let kn = pos("4k3/8/8/8/8/8/8/4KN2 w - - 0 1");
+        assert!(!has_mating_material(&kn, Color::White));
+        // K + single bishop: cannot mate.
+        let kb = pos("4k3/8/8/8/8/8/8/4KB2 w - - 0 1");
+        assert!(!has_mating_material(&kb, Color::White));
+    }
+
+    #[test]
+    fn mating_material_two_minors_can() {
+        // K+N+N: two knights CAN mate a cooperating king (6.9 "any series").
+        let knn = pos("4k3/8/8/8/8/8/8/4KNN1 w - - 0 1");
+        assert!(has_mating_material(&knn, Color::White));
+        // K+B+N: can mate.
+        let kbn = pos("4k3/8/8/8/8/8/8/4KBN1 w - - 0 1");
+        assert!(has_mating_material(&kbn, Color::White));
+        // K+B+B (same or opposite colour — the per-side test does not care): can.
+        let kbb = pos("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1");
+        assert!(has_mating_material(&kbb, Color::White));
+    }
+
+    #[test]
+    fn mating_material_major_or_pawn_can() {
+        // A queen, a rook, or a pawn each means this side can mate.
+        assert!(has_mating_material(
+            &pos("4k3/8/8/8/8/8/8/3QK3 w - - 0 1"),
+            Color::White
+        ));
+        assert!(has_mating_material(
+            &pos("4k3/8/8/8/8/8/8/3RK3 w - - 0 1"),
+            Color::White
+        ));
+        assert!(has_mating_material(
+            &pos("4k3/8/8/8/8/4P3/8/4K3 w - - 0 1"),
+            Color::White
+        ));
+    }
+
+    #[test]
+    fn mating_material_is_per_side_not_symmetric() {
+        // K+Q vs K+N: the queen side CAN mate; the knight side CANNOT. This is
+        // the case is_insufficient_material cannot answer (it is not a dead
+        // position — a queen is on the board — so it returns false for both,
+        // telling S2 nothing about the per-side timeout ruling).
+        let p = pos("4k1n1/8/8/8/8/8/8/3QK3 w - - 0 1");
+        assert!(has_mating_material(&p, Color::White)); // queen side
+        assert!(!has_mating_material(&p, Color::Black)); // lone-ish: K + one knight
+        assert!(!is_insufficient_material(&p)); // NOT a dead position (queen present)
     }
 }
