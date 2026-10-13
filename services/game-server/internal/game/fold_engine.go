@@ -39,6 +39,7 @@ func FoldWithEngine(ctx context.Context, events []Event, opts FoldOptions, oracl
 	// using the pre-move history for that move's call.
 	fen := st.StartFEN
 	keys := make([]uint64, 0, len(events))
+	var lastTerminal *Termination
 	for i := range events {
 		if events[i].Type != EvMovePlayed || events[i].MovePlayed == nil {
 			continue
@@ -55,9 +56,11 @@ func FoldWithEngine(ctx context.Context, events []Event, opts FoldOptions, oracl
 		}
 		fen = v.NewFEN
 		keys = append(keys, v.NewZobrist)
+		lastTerminal = v.Terminal // the terminal (if any) the LAST move produced
 	}
 	st.CurFEN = fen
 	st.PriorKeys = keys
+	st.LastMoveTerminal = lastTerminal
 	return st, nil
 }
 

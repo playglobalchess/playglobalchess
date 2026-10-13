@@ -99,9 +99,28 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		// corrupting the game. So we only advance on a new move; a re-ack is
 		// returned as-is for the transport to re-emit MOVE_ACCEPTED, with no
 		// projection change.
-		if out.Ply != s.ply+1 {
-			// Idempotent re-ack (or any non-advancing accept): do not touch state.
-			break
+		switch {
+		case out.Ply == s.ply+1:
+			// Genuine new move — fall through to advance the projection below.
+		case out.Ply <= s.ply:
+			// Idempotent re-ack of an already-persisted ply (a client resend after
+			// a lost ack): the pipeline returns Accepted with the EXISTING move's
+			// ply, empty NewFEN, zero NewZobrist, nil Terminal. Advancing here
+			// would overwrite curFEN with "", append a bogus 0 key, and flip turn.
+			// So we return it as-is (transport re-emits MOVE_ACCEPTED) with NO
+			// projection change.
+			return
+		default:
+			// out.Ply > s.ply+1: the pipeline accepted a move that skips a ply.
+			// This is NOT a duplicate — it is a pipeline/stream desync, and
+			// silently treating it as a re-ack would freeze the projection while
+			// the stream advanced (every later move then validates a stale FEN).
+			// Surface it as an error so the transport fails loudly rather than
+			// corrupting the game.
+			c.out = game.MoveOutcome{}
+			c.err = fmt.Errorf("session: pipeline accepted ply %d but session is at %d (expected %d) — stream desync",
+				out.Ply, s.ply, s.ply+1)
+			return
 		}
 		s.curFEN = out.NewFEN
 		s.priorKeys = append(s.priorKeys, out.NewZobrist)
@@ -123,8 +142,7 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 				c.err = err
 				return
 			}
-			s.ended = true
-			s.terminal = *out.Terminal
+			s.endGame(*out.Terminal)
 		}
 	case out.Flagged:
 		// The mover ran out of time on this move. Append ClockFlagged then
@@ -228,34 +246,62 @@ func (c *snapCmd) apply(_ context.Context, s *Session) {
 // flag appends ClockFlagged + GameEnded for a flagged seat, deciding FLAG vs
 // TIMEOUT_VS_INSUFFICIENT via the engine (GS-1 FlagTermination over GS-2
 // HasSufficientMaterial).
+//
+// Ordering: everything fallible that does NOT touch the store (the termination
+// decision, the result vector) is computed FIRST, so the only step between the
+// two appends is the second append itself — the smallest possible window for a
+// half-terminal stream (ClockFlagged committed, GameEnded not). If the GameEnded
+// append fails after ClockFlagged committed, the session returns the error and
+// does NOT mark itself ended; NewSession's recovery (finishTrailingFlag) closes
+// the half-terminal stream on the next rebuild so it never resumes as LIVE.
 func (s *Session) flag(ctx context.Context, flaggedSeat uint8) error {
+	// (1) Decide the termination + result vector BEFORE any append (fail here
+	// leaves the stream untouched).
+	term, err := game.FlagTermination(ctx, s.oracle, s.curFEN, flaggedSeat, s.seatCount)
+	if err != nil {
+		return fmt.Errorf("session: flag termination: %w", err)
+	}
+	rv := flagResultVector(term, flaggedSeat, s.seatCount)
+
+	// (2) Append ClockFlagged, then (3) GameEnded. A failure between them is the
+	// recoverable half-terminal case (see finishTrailingFlag).
 	if _, err := s.store.Append(ctx, s.stream, game.Event{
 		Type: game.EvClockFlagged, SeatAction: &game.SeatAction{SeatIdx: flaggedSeat},
 	}); err != nil {
 		return fmt.Errorf("session: append ClockFlagged: %w", err)
 	}
-	term, err := game.FlagTermination(ctx, s.oracle, s.curFEN, flaggedSeat, s.seatCount)
-	if err != nil {
-		return fmt.Errorf("session: flag termination: %w", err)
+	if err := s.appendGameEnded(ctx, term, rv); err != nil {
+		return err
 	}
-	// The flagged seat loses on FLAG; on TIMEOUT_VS_INSUFFICIENT it is a draw.
-	rv := make([]game.Result, s.seatCount)
+	s.endGame(term)
+	return nil
+}
+
+// flagResultVector: the flagged seat loses on FLAG; on TIMEOUT_VS_INSUFFICIENT
+// the game is a draw for all seats.
+func flagResultVector(term game.Termination, flaggedSeat uint8, seatCount int) []game.Result {
+	rv := make([]game.Result, seatCount)
 	if term == game.TermTimeoutVsInsufficient {
 		for i := range rv {
 			rv[i] = game.ResultDraw
 		}
-	} else {
-		for i := range rv {
-			rv[i] = game.ResultWin
-		}
-		rv[flaggedSeat] = game.ResultLoss
+		return rv
 	}
-	if err := s.appendGameEnded(ctx, term, rv); err != nil {
-		return err
+	for i := range rv {
+		rv[i] = game.ResultWin
 	}
+	rv[flaggedSeat] = game.ResultLoss
+	return rv
+}
+
+// endGame is the SINGLE place the three ending-state fields are written together,
+// so no code path can set one and forget another (the stale-phase bug: ended=true
+// with phase still Live produced a contradictory snapshot). Every terminal path
+// — move-produced, flag, and construction-time recovery — calls this.
+func (s *Session) endGame(term game.Termination) {
 	s.ended = true
 	s.terminal = term
-	return nil
+	s.phase = game.PhaseEnded
 }
 
 func (s *Session) appendGameEnded(ctx context.Context, term game.Termination, rv []game.Result) error {

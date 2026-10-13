@@ -79,6 +79,13 @@ type State struct {
 	// (Q-GS5). It follows status_with_history's convention indirectly: to ask
 	// about the position after move N, pass PriorKeys[:N].
 	PriorKeys []uint64
+	// LastMoveTerminal is the terminal condition (if any) the FINAL replayed move
+	// produced, as the engine reported it — set only by FoldWithEngine. The live
+	// session uses it to detect a half-terminal stream on rebuild (a terminal
+	// move or flag whose GameEnded append did not land) and finish it, so a
+	// finished game never resumes as LIVE. Nil when the last move was not
+	// terminal (or no moves / pure Fold).
+	LastMoveTerminal *Termination
 
 	// Pending offers/requests (reset appropriately on resolution).
 	DrawOfferBy   int // seat_idx with an open draw offer, or -1

@@ -120,6 +120,11 @@ func TestFullGameToMate(t *testing.T) {
 	if !snap.Ended || snap.Terminal != game.TermMate {
 		t.Errorf("post-end snapshot = {Ended:%v Terminal:%v}, want {true MATE}", snap.Ended, snap.Terminal)
 	}
+	// Phase must also flip to Ended — not left at Live (the stale-phase bug: a
+	// snapshot that says both Live and Ended is contradictory).
+	if snap.Phase != game.PhaseEnded {
+		t.Errorf("post-end snapshot Phase = %v, want PhaseEnded (stale-phase bug?)", snap.Phase)
+	}
 }
 
 // TestFlagUsesAdvancedClock: after real time is burned on prior moves, the idle
@@ -244,6 +249,9 @@ func TestSnapshotEqualsFold(t *testing.T) {
 		}
 		if snap.FEN != folded.CurFEN {
 			t.Errorf("ply %d: snapshot FEN %q != folded %q", i+1, snap.FEN, folded.CurFEN)
+		}
+		if snap.Phase != folded.Phase {
+			t.Errorf("ply %d: snapshot Phase %v != folded %v", i+1, snap.Phase, folded.Phase)
 		}
 		if snap.Ply != folded.Ply || snap.Turn != folded.TurnIdx {
 			t.Errorf("ply %d: snapshot ply/turn (%d,%d) != folded (%d,%d)", i+1, snap.Ply, snap.Turn, folded.Ply, folded.TurnIdx)
@@ -574,5 +582,180 @@ func TestResyncPreservesIdleThink(t *testing.T) {
 	if !ended {
 		t.Fatal("rebuilt session did not flag despite ~4s idle since the last move " +
 			"(idle baseline reset on rebuild?)")
+	}
+}
+
+// TestCloseConcurrentWithDispatchNoPanic covers finding 4.2: Close() must be
+// safe while other goroutines are dispatching — closing the commands channel
+// would panic a racing send. Run with -race; the pass criterion is "no panic".
+func TestCloseConcurrentWithDispatchNoPanic(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// These may succeed or return errSessionClosed once Close lands;
+			// neither may panic.
+			_, _ = s.StateSnapshot(ctx)
+			_, _ = s.TickFlagCheck(ctx)
+		}()
+	}
+	// Close while the dispatchers are in flight.
+	s.Close()
+	wg.Wait()
+	// Idempotent + safe to call again.
+	s.Close()
+}
+
+// TestCancelledCallerStillCommits covers finding 4.1: if the caller's ctx
+// cancels AFTER the actor accepted a mutating command, the move must still
+// commit durably — the caller's ctx governs delivery, not execution. We cannot
+// deterministically hit the exact nanosecond window, so we assert the invariant
+// that matters: a move the pipeline persisted is ALWAYS reflected in a
+// subsequent snapshot, regardless of what the submitting call returned.
+func TestCancelledCallerStillCommits(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, store, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+
+	// An already-cancelled context: already-cancelled before the result wait. The command
+	// is still delivered and runs to completion (dispatch does not abandon after
+	// the send). The move must be persisted and the projection advanced.
+	cctx, ccancel := context.WithCancel(ctx)
+	fc.add(time.Second)
+	// Cancel right away; dispatch's first select may still send (unbuffered, the
+	// actor is ready), and the second select no longer honours ctx.
+	ccancel()
+	_, _ = s.SubmitMove(cctx, 0, 1, "e2e4", 1)
+
+	// Whatever the call returned, durability + projection must agree: either the
+	// move committed (ply 1 in the stream AND snapshot) or it did not run at all
+	// (ply 0 in both). They must NEVER disagree (the finding was: committed in
+	// the store but reported failed / projection stale).
+	snap, err := s.StateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	evs, _ := store.Load(ctx, game.StreamIDFor(gameID))
+	moves := 0
+	for _, e := range evs {
+		if e.Type == game.EvMovePlayed {
+			moves++
+		}
+	}
+	if int(snap.Ply) != moves {
+		t.Fatalf("ack/durability divergence: snapshot ply %d but %d MovePlayed in stream", snap.Ply, moves)
+	}
+}
+
+// TestRecoverHalfTerminalFlag covers finding 2.1 case (a): a stream left with a
+// ClockFlagged and NO GameEnded (the GameEnded append failed mid-flag) must be
+// FINISHED on rebuild, not resume as LIVE.
+func TestRecoverHalfTerminalFlag(t *testing.T) {
+	ctx := context.Background()
+	store := game.NewMemStore()
+	sid := game.StreamIDFor(gameID)
+	// Seed a live game, then a MovePlayed, then a bare ClockFlagged with NO
+	// GameEnded — the half-terminal flag stream.
+	for _, ev := range []game.Event{
+		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
+			PoolID: "x", Rated: false,
+			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
+			StartFEN: startFEN, TimeControl: "t-10+0",
+		}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
+		{Type: game.EvMovePlayed, MovePlayed: &game.MovePlayed{Ply: 1, SeatIdx: 0, UCI: "e2e4", ClockAfterMs: 9000, ServerTS: 1000}},
+		{Type: game.EvClockFlagged, SeatAction: &game.SeatAction{SeatIdx: 1}}, // black flagged, no GameEnded
+	} {
+		if _, err := store.Append(ctx, sid, ev); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	o, _ := engine.New()
+	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 10_000, IncrementMs: 0}}
+	s, err := NewSession(ctx, Config{GameID: gameID, Store: store, Oracle: o, Opts: opts, Now: func() time.Time { return time.UnixMilli(5000) }})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go s.Run(rctx)
+
+	snap, err := s.StateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !snap.Ended || snap.Phase != game.PhaseEnded {
+		t.Fatalf("half-terminal flag stream rebuilt as not-ended: Ended=%v Phase=%v", snap.Ended, snap.Phase)
+	}
+	// The recovery appended the missing GameEnded.
+	evs, _ := store.Load(ctx, sid)
+	if evs[len(evs)-1].Type != game.EvGameEnded {
+		t.Fatalf("recovery did not append GameEnded; last=%v", evs[len(evs)-1].Type)
+	}
+	// A move on the recovered game is rejected (game over), not accepted.
+	out, _ := s.SubmitMove(ctx, 0, 2, "e4e5", 2)
+	if !out.Rejected {
+		t.Errorf("move on recovered-terminal game = %+v, want rejected", out)
+	}
+}
+
+// TestRecoverHalfTerminalMate covers finding 2.1 case (b): a stream whose last
+// MovePlayed is checkmate but has NO GameEnded (the GameEnded append failed
+// after the move persisted) must be FINISHED on rebuild, not resume as LIVE.
+func TestRecoverHalfTerminalMate(t *testing.T) {
+	ctx := context.Background()
+	store := game.NewMemStore()
+	sid := game.StreamIDFor(gameID)
+	// Scholar's mate as persisted MovePlayed events, with NO trailing GameEnded.
+	seed := []game.Event{
+		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
+			PoolID: "x", Rated: false,
+			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
+			StartFEN: startFEN, TimeControl: "t-300+3",
+		}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
+	}
+	mates := []struct {
+		ply  uint32
+		seat uint8
+		uci  string
+	}{{1, 0, "e2e4"}, {2, 1, "e7e5"}, {3, 0, "f1c4"}, {4, 1, "b8c6"}, {5, 0, "d1h5"}, {6, 1, "g8f6"}, {7, 0, "h5f7"}}
+	for _, m := range mates {
+		seed = append(seed, game.Event{Type: game.EvMovePlayed, MovePlayed: &game.MovePlayed{Ply: m.ply, SeatIdx: m.seat, UCI: m.uci, ClockAfterMs: 300000, ServerTS: uint64(m.ply) * 1000}})
+	}
+	for _, ev := range seed {
+		if _, err := store.Append(ctx, sid, ev); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	o, _ := engine.New()
+	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 300_000, IncrementMs: 3_000}}
+	s, err := NewSession(ctx, Config{GameID: gameID, Store: store, Oracle: o, Opts: opts, Now: func() time.Time { return time.UnixMilli(10000) }})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go s.Run(rctx)
+
+	snap, err := s.StateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !snap.Ended || snap.Phase != game.PhaseEnded || snap.Terminal != game.TermMate {
+		t.Fatalf("half-terminal mate rebuilt wrong: Ended=%v Phase=%v Terminal=%v", snap.Ended, snap.Phase, snap.Terminal)
+	}
+	evs, _ := store.Load(ctx, sid)
+	if evs[len(evs)-1].Type != game.EvGameEnded {
+		t.Fatalf("recovery did not append GameEnded; last=%v", evs[len(evs)-1].Type)
 	}
 }
