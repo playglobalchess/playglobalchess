@@ -4,8 +4,8 @@
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS3 (implementation slice of SPEC-S2-GAME-SERVER §3.5/§3.6/§6.3) |
 | Owner | S2 Real-time |
-| Status | REVIEW |
-| Version | 0.1 |
+| Status | RATIFIED |
+| Version | 1.0 |
 | Last updated | 2026-10-13 |
 | Implements (master IDs) | X-2, F-01, F-01.5 (reconnection), NFR-2 (no game loss), NFR-5, NFR-7, ADR-10, ADR-12 |
 | Depends on | SPEC-S2-GAME-SERVER (RATIFIED); GS-1 (lifecycle/clock/pipeline, PR #34); GS-2 (engine-cgo `CgoOracle`, PR #38); SPEC-S1-ENGINE-CORE (G-A) |

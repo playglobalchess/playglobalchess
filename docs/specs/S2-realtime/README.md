@@ -14,7 +14,7 @@ See `../README.md` for how specs relate to `../../MASTER-PLAN.md`, and `../_shar
 - **PLAN-CODEC.md** — the ADR-14 wire codec implementation plan (**RATIFIED**).
 - **GAME-SERVER.md** — lifecycle, clock, matchmaking, reconnection, codec consumption / OPEN-C4 (SPEC-S2-GAME-SERVER, **RATIFIED** 2026-10-13; feeds G-E). GS-1 (lifecycle + clock core) implemented + merged (PR #34).
 - **GAME-SERVER-GS2-ENGINE-CGO.md** — implementation slice of SPEC-S2-GAME-SERVER §3.6/§4: the engine-cgo legality seam (binds the S1 engine into the Go server over cgo, ADR-15; fills GS-1's stubbed `LegalityOracle`). **RATIFIED** 2026-10-13. Implemented + merged (PR #38).
-- **GAME-SERVER-GS3-LIVE-SESSION.md** — implementation slice of SPEC-S2-GAME-SERVER §3.5/§3.6/§6.3: the live in-memory game session (owns CurFEN + clocks + folded Zobrist history, drives the GS-1 pipeline against the GS-2 engine, serves reconnection resync, **closes Q-GS5 repetition**). **REVIEW**. No new wire bytes, no new ADR.
+- **GAME-SERVER-GS3-LIVE-SESSION.md** — implementation slice of SPEC-S2-GAME-SERVER §3.5/§3.6/§6.3: the live in-memory game session (owns CurFEN + clocks + folded Zobrist history, drives the GS-1 pipeline against the GS-2 engine, serves reconnection resync, **closes Q-GS5 repetition**). **RATIFIED** 2026-10-13. No new wire bytes, no new ADR; carries one coordinated LegalityOracle/MoveIntent change (Q-GS3B).
 
 ## Still to write (P0+)
 - MATCHMAKING.md (if the §3.4 model needs more depth than GAME-SERVER carries)
