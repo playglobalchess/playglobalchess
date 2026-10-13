@@ -67,6 +67,9 @@ pub use moves::{Move, MoveList};
 pub use perft::{perft, perft_divide};
 pub use position::Position;
 pub use san::{move_to_san, move_to_uci, san_to_move, uci_to_move, MoveError};
-pub use status::{is_insufficient_material, status, status_with_history, DrawClaim, GameStatus};
+pub use status::{
+    has_mating_material, is_insufficient_material, status, status_with_history, DrawClaim,
+    GameStatus,
+};
 pub use types::{Color, Piece, PieceType, Square};
 pub use zobrist::zobrist;

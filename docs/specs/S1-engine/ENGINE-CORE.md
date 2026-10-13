@@ -124,6 +124,7 @@ Special-move rules enforced exactly (FIDE):
 - **Threefold / fivefold repetition**: repetition is **by position identity**, where identity = (piece placement + side to move + castling rights + en-passant *availability*), explicitly **not** the move list (MASTER §X.1.3). A Zobrist hash keyed over exactly those fields backs an occurrence count; a full-equality check guards hash collisions on claim. Threefold is claimable; fivefold is automatic.
 - **50-move / 75-move**: halfmove_clock ≥ 100 plies ⇒ 50-move draw claimable; ≥ 150 ⇒ 75-move automatic. Clock resets on any capture or pawn move.
 - **Insufficient material** (automatic draw): K vs K; K+B vs K; K+N vs K; K+B vs K+B with both bishops on the **same color** complex (MASTER §X.1.3). (K+N+N vs K is *not* auto-draw under FIDE — it is not forced mate but mate is possible, so it is handled as "no auto-draw"; documented so it is not "fixed" by mistake.)
+- **Per-side mating capacity (FIDE Art. 6.9 — the timeout rule)**: a *distinct* question from the symmetric dead-position rule above. On a clock flag, the game is a draw instead of a loss iff the OPPONENT of the flagging side "cannot checkmate … by any possible series of legal moves" — i.e. that side lacks mating material. `has_mating_material(p, color)` (§4.1) answers it **per side**: a side CAN mate unless it holds only a lone king, K+one knight, or K+one bishop; any pawn/rook/queen or two-or-more minors (NN/BN/BB) can. Note the deliberate divergence from the dead-position rule: **K+N+N returns `true` here** (two knights *can* mate a cooperating king, which "any series of legal moves" permits — the settled Lichess/chess.com timeout ruling), even though K+N+N is *not* an **automatic** draw via `is_insufficient_material`. Same material, two different questions — do not unify them. The engine reports capacity; S2 governs whether a flag ends as `FLAG` or `TIMEOUT_VS_INSUFFICIENT` (SPEC-S2-GAME-SERVER §3.3), consistent with detect-don't-govern.
 
 ### 3.8 Determinism & move ordering
 Generated move lists have a **defined, stable order** (by from-square, then to-square, then promotion piece). Perft counts are order-independent, but a stable order makes golden tests, FFI, and client/server agreement reproducible (tenet §1.4.1). No ordering heuristic lives in the core — ordering for search is a §X-6 (analysis) concern.
@@ -152,6 +153,7 @@ fn status(p: &Position) -> GameStatus;               // Ongoing | Checkmate | St
                                                      //  | DrawFiftyMove(claimable|auto)
                                                      //  | DrawRepetition(threefold|fivefold)
 fn is_in_check(p: &Position) -> bool;
+fn has_mating_material(p: &Position, color: Color) -> bool;  // per-side FIDE-6.9 timeout capacity (§3.7)
 ```
 S2's move path: receive `MOVE {game_id, ply_expected, uci}` intent → decode uci → `is_legal` → if legal, `make` + project a `MovePlayed` event (MASTER §VIII.3) + reply `MOVE_ACCEPTED`; else `MOVE_REJECTED {reason}`. The engine supplies the legal/illegal verdict and the resulting position; S2 owns ply/clock/events.
 
