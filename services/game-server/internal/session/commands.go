@@ -2,8 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/clock"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 )
 
@@ -85,6 +87,14 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		s.priorKeys = append(s.priorKeys, out.NewZobrist)
 		s.ply = out.Ply
 		s.turn = uint8((int(s.turn) + 1) % s.seatCount)
+		// Advance the owned clock incrementally from the pipeline's authoritative
+		// post-move remaining (out.ClockAfterMs, which already includes delay +
+		// increment). Only the mover's clock changes; CloneWith leaves the others
+		// untouched — the same projection the fold does from a stored MovePlayed.
+		// This keeps the clock projection O(1) per move (no re-fold) and in sync
+		// with the stream, so StateSnapshot and TickFlagCheck see the real
+		// remaining time (§3.5 resync + idle-flag correctness).
+		s.clocks = s.clocks.CloneWith(int(c.seat), int64(out.ClockAfterMs))
 		s.lastMoveAt = s.now()
 		if out.Terminal != nil {
 			// Engine-detected terminal (mate / stalemate / insufficient /
@@ -94,6 +104,7 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 				return
 			}
 			s.ended = true
+			s.terminal = *out.Terminal
 		}
 	case out.Flagged:
 		// The mover ran out of time on this move. Append ClockFlagged then
@@ -142,8 +153,10 @@ func (c *tickCmd) apply(ctx context.Context, s *Session) {
 	// COPY to test the boundary without mutating unless it flags.
 	next, applyErr := s.clocks.Apply(s.opts.TimeControl, int(s.turn), elapsedMs)
 	if applyErr != nil {
-		// ErrFlagged means the side to move is out of time.
-		if next.Flagged() {
+		// Match the pipeline's flag-detection convention exactly (errors.Is on
+		// clock.ErrFlagged) so the two callers cannot drift on what counts as a
+		// flag if clock.Apply's error contract evolves.
+		if errors.Is(applyErr, clock.ErrFlagged) {
 			s.clocks = next
 			if e := s.flag(ctx, uint8(next.FlaggedSeat)); e != nil {
 				c.err = e
@@ -186,6 +199,7 @@ func (c *snapCmd) apply(_ context.Context, s *Session) {
 		Phase:       s.phase,
 		RemainingMs: rem,
 		Ended:       s.ended,
+		Terminal:    s.terminal,
 	}
 }
 
@@ -220,6 +234,7 @@ func (s *Session) flag(ctx context.Context, flaggedSeat uint8) error {
 		return err
 	}
 	s.ended = true
+	s.terminal = term
 	return nil
 }
 

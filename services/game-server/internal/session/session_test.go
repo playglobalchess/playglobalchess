@@ -111,6 +111,72 @@ func TestFullGameToMate(t *testing.T) {
 	if !out.Rejected || out.Reason != game.RejectGameOver {
 		t.Errorf("post-end move = %+v, want GAME_OVER", out)
 	}
+	// A snapshot after the game ends carries the real terminal (not the zero
+	// value) so a reconnecting client can show the correct game-over reason.
+	snap, err := s.StateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("post-end snapshot: %v", err)
+	}
+	if !snap.Ended || snap.Terminal != game.TermMate {
+		t.Errorf("post-end snapshot = {Ended:%v Terminal:%v}, want {true MATE}", snap.Ended, snap.Terminal)
+	}
+}
+
+// TestFlagUsesAdvancedClock: after real time is burned on prior moves, the idle
+// TickFlagCheck must charge against the ADVANCED clock, not the base — i.e. a
+// side that has used most of its time flags on a shorter idle than a fresh one
+// would. This exercises the clock-advancement-on-move fix (finding 1).
+func TestFlagUsesAdvancedClock(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	// 10s base, no increment, no delay — easy arithmetic.
+	store := game.NewMemStore()
+	ctx := context.Background()
+	sid := game.StreamIDFor(gameID)
+	for _, ev := range []game.Event{
+		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
+			PoolID: "x", Rated: false,
+			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
+			StartFEN: startFEN, TimeControl: "t-10+0",
+		}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
+	} {
+		store.Append(ctx, sid, ev)
+	}
+	o, _ := engine.New()
+	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 10_000, IncrementMs: 0}}
+	s, err := NewSession(ctx, Config{GameID: gameID, Store: store, Oracle: o, Opts: opts, Now: fc.now})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go s.Run(rctx)
+
+	// White spends 8s on move 1 (2s left), black spends 1s (9s left).
+	fc.add(8 * time.Second)
+	if o1, _ := s.SubmitMove(ctx, 0, 1, "e2e4", 1); !o1.Accepted {
+		t.Fatal("move 1 not accepted")
+	}
+	fc.add(1 * time.Second)
+	if o2, _ := s.SubmitMove(ctx, 1, 2, "e7e5", 2); !o2.Accepted {
+		t.Fatal("move 2 not accepted")
+	}
+	// Now it's white to move with ~2s left. An idle of 3s MUST flag white — a
+	// stale (base 10s) clock would NOT flag on 3s, so this proves the clock was
+	// advanced by the moves.
+	snap, _ := s.StateSnapshot(ctx)
+	if snap.RemainingMs[0] >= 10_000 {
+		t.Fatalf("white clock not advanced: %d ms (still at/above base)", snap.RemainingMs[0])
+	}
+	fc.add(3 * time.Second)
+	ended, err := s.TickFlagCheck(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if !ended {
+		t.Fatal("white did not flag on a 3s idle despite only ~2s left — clock stale?")
+	}
 }
 
 // TestRepetitionAutoDraw closes Q-GS5 at the session level: a knight shuffle
@@ -181,6 +247,18 @@ func TestSnapshotEqualsFold(t *testing.T) {
 		}
 		if snap.Ply != folded.Ply || snap.Turn != folded.TurnIdx {
 			t.Errorf("ply %d: snapshot ply/turn (%d,%d) != folded (%d,%d)", i+1, snap.Ply, snap.Turn, folded.Ply, folded.TurnIdx)
+		}
+		// The clock projection must match the fold too — this is the assertion
+		// that catches a stale-clock bug (the session must advance s.clocks
+		// incrementally on each accepted move, not leave it at the base).
+		if len(snap.RemainingMs) != len(folded.Clock.RemainingMs) {
+			t.Fatalf("ply %d: snapshot clock len %d != folded %d", i+1, len(snap.RemainingMs), len(folded.Clock.RemainingMs))
+		}
+		for seat := range snap.RemainingMs {
+			if snap.RemainingMs[seat] != folded.Clock.RemainingMs[seat] {
+				t.Errorf("ply %d seat %d: snapshot remaining %d != folded %d (clock not advanced on move?)",
+					i+1, seat, snap.RemainingMs[seat], folded.Clock.RemainingMs[seat])
+			}
 		}
 	}
 }

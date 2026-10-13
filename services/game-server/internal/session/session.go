@@ -55,6 +55,7 @@ type Session struct {
 	seatCount  int
 	rated      bool
 	ended      bool
+	terminal   game.Termination // the ending condition, set when ended=true
 	lastMoveAt time.Time
 }
 
@@ -111,6 +112,7 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		seatCount:  len(st.Seats),
 		rated:      st.Rated,
 		ended:      st.Phase == game.PhaseEnded,
+		terminal:   st.Termination, // meaningful when already ended at construction
 		lastMoveAt: now(),
 	}
 	return s, nil
