@@ -62,6 +62,16 @@ impl Move {
     /// pawn/king is rejected here as malformed.
     #[must_use]
     pub fn from_uci(s: &str) -> Option<Self> {
+        // A UCI move is pure ASCII (files a-h, ranks 1-8, promotion q/r/b/n).
+        // Guard non-ASCII FIRST: `s.len()` is a BYTE length, so without this a
+        // multi-byte-UTF-8 string of 4-5 bytes would pass the length check and
+        // then panic on the `&s[0..2]` / `&s[2..4]` slices when a byte boundary
+        // falls inside a char. A non-ASCII UCI is malformed anyway, so rejecting
+        // it is both panic-safe and semantically correct (untrusted PGN/UCI
+        // import must never crash the engine — ENGINE-CORE §5 no-panic contract).
+        if !s.is_ascii() {
+            return None;
+        }
         if s.len() != 4 && s.len() != 5 {
             return None;
         }
@@ -186,6 +196,21 @@ mod tests {
         assert_eq!(Move::from_uci("e7e8k"), None); // promotion to king
         assert_eq!(Move::from_uci("e7e8p"), None); // promotion to pawn
         assert_eq!(Move::from_uci("e2e4e4"), None);
+    }
+
+    #[test]
+    fn uci_rejects_non_ascii_without_panic() {
+        // Regression (found by the GS-2 engine-cgo fuzz sweep): a non-ASCII
+        // string whose BYTE length is 4 or 5 must NOT panic on the internal
+        // slices — it must be rejected as malformed. Byte lengths chosen to hit
+        // the old len()==4/5 guard: '·' (U+00B7) is 2 bytes, '€' is 3 bytes.
+        assert_eq!(Move::from_uci("··"), None); // 2 chars, 4 bytes
+        assert_eq!(Move::from_uci("a·b"), None); // 1+2+1 = 4 bytes
+        assert_eq!(Move::from_uci("·a·"), None); // 2+1+2 = 5 bytes
+        assert_eq!(Move::from_uci("€a"), None); // 3+1 = 4 bytes
+        assert_eq!(Move::from_uci("e2e€"), None); // valid prefix, non-ASCII tail
+        // A multi-byte char as the "promotion" slot.
+        assert_eq!(Move::from_uci("e2e4·"), None); // 4 ascii + 2-byte = 6 bytes
     }
 
     #[test]

@@ -165,6 +165,14 @@ fn disambiguation(pos: &Position, m: Move, kind: PieceType) -> String {
 /// Decode a SAN string into the unique legal move it denotes in `pos`
 /// (ENGINE-CORE §4.2). Tolerant of trailing `+`/`#` and an `e.p.` suffix.
 pub fn san_to_move(pos: &Position, san: &str) -> Result<Move, MoveError> {
+    // SAN is pure ASCII (piece letters KQRBN, files a-h, ranks 1-8, `x`, `=`,
+    // `+`, `#`, `O-O`). Guard non-ASCII FIRST so the byte-index slices below
+    // (and in the parser body) can never land inside a multi-byte UTF-8 char and
+    // panic — untrusted PGN import (F-08) must never crash the engine
+    // (ENGINE-CORE §5 no-panic contract). A non-ASCII SAN is malformed anyway.
+    if !san.is_ascii() {
+        return Err(MoveError::Malformed(san.to_string()));
+    }
     let raw = san.trim();
     // Strip decorations that do not affect identity: check/mate and e.p.
     let core = raw
@@ -455,6 +463,22 @@ mod tests {
     fn san_to_move_malformed() {
         let p = Position::startpos();
         for bad in ["", "Z9", "e", "=Q", "Ke2e4e4"] {
+            assert!(
+                matches!(san_to_move(&p, bad), Err(MoveError::Malformed(_))),
+                "expected Malformed for {bad:?}, got {:?}",
+                san_to_move(&p, bad)
+            );
+        }
+    }
+
+    #[test]
+    fn san_to_move_rejects_non_ascii_without_panic() {
+        // Regression (same class as from_uci): a non-ASCII SAN whose byte length
+        // reaches the internal slices must be rejected as Malformed, never
+        // panic. '·' (U+00B7) is 2 bytes, '€' is 3 — chosen to drive the
+        // byte-index slices in the parser body.
+        let p = Position::startpos();
+        for bad in ["··", "N·4", "€", "e·", "·x·4", "Nf·", "e4=·"] {
             assert!(
                 matches!(san_to_move(&p, bad), Err(MoveError::Malformed(_))),
                 "expected Malformed for {bad:?}, got {:?}",
