@@ -1,0 +1,19 @@
+[package]
+name = "pgc-engine-cgo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "C-ABI (cgo) binding for the PlayGlobalChess S1 engine (X-1, ADR-11, ADR-15). Emits a staticlib + a hand-written C header so the Go game-server links the SAME pgc-engine rules in-process (NFR-5) — the engine leg of the uniform cgo pattern alongside protocol/codec-cgo. The pure engine crate stays #![forbid(unsafe_code)]; the one unavoidable extern \"C\" unsafe seam is quarantined here. Delegate-only — no chess logic. Spec: docs/specs/S2-realtime/GAME-SERVER-GS2-ENGINE-CGO.md."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "pgc_engine_cgo"
+# staticlib: the .a the Go server links via cgo (ADR-15 in-process C-ABI).
+# rlib: so `cargo test` can run this crate's native unit tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The pure engine — the single source of chess truth (ADR-11, NFR-5). This crate
+# only re-exposes it over a C ABI; it adds no chess logic.
+pgc-engine = { path = ".." }

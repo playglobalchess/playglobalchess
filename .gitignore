@@ -97,3 +97,9 @@ protocol/codec-wasm/target-wasm/
 # crate, Go wrapper/test, Makefile and header SOURCE are committed, the staged
 # copies are not.
 services/game-server/internal/codec/lib/
+
+# ---- Generated Go cgo engine artifacts (SPEC-S2-GAME-SERVER-GS2) ----
+# Same discipline: the pgc-engine-cgo staticlib staged for cgo by `make lib` is
+# a build output; the crate, Go wrapper/test, Makefile and header SOURCE are
+# committed, the staged .a is not.
+services/game-server/internal/engine/lib/
