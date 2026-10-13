@@ -13,7 +13,7 @@ See `../README.md` for how specs relate to `../../MASTER-PLAN.md`, and `../_shar
 - **PROTOCOL.md** — WS binary frame + event-store schema + entity model (SPEC-S2-PROTOCOL, **RATIFIED**; the frozen §4A contract, feeds G-D). Covers the WS frame layout (MASTER §VIII.4) — no separate WS-PROTOCOL.md needed.
 - **PLAN-CODEC.md** — the ADR-14 wire codec implementation plan (**RATIFIED**).
 - **GAME-SERVER.md** — lifecycle, clock, matchmaking, reconnection, codec consumption / OPEN-C4 (SPEC-S2-GAME-SERVER, **RATIFIED** 2026-10-13; feeds G-E). GS-1 (lifecycle + clock core) implemented + merged (PR #34).
-- **GAME-SERVER-GS2-ENGINE-CGO.md** — implementation slice of SPEC-S2-GAME-SERVER §3.6/§4: the engine-cgo legality seam (binds the S1 engine into the Go server over cgo, ADR-15; fills GS-1's stubbed `LegalityOracle`). **REVIEW**. Pins the C-ABI surface + test plan before coding; introduces no new wire bytes and no new ADR (Q-GS4 already DECIDED via ADR-15).
+- **GAME-SERVER-GS2-ENGINE-CGO.md** — implementation slice of SPEC-S2-GAME-SERVER §3.6/§4: the engine-cgo legality seam (binds the S1 engine into the Go server over cgo, ADR-15; fills GS-1's stubbed `LegalityOracle`). **RATIFIED** 2026-10-13. Pins the C-ABI surface + test plan; introduces no new wire bytes and no new ADR (Q-GS4 already DECIDED via ADR-15).
 
 ## Still to write (P0+)
 - MATCHMAKING.md (if the §3.4 model needs more depth than GAME-SERVER carries)
