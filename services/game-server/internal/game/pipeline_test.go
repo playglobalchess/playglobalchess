@@ -11,7 +11,7 @@ import (
 func seedLiveGame(t *testing.T, store *MemStore, rated bool) (string, string) {
 	t.Helper()
 	gameID := "f47ac10b-58cc-4372-a567-0e02b2c3d479"
-	streamID := streamIDFor(gameID)
+	streamID := StreamIDFor(gameID)
 	ctx := context.Background()
 	for _, ev := range liveStream(rated) {
 		if _, err := store.Append(ctx, streamID, ev); err != nil {

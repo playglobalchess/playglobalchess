@@ -55,43 +55,33 @@ const expectedABIVersion = 1
 var _ game.LegalityOracle = CgoOracle{}
 
 // Legality validates a UCI move against a FEN via the engine and, when legal,
-// returns the resulting position + any terminal condition. It makes exactly one
-// engine round-trip (the move path's O(1) oracle cost, GS-1 PR #34).
-func (CgoOracle) Legality(ctx context.Context, fen, uci string) (game.LegalityVerdict, error) {
+// returns the resulting position, its Zobrist key, and any terminal condition.
+// It makes exactly one engine round-trip (the move path's O(1) oracle cost,
+// GS-1 PR #34).
+//
+// priorKeys is the folded Zobrist history BEFORE the resulting position
+// (status_with_history's convention). The live session (GS-3) threads it so the
+// engine can detect threefold/fivefold REPETITION (Q-GS5). A nil/empty history
+// means repetition is simply not detectable this call — every other terminal
+// (mate / stalemate / insufficient / 75-move) still is.
+func (CgoOracle) Legality(ctx context.Context, fen, uci string, priorKeys []uint64) (game.LegalityVerdict, error) {
 	if err := ctx.Err(); err != nil {
 		return game.LegalityVerdict{}, err
 	}
 
 	fenPtr, fenLen := bytesOf(fen)
 	uciPtr, uciLen := bytesOf(uci)
+	keysPtr, keysLen := u64sOf(priorKeys)
 
 	var out *C.uint8_t
 	var outLen C.size_t
 	var status, claim C.int32_t
 	var zobrist C.uint64_t
 
-	// prior_keys is EMPTY on this path — see Q-GS5 (SPEC-S2-GAME-SERVER §10).
-	// The engine's status_with_history takes the folded Zobrist history to
-	// detect threefold/fivefold REPETITION; that history is owned by the live
-	// in-memory game session (a later chunk), not reconstructable here. So this
-	// path detects every position-derived terminal (mate / stalemate /
-	// insufficient / 75-move-automatic) but NOT repetition. pgc_engine_apply
-	// computes each resulting position's Zobrist key (out_zobrist) — the Q-GS5
-	// chunk will surface it on the verdict so the live session can accumulate
-	// the history and pass it back in here (GS-1's LegalityVerdict has no
-	// zobrist field yet; adding it is part of that chunk, not GS-2).
-	//
-	// GUARD AGAINST SILENT FORGETTING: this is pinned by
-	// TestRepetitionIsNotDetectedYet (engine_test.go) — a test that ASSERTS a
-	// repeated position is currently NOT auto-drawn on this path. When the
-	// live-session chunk threads the history, that test will start failing,
-	// forcing whoever does the wiring to confront Q-GS5 here rather than leave
-	// repetition silently broken. Do not delete that test without wiring the
-	// history.
 	rc := C.pgc_engine_apply(
 		fenPtr, fenLen,
 		uciPtr, uciLen,
-		nil, 0, // prior_keys: see Q-GS5 above
+		keysPtr, keysLen, // prior_keys: the folded history, so repetition is seen (Q-GS5)
 		&out, &outLen,
 		&status, &claim,
 		&zobrist,
@@ -102,9 +92,10 @@ func (CgoOracle) Legality(ctx context.Context, fen, uci string) (game.LegalityVe
 		defer C.pgc_engine_free(out, outLen)
 		newFEN := C.GoStringN((*C.char)(unsafe.Pointer(out)), C.int(outLen))
 		return game.LegalityVerdict{
-			Legal:    true,
-			NewFEN:   newFEN,
-			Terminal: terminalOf(int32(status), int32(claim)),
+			Legal:      true,
+			NewFEN:     newFEN,
+			NewZobrist: uint64(zobrist),
+			Terminal:   terminalOf(int32(status), int32(claim)),
 		}, nil
 	case C.PGC_ENG_ERR_MOVE, C.PGC_ENG_ERR_ILLEGAL:
 		// Both are "not a legal move in this position" to the pipeline, which
@@ -188,4 +179,15 @@ func bytesOf(s string) (*C.uint8_t, C.size_t) {
 	// unsafe.StringData's bytes are pinned for this cgo call; the engine only
 	// reads them.
 	return (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(s))), C.size_t(len(s))
+}
+
+// u64sOf returns a cgo (ptr,len) view of a []uint64 for the duration of the
+// call (the engine reads it as const uint64_t*). Empty slice -> (nil, 0), which
+// the C side accepts (prior_keys may be NULL iff prior_keys_len == 0).
+func u64sOf(ks []uint64) (*C.uint64_t, C.size_t) {
+	if len(ks) == 0 {
+		return nil, 0
+	}
+	// &ks[0] is pinned for this cgo call; the engine only reads the slice.
+	return (*C.uint64_t)(unsafe.Pointer(&ks[0])), C.size_t(len(ks))
 }

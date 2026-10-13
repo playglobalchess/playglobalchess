@@ -71,6 +71,15 @@ type State struct {
 	TurnIdx uint8 // seat_idx to move (derived from Ply over the seat order)
 	Clock   clock.Clock
 
+	// PriorKeys is the folded Zobrist-key history of the positions reached by
+	// the moves played so far (one key per MovePlayed, in order). Populated only
+	// by FoldWithEngine (the pure Fold leaves it nil — it has no engine to hash
+	// with). The live session (GS-3) seeds its running history from this and
+	// threads it back into Legality so repetition is detected on the live path
+	// (Q-GS5). It follows status_with_history's convention indirectly: to ask
+	// about the position after move N, pass PriorKeys[:N].
+	PriorKeys []uint64
+
 	// Pending offers/requests (reset appropriately on resolution).
 	DrawOfferBy   int // seat_idx with an open draw offer, or -1
 	TakebackReqBy int // seat_idx with an open takeback request, or -1

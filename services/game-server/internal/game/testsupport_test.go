@@ -20,6 +20,9 @@ type fakeOracle struct {
 	fail error
 	// calls counts Legality invocations (determinism assertions).
 	calls int
+	// lastPriorKeys records the priorKeys passed to the most recent Legality
+	// call, so tests can assert the history is threaded through (Q-GS5).
+	lastPriorKeys []uint64
 }
 
 func newFakeOracle() *fakeOracle {
@@ -31,8 +34,9 @@ func (o *fakeOracle) allow(uci, newFEN string, terminal *Termination) {
 	o.legal[uci] = LegalityVerdict{Legal: true, NewFEN: newFEN, Terminal: terminal}
 }
 
-func (o *fakeOracle) Legality(ctx context.Context, fen, uci string) (LegalityVerdict, error) {
+func (o *fakeOracle) Legality(ctx context.Context, fen, uci string, priorKeys []uint64) (LegalityVerdict, error) {
 	o.calls++
+	o.lastPriorKeys = priorKeys
 	if o.fail != nil {
 		return LegalityVerdict{}, o.fail
 	}

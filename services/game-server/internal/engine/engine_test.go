@@ -22,7 +22,7 @@ func newOracle(t *testing.T) CgoOracle {
 // and (here) no terminal. This is the pipeline's §3.6 step-3 path.
 func TestLegalMove(t *testing.T) {
 	o := newOracle(t)
-	v, err := o.Legality(context.Background(), startFEN, "e2e4")
+	v, err := o.Legality(context.Background(), startFEN, "e2e4", nil)
 	if err != nil {
 		t.Fatalf("Legality: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestLegalMove(t *testing.T) {
 func TestIllegalAndMalformed(t *testing.T) {
 	o := newOracle(t)
 	for _, uci := range []string{"e2e5" /*illegal*/, "zzzz" /*malformed*/, "e9e8" /*off board*/} {
-		v, err := o.Legality(context.Background(), startFEN, uci)
+		v, err := o.Legality(context.Background(), startFEN, uci, nil)
 		if err != nil {
 			t.Fatalf("Legality(%q): unexpected error %v", uci, err)
 		}
@@ -84,7 +84,7 @@ func TestTerminalDetection(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			v, err := o.Legality(context.Background(), tc.fen, tc.uci)
+			v, err := o.Legality(context.Background(), tc.fen, tc.uci, nil)
 			if err != nil {
 				t.Fatalf("Legality: %v", err)
 			}
@@ -134,12 +134,12 @@ func TestHasSufficientMaterial(t *testing.T) {
 func TestDeterminism(t *testing.T) {
 	o := newOracle(t)
 	ctx := context.Background()
-	first, err := o.Legality(ctx, startFEN, "g1f3")
+	first, err := o.Legality(ctx, startFEN, "g1f3", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
-		again, err := o.Legality(ctx, startFEN, "g1f3")
+		again, err := o.Legality(ctx, startFEN, "g1f3", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +155,7 @@ func TestContextCancel(t *testing.T) {
 	o := newOracle(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := o.Legality(ctx, startFEN, "e2e4"); err == nil {
+	if _, err := o.Legality(ctx, startFEN, "e2e4", nil); err == nil {
 		t.Error("cancelled context did not error")
 	}
 	if _, err := o.HasSufficientMaterial(ctx, startFEN, 0); err == nil {
@@ -169,34 +169,66 @@ func TestImplementsOracle(t *testing.T) {
 	var _ game.LegalityOracle = newOracle(t)
 }
 
-// TestRepetitionIsNotDetectedYet PINS the Q-GS5 deferral (SPEC-S2-GAME-SERVER
-// §10): the move path calls the engine with empty prior_keys, so repetition is
-// NOT detectable here — a move that merely reaches a position cannot return
-// DrawRepetition, because the oracle has no history to count against.
+// TestRepetitionDetectedWithHistory closes Q-GS5: when the folded Zobrist
+// history IS supplied (as the live session now does), the engine detects
+// repetition. This replaces the GS-2 pin TestRepetitionIsNotDetectedYet — the
+// pin did its job (it forced GS-3 to wire the history); this is the positive
+// proof that the wiring works end to end through CgoOracle.
 //
-// This test exists to FAIL LOUDLY the day someone wires the folded Zobrist
-// history (the live-session chunk): once prior_keys is threaded, this move
-// could legitimately return a repetition terminal, and whoever does the wiring
-// MUST revisit this test (and Q-GS5) rather than leave repetition silently
-// broken. Do not delete it without wiring the history — that is the whole point
-// of the pin. See engine.go Legality's prior_keys comment.
-func TestRepetitionIsNotDetectedYet(t *testing.T) {
+// Setup: a quiet knight shuffle (Nf3 Nf6 Ng1 Ng8 ...) returns to the start
+// position repeatedly. We simulate what the live session does — accumulate each
+// resulting Zobrist key and pass the prior history on the next call — and assert
+// that once the start position has occurred enough times, the engine reports a
+// repetition draw.
+func TestRepetitionDetectedWithHistory(t *testing.T) {
 	o := newOracle(t)
-	// A quiet reversible move (knight out) from the start position. Even if this
-	// exact position had occurred many times before in a real game, the move
-	// path here has no history, so the engine can only ever report Ongoing — it
-	// cannot see a repetition. We assert the terminal is nil, documenting that
-	// the repetition branch of terminalOf is unreachable on this path today.
-	v, err := o.Legality(context.Background(), startFEN, "g1f3")
-	if err != nil {
-		t.Fatalf("Legality: %v", err)
+	ctx := context.Background()
+
+	// Empty history first: a single move reaches no repetition (control).
+	v0, err := o.Legality(ctx, startFEN, "g1f3", nil)
+	if err != nil || !v0.Legal {
+		t.Fatalf("control move: %+v err=%v", v0, err)
 	}
-	if !v.Legal {
-		t.Fatal("Nf3 reported illegal")
+	if v0.Terminal != nil {
+		t.Fatalf("no-history move reported terminal %v, want nil", *v0.Terminal)
 	}
-	if v.Terminal != nil {
-		t.Fatalf("move path returned terminal %v with no history — repetition "+
-			"wiring (Q-GS5) may have landed; update this pin and terminalOf's "+
-			"repetition handling accordingly", *v.Terminal)
+	if v0.NewZobrist == 0 {
+		t.Fatal("verdict carried no Zobrist key (Q-GS5 plumbing missing)")
+	}
+
+	// Now shuffle knights back to the start position, threading the history the
+	// way the session will. The move cycle Nf3 Nf6 Ng1 Ng8 returns to startpos.
+	cycle := []struct{ fen, uci string }{
+		{"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "g1f3"},
+		{"rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1", "g8f6"},
+		{"rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 2 2", "f3g1"},
+		{"rnbqkb1r/pppppppp/5n2/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 3 2", "f6g8"},
+	}
+	var history []uint64
+	var sawRepetition bool
+	fen := startFEN
+	// Walk the cycle up to the fivefold-automatic threshold. The startpos recurs
+	// once per full cycle; we need it to have occurred 5 times total.
+	for round := 0; round < 6 && !sawRepetition; round++ {
+		for _, step := range cycle {
+			v, err := o.Legality(ctx, step.fen, step.uci, history)
+			if err != nil {
+				t.Fatalf("round %d move %q: %v", round, step.uci, err)
+			}
+			if !v.Legal {
+				t.Fatalf("round %d move %q reported illegal from %q", round, step.uci, step.fen)
+			}
+			history = append(history, v.NewZobrist)
+			fen = v.NewFEN
+			if v.Terminal != nil && *v.Terminal == game.TermRepetition {
+				sawRepetition = true
+				break
+			}
+		}
+	}
+	_ = fen
+	if !sawRepetition {
+		t.Fatal("repetition was never detected despite the position recurring " +
+			"to the fivefold threshold with history threaded — Q-GS5 wiring is broken")
 	}
 }
