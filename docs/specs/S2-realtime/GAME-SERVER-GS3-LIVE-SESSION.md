@@ -74,7 +74,8 @@ attaches a connection to; here it is exercised directly (no network).
 | §3.6 move pipeline needs a `CurFEN` supplier + outcome applier | §3.1/§3.2 — the session owns `CurFEN`, calls `Pipeline.SubmitMove`, applies the result. |
 | **Q-GS5** repetition on the live path | §3.2 — the session accumulates the Zobrist history and threads it into the oracle; flips the GS-2 pin test. |
 | §3.5 reconnection resync, node-independent, no game loss (NFR-2) | §3.3 — `StateSnapshot` folds the durable stream; any node can rebuild. |
-| §3.3 clock + flag-on-timeout incl. disconnect | §3.4 — session-owned clock source + `Apply`; flag → `GameEnded`. |
+| §3.3 clock + flag-on-timeout incl. disconnect | §3.4 — pipeline charges per-move; the session's `TickFlagCheck` handles idle timeout; flag → `GameEnded`. |
+| **F-01.4** takeback (unrated) | §3.2 (Takeback) — drives GS-1 `RefoldTakeback` to roll the projection + `priorKeys` + clocks back to ply-n; rated rejects. |
 | NFR-7 persist-before-ack | unchanged — the pipeline the session drives already enforces it; the session acks only on the pipeline's accepted outcome. |
 | §6.3 goroutine-per-game ownership | §3.5 — single-writer discipline, `-race` proven. |
 | NFR-5 no chess logic in Go | the session threads opaque FEN/UCI/zobrist; all legality/terminal/material via `CgoOracle`. |
@@ -107,26 +108,41 @@ is the one O(ply) rebuild (resume cost, §3.5) — NOT the per-move path.
 
 ### 3.2 Move handling (drives GS-1 §3.6, closes Q-GS5)
 
-`SubmitMove(ctx, seat, plyExpected, uci) -> Outcome`:
-1. charge the mover's elapsed time (`now() - lastMoveAt`) via `clock.Apply`; a
-   flag here → the flag path (§3.4), no move.
-2. call `game.Pipeline.SubmitMove` with the session's **owned `curFEN`** and the
-   charged clock — the pipeline authorizes, validates via the engine, and
-   persists (NFR-7) exactly as GS-1 does.
-3. on an accepted outcome: advance `curFEN = outcome.NewFEN`, append the move's
-   resulting Zobrist key to `priorKeys`, update clocks/ply/turn, set
-   `lastMoveAt = now()`. **The accumulated `priorKeys` is what the next move's
-   legality call passes to the engine so `status_with_history` can see
-   repetitions** — closing Q-GS5.
+`SubmitMove(ctx, MoveIntent) -> MoveOutcome` — the session builds the GS-1
+`game.MoveIntent` and calls `game.Pipeline.SubmitMove`; it does **not**
+re-implement any pipeline step. Clock charging and flag detection already live
+INSIDE the pipeline (`st.Clock.Apply` + `MoveOutcome.Flagged` via
+`clock.ErrFlagged`, GS-1 `pipeline.go`), so the session must NOT charge the clock
+a second time — that would double-deduct and flag early. The session's job is to
+supply the inputs the pipeline needs and apply the outcome:
+1. compute `elapsedMs = now() - lastMoveAt` (the session owns the only wall
+   clock) and build `MoveIntent{GameID, SeatIdx: seat, PlyExpected, UCI,
+   CurFEN: <owned>, ElapsedMs: elapsedMs, PriorKeys: <owned history>}`. The
+   session passes elapsed time as DATA; the pipeline is the single place it is
+   applied to the clock.
+2. call `game.Pipeline.SubmitMove(ctx, intent)`. The pipeline authorizes,
+   charges the clock once, validates via the engine (now with `PriorKeys` so
+   repetition is seen), and persists (NFR-7) — exactly GS-1, unchanged.
+3. branch on the returned `MoveOutcome`:
+   - `Accepted`: advance `curFEN = outcome.NewFEN`, append `outcome.NewZobrist`
+     to `priorKeys`, set `clocks` from the outcome's `ClockAfterMs`/ply/turn, set
+     `lastMoveAt = now()`.
+   - `Flagged`: drive the flag path (§3.4) — the pipeline already detected it;
+     the session appends `ClockFlagged`→`GameEnded`.
+   - `Rejected`: no projection change; return the reject for the transport.
 4. return the outcome for the transport to encode/emit.
+
+The accumulated `priorKeys` carried on each `MoveIntent` is what lets the
+engine's `status_with_history` see repetitions — closing Q-GS5.
 
 > **Q-GS5 wiring detail.** GS-2's `CgoOracle.Legality` currently passes empty
 > `prior_keys` and its `LegalityVerdict` carries no Zobrist key. GS-3 needs both
-> ends: (a) the verdict must surface the resulting key, and (b) the oracle call
-> must accept the prior history. This is a small, additive extension of the GS-1
-> `LegalityOracle`/`LegalityVerdict` contract (a `priorKeys []uint64` input and a
-> `NewZobrist uint64` output) — see Q-GS3B for the exact shape and why it is done
-> here, not in GS-2.
+> ends: (a) the verdict must surface the resulting key (`NewZobrist`, additive),
+> and (b) the oracle call must accept the prior history (`priorKeys` param, a
+> breaking signature change). This is a **coordinated** change across the GS-1
+> `LegalityOracle`/`LegalityVerdict`, both implementers, both callers, and
+> `MoveIntent` — see Q-GS3B for the exact edit list and why it is done here, not
+> in GS-2. The engine-cgo C-ABI needs NO change (it already has both ends).
 
 ### 3.3 Reconnection resync (§3.5)
 
@@ -140,11 +156,19 @@ chunk.
 ### 3.4 Clocks, disconnect, flag-on-timeout (§3.3/§3.5)
 
 The session owns the only wall-clock source (injected `now`), so clock behavior
-is deterministic under test. Elapsed time is charged on each move and on an
-explicit `TickFlagCheck(ctx)` the transport/scheduler calls (e.g. on a timer):
-if the side to move's remaining time has reached 0, the session produces
-`ClockFlagged` → `GameEnded`, with FLAG vs TIMEOUT_VS_INSUFFICIENT decided by
-`game.FlagTermination` (GS-1) over `CgoOracle.HasSufficientMaterial` (GS-2). The
+is deterministic under test. There are two distinct charge paths, and only one
+of them touches the clock per move:
+- **On a move:** elapsed time is applied INSIDE the pipeline (§3.2 — the session
+  only measures `elapsedMs` and hands it over as `MoveIntent.ElapsedMs`; it does
+  not call `clock.Apply` itself).
+- **On an idle timeout (no move):** `TickFlagCheck(ctx)`, which the
+  transport/scheduler calls on a timer (Q-GS3C), measures `now() - lastMoveAt`
+  against the side-to-move's remaining time; if it has reached 0 the session
+  produces `ClockFlagged` → `GameEnded`. This is the only place the SESSION
+  evaluates the clock, and it fires no move — so there is no double-charge with
+  the pipeline's per-move `Apply`.
+FLAG vs TIMEOUT_VS_INSUFFICIENT is decided by `game.FlagTermination` (GS-1) over
+`CgoOracle.HasSufficientMaterial` (GS-2). The
 clock keeps running while a seat is disconnected — disconnection is a transport
 state the session does not even see; only the clock matters (§3.5).
 
@@ -158,14 +182,18 @@ mutable state; a `Session` is an explicit value/handle, not a global registry
 ## 4. Interfaces & contracts
 
 GS-3 adds the `session` package API (`NewSession`, `SubmitMove`,
-`StateSnapshot`, `TickFlagCheck`, `Takeback`) and makes **one small additive
-extension** to the GS-1 `game.LegalityOracle` / `LegalityVerdict` for Q-GS5
-(prior-keys in, resulting-zobrist out — Q-GS3B). It changes no wire bytes and no
-engine behavior; the engine-cgo C-ABI already returns `out_zobrist` and accepts
-`prior_keys`, so this is a Go-side plumbing change only (the C seam is unchanged
-and `CgoOracle` simply stops hardcoding `nil, 0`). Changing the GS-1 interface
-is reviewed by S2; it is backward-additive (the pipeline passes the session's
-keys through).
+`StateSnapshot`, `TickFlagCheck`, `Takeback`) and makes **one coordinated change**
+to the GS-1 move contract for Q-GS5: a `NewZobrist uint64` field on
+`LegalityVerdict` (additive — no caller breaks) PLUS a `priorKeys []uint64`
+parameter on the `LegalityOracle.Legality` method (a **breaking** signature
+change — see Q-GS3B for the exact lockstep edit of both implementers, both
+callers, their tests, and the new `MoveIntent.PriorKeys` field). It changes no
+wire bytes and no engine behavior; the engine-cgo C-ABI already accepts
+`prior_keys` and returns `out_zobrist`, so this is a Go-side plumbing change only
+(the C seam is unchanged and `CgoOracle` simply stops hardcoding `nil, 0`).
+Changing the GS-1 interface is reviewed by S2; the implementing PR MUST enumerate
+every call site (Q-GS3B) so it is scoped as an interface change, not a struct
+tweak.
 
 ## 5. Edge cases & failure modes
 
@@ -227,8 +255,11 @@ keys through).
       projection, and threads the accumulated `priorKeys` into the oracle —
       **Q-GS5 closed**; the GS-2 pin test is retired/replaced by the positive
       repetition-auto-draw test.
-- [ ] The additive `LegalityOracle`/`LegalityVerdict` extension (prior-keys in,
-      resulting-zobrist out) landed with `CgoOracle` no longer hardcoding `nil,0`.
+- [ ] The coordinated `LegalityOracle`/`LegalityVerdict`/`MoveIntent` change
+      (prior-keys param in, `NewZobrist` field out) landed in ONE commit touching
+      every call site named in Q-GS3B — `CgoOracle` (no longer hardcoding
+      `nil,0`), the GS-1 test double, `Pipeline.SubmitMove`, `FoldWithEngine`,
+      and their tests — scoped as an interface change, not a struct tweak.
 - [ ] `StateSnapshot` == a fresh fold of the stream (resync correctness).
 - [ ] Clock-aware flag-on-timeout incl. the material split; deterministic under a
       fake clock source.
@@ -248,15 +279,29 @@ keys through).
   than a discipline reviewers must re-check. The mutex form is simpler for GS-3's
   no-network tests but pushes the ownership question to the transport chunk.
   Flag if you want the mutex form for now and the actor loop at the transport.
-- **Q-GS3B — where the repetition plumbing lands — PROPOSED (here, additive).**
-  Closing Q-GS5 needs the `LegalityOracle` to accept `priorKeys` and the
-  `LegalityVerdict` to carry the resulting Zobrist key. Options: **(a)** extend
-  the GS-1 interface additively now, in GS-3 (proposed — GS-3 is the first
-  component that actually has a history to pass, and the engine-cgo C-ABI already
-  has both ends, so it is pure Go plumbing); **(b)** a parallel oracle method
-  `LegalityWithHistory` leaving the GS-1 signature untouched (more surface, two
-  code paths). **Proposed: (a).** The change is backward-additive and keeps one
-  legality path.
+- **Q-GS3B — where the repetition plumbing lands — PROPOSED (a: one coordinated
+  interface change here).** Closing Q-GS5 needs the `LegalityOracle` to accept
+  the prior Zobrist history and the `LegalityVerdict` to carry the resulting
+  key. **Honest scoping — this is NOT fully "additive":** the `LegalityVerdict`
+  struct gains a `NewZobrist uint64` field (that part IS additive, no caller
+  breaks), but adding `priorKeys []uint64` to the `Legality` METHOD signature is
+  a **breaking interface change in Go** — it forces a single coordinated edit, in
+  one commit, of EVERY implementer and caller:
+  - implementers: `engine.CgoOracle.Legality` (stop hardcoding `nil, 0`, pass the
+    keys through) and the GS-1 test double in `internal/game`;
+  - callers: `Pipeline.SubmitMove`'s step-3 call (`pipeline.go:184`) and
+    `FoldWithEngine`'s replay call (`fold_engine.go:39`), plus their tests;
+  - the pipeline must obtain the keys to pass: `MoveIntent` gains a
+    `PriorKeys []uint64` field the session populates (and `FoldWithEngine`
+    accumulates keys as it replays, so its own replay calls stay correct).
+  Options: **(a)** make that one coordinated change now, in GS-3 (proposed —
+  GS-3 is the first component with a real history to pass; the engine-cgo C-ABI
+  already accepts `prior_keys` and returns `out_zobrist`, so no Rust/C change);
+  **(b)** add a parallel `LegalityWithHistory` method, leaving the GS-1 signature
+  untouched (no lockstep edit, but two legality code paths and a bool-y "which
+  one do I call"). **Proposed: (a)** — one legality path is worth the single
+  coordinated edit, and the §9 DoD + the implementing PR must list every call
+  site above so the change is scoped as an interface change, not a struct tweak.
 - **Q-GS3C — the flag-check trigger.** GS-3 exposes `TickFlagCheck` for a
   caller (transport/scheduler) to drive on a timer; GS-3 does NOT own a real
   timer goroutine (that is transport/scheduling, and a per-game ticker is a §6.3
