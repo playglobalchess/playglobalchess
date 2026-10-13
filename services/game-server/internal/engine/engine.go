@@ -70,15 +70,28 @@ func (CgoOracle) Legality(ctx context.Context, fen, uci string) (game.LegalityVe
 	var status, claim C.int32_t
 	var zobrist C.uint64_t
 
-	// prior_keys is empty here: the engine's status_with_history takes the folded
-	// Zobrist history for repetition, which the live-session threads in a later
-	// chunk. For single-move legality + the position-derived terminals
-	// (mate/stalemate/insufficient/fifty-move) it is not needed; repetition
-	// detection wires the history through when the live session exists.
+	// prior_keys is EMPTY on this path — see Q-GS5 (SPEC-S2-GAME-SERVER §10).
+	// The engine's status_with_history takes the folded Zobrist history to
+	// detect threefold/fivefold REPETITION; that history is owned by the live
+	// in-memory game session (a later chunk), not reconstructable here. So this
+	// path detects every position-derived terminal (mate / stalemate /
+	// insufficient / 75-move-automatic) but NOT repetition. pgc_engine_apply
+	// computes each resulting position's Zobrist key (out_zobrist) — the Q-GS5
+	// chunk will surface it on the verdict so the live session can accumulate
+	// the history and pass it back in here (GS-1's LegalityVerdict has no
+	// zobrist field yet; adding it is part of that chunk, not GS-2).
+	//
+	// GUARD AGAINST SILENT FORGETTING: this is pinned by
+	// TestRepetitionIsNotDetectedYet (engine_test.go) — a test that ASSERTS a
+	// repeated position is currently NOT auto-drawn on this path. When the
+	// live-session chunk threads the history, that test will start failing,
+	// forcing whoever does the wiring to confront Q-GS5 here rather than leave
+	// repetition silently broken. Do not delete that test without wiring the
+	// history.
 	rc := C.pgc_engine_apply(
 		fenPtr, fenLen,
 		uciPtr, uciLen,
-		nil, 0,
+		nil, 0, // prior_keys: see Q-GS5 above
 		&out, &outLen,
 		&status, &claim,
 		&zobrist,

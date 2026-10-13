@@ -74,8 +74,8 @@ func TestTerminalDetection(t *testing.T) {
 		},
 		{
 			name: "stalemate",
-			// Black king h8, white Qg6, white Kf7-ish: move Qg6 to g7? Use a known
-			// one-move-to-stalemate position: white to move, Qf7-g6 stalemates.
+			// Kf6 + Qf7 vs lone Kh8, White to move. f7g6 (Qg6) leaves Black's
+			// king on h8 with no legal move and not in check — stalemate.
 			fen:      "7k/5Q2/5K2/8/8/8/8/8 w - - 0 1",
 			uci:      "f7g6",
 			want:     game.TermStalemate,
@@ -167,4 +167,36 @@ func TestContextCancel(t *testing.T) {
 // the GS-1 interface the pipeline depends on.
 func TestImplementsOracle(t *testing.T) {
 	var _ game.LegalityOracle = newOracle(t)
+}
+
+// TestRepetitionIsNotDetectedYet PINS the Q-GS5 deferral (SPEC-S2-GAME-SERVER
+// §10): the move path calls the engine with empty prior_keys, so repetition is
+// NOT detectable here — a move that merely reaches a position cannot return
+// DrawRepetition, because the oracle has no history to count against.
+//
+// This test exists to FAIL LOUDLY the day someone wires the folded Zobrist
+// history (the live-session chunk): once prior_keys is threaded, this move
+// could legitimately return a repetition terminal, and whoever does the wiring
+// MUST revisit this test (and Q-GS5) rather than leave repetition silently
+// broken. Do not delete it without wiring the history — that is the whole point
+// of the pin. See engine.go Legality's prior_keys comment.
+func TestRepetitionIsNotDetectedYet(t *testing.T) {
+	o := newOracle(t)
+	// A quiet reversible move (knight out) from the start position. Even if this
+	// exact position had occurred many times before in a real game, the move
+	// path here has no history, so the engine can only ever report Ongoing — it
+	// cannot see a repetition. We assert the terminal is nil, documenting that
+	// the repetition branch of terminalOf is unreachable on this path today.
+	v, err := o.Legality(context.Background(), startFEN, "g1f3")
+	if err != nil {
+		t.Fatalf("Legality: %v", err)
+	}
+	if !v.Legal {
+		t.Fatal("Nf3 reported illegal")
+	}
+	if v.Terminal != nil {
+		t.Fatalf("move path returned terminal %v with no history — repetition "+
+			"wiring (Q-GS5) may have landed; update this pin and terminalOf's "+
+			"repetition handling accordingly", *v.Terminal)
+	}
 }
