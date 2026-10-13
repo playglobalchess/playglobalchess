@@ -117,14 +117,33 @@ nested ownership.
 #define PGC_ENG_ERR_NULL_ARG      98
 #define PGC_ENG_ERR_PANIC         99   /* a panic caught at the boundary (never UB) */
 
-/* Apply one UCI move to a FEN. On PGC_ENG_OK:
- *   *out_fen / *out_fen_len  = the position AFTER the move (copy, then free),
- *   *out_status              = a small enum: 0 ongoing, 1 checkmate, 2 stalemate,
- *                              3 insufficient, 4 fifty-move, 5 repetition, ...
- *   *out_claim               = 0 none / 1 claimable / 2 automatic (for the draw rows).
- * PGC_ENG_ERR_ILLEGAL ⇒ no out buffer written; the pipeline emits MOVE_REJECTED{ILLEGAL}.
+/* Apply one UCI move to a FEN.
+ *
+ * Out-parameter write-conditions (make the hand-written seam unambiguous — a
+ * reader of this header alone must know exactly when each out-pointer is
+ * written, so no caller does an uninitialized read and the seam never writes on
+ * error):
+ *   On PGC_ENG_OK (and ONLY then) all five out-params are written:
+ *     *out_fen / *out_fen_len = the position AFTER the move (copy, then free);
+ *     *out_status = a small enum: 0 ongoing, 1 checkmate, 2 stalemate,
+ *                   3 insufficient, 4 fifty-move, 5 repetition, ...;
+ *     *out_claim  = 0 none / 1 claimable / 2 automatic (for the draw rows);
+ *     *out_zobrist = the Zobrist key of the resulting position, so the server
+ *                    appends it to its folded history WITHOUT re-hashing in Go
+ *                    (NFR-5: Go computes no chess state). It is the key of the
+ *                    position in *out_fen.
+ *   On ANY non-OK return (PGC_ENG_ERR_FEN / _MOVE / _ILLEGAL / _NULL_ARG /
+ *   _PANIC) NONE of the five out-params is written — not *out_zobrist, not the
+ *   scalars, not the buffer. The caller must treat them as untouched and read
+ *   none of them. In particular PGC_ENG_ERR_ILLEGAL writes nothing and the
+ *   pipeline emits MOVE_REJECTED{ILLEGAL}.
+ * The implementation writes the out-params only on the success path, after all
+ * fallible work has succeeded, so a mid-computation error cannot leave a
+ * partially-written set.
+ *
  * prior_keys (ptr,len) is the Zobrist history the server folded, EXCLUDING the
- * resulting position (status_with_history's convention). */
+ * resulting position (status_with_history's convention). prior_keys may be NULL
+ * iff prior_keys_len == 0. */
 int32_t pgc_engine_apply(const uint8_t *fen, size_t fen_len,
                          const uint8_t *uci, size_t uci_len,
                          const uint64_t *prior_keys, size_t prior_keys_len,
@@ -144,11 +163,24 @@ void pgc_engine_free(uint8_t *ptr, size_t len);
 uint32_t pgc_engine_abi_version(void);
 ```
 
+- **`out_status` is a closed enum (frozen on this ABI), not an open `...`:** it
+  maps 1:1 from the engine's `GameStatus` (status.rs). Full set — `0` ongoing,
+  `1` checkmate, `2` stalemate, `3` insufficient-material, `4` fifty/seventyfive-
+  move, `5` repetition. The claim class (`out_claim`: `0` none / `1` claimable /
+  `2` automatic) disambiguates the two-tier draw rows (`4` and `5`) exactly as
+  `DrawClaim` does. A value outside this set is a seam bug, not a wire-extensible
+  field — Go validates it (a closed domain on a trusted internal ABI, consistent
+  with the codec's frozen-enum validation discipline). The engine *reports* these;
+  Go maps `(status, claim)` to the §4A.5 `Termination` and owns the claim policy
+  (Q-GS2E-2) — the C seam performs no governance.
 - **Buffer ownership (one rule):** Rust allocates `*out_fen`; Go copies into Go
   memory and calls `pgc_engine_free(out_fen, out_fen_len)` exactly once; Go never
   frees a Rust pointer any other way and never hands Rust a Go pointer Rust
-  retains (the cgo pointer rule). `out_zobrist` returns the resulting position's
-  key so the server appends it to its folded history without re-hashing in Go.
+  retains (the cgo pointer rule). `*out_fen` is allocated ONLY on `PGC_ENG_OK`
+  (see the per-param write-conditions above), so Go calls `pgc_engine_free` only
+  after an OK return and never on an error path. The scalar out-params
+  (`out_status`, `out_claim`, `out_zobrist`) are plain stack values the caller
+  owns; they are written only on OK and never need freeing.
 - **Build wiring:** `services/game-server`'s Makefile builds the staticlib
   (`cargo build -p pgc-engine-cgo --release`, dropping `.a` + header into a known
   gitignored path) and cgo-links it, mirroring the codec step already in the
@@ -165,7 +197,7 @@ uint32_t pgc_engine_abi_version(void);
 | Invalid/garbage FEN into the seam | `PGC_ENG_ERR_FEN`; Go surfaces `ERROR{INTERNAL}` (a stored FEN should never be invalid — this is a corrupt-state guard, like `FoldWithEngine`'s corrupt-stream refusal). |
 | Unparseable UCI | `PGC_ENG_ERR_MOVE` → the pipeline treats as `MOVE_REJECTED{ILLEGAL}` (a malformed move is not legal). |
 | Legal-form but illegal move | `PGC_ENG_ERR_ILLEGAL`, no out buffer → `MOVE_REJECTED{ILLEGAL}`, no event (§3.6 step 3). |
-| Rust panic anywhere in a boundary fn | `catch_unwind` → `PGC_ENG_ERR_PANIC`; **never** unwinds across cgo (UB). Fuzzed in §8. |
+| Rust panic anywhere in a boundary fn | `catch_unwind` → `PGC_ENG_ERR_PANIC`; **never** unwinds across cgo (UB). Before collapsing to the opaque code, the seam MUST log the caught panic payload Rust-side (message + the boundary fn name; the panic location via a panic hook) to the engine's stderr/log, so the bug signal is not thrown away with the return value — the ABI carries only `int32_t`, so the diagnostic lives in the Rust-side log, not the return channel. The Go caller, on receiving `PGC_ENG_ERR_PANIC`, logs its own input context (game_id, ply, uci, and a FEN hash — never a token) and surfaces `ERROR{INTERNAL}`; the pair (Rust panic log + Go input log, correlated by time/game_id) is what lets an on-call reproduce it. Fuzzed in §8 (never UB), and §8 adds a test asserting a deliberately-panicking boundary fn both returns 99 AND emits the Rust-side log line. |
 | Null / !0-length-null argument | `PGC_ENG_ERR_NULL_ARG`; Go never dereferences a non-OK out-buffer (§5 cgo row of SPEC-S2-GAME-SERVER). |
 | Oversize / truncated buffer | typed error, never a crash — the §8 fuzz sweep asserts this across ~100k malformed calls. |
 | Determinism | same (fen, uci, prior_keys) ⇒ identical answer every call (engine is pure + deterministic, G-A); the Go conformance test asserts it. |
@@ -199,6 +231,14 @@ uint32_t pgc_engine_abi_version(void);
   through `pgc-engine` directly (a Rust test produces the expected vector).
 - **cgo safety (fuzz)** — ~100k malformed/random/oversize/null calls to every
   boundary fn: never a crash, always a typed status, never UB from a panic.
+- **panic diagnostics** — a boundary fn made to panic deliberately (a test-only
+  hook) must (a) return `PGC_ENG_ERR_PANIC` (99), (b) NOT unwind across the seam,
+  and (c) emit the Rust-side panic log line (message + boundary-fn name) — the
+  §5 panic row's requirement, asserted so the bug signal is provably not lost.
+- **out-param write-conditions** — a test asserts that on each error return
+  (`_FEN`/`_MOVE`/`_ILLEGAL`/`_NULL_ARG`/`_PANIC`) the five `pgc_engine_apply`
+  out-params are left untouched (pre-poisoned sentinels unchanged), proving the
+  seam never writes on error and the §4 write-conditions hold.
 - **cgo leak** — a counting-allocator or asan test asserting every successful
   `pgc_engine_apply` output is freed exactly once by `pgc_engine_free` (balances).
 - **ABI-version lock** — the Go side asserts `pgc_engine_abi_version()` equals the
@@ -224,6 +264,10 @@ uint32_t pgc_engine_abi_version(void);
 - [ ] Engine-conformance Go test green (CgoOracle == engine ground truth over the
       edge/game-end/golden corpus).
 - [ ] cgo fuzz (no crash / typed errors) + leak (balanced free) tests green.
+- [ ] Panic-diagnostics test green: a deliberate boundary panic returns `99`, does
+      not unwind, and emits the Rust-side panic log line (§5 / §8).
+- [ ] Out-param write-condition test green: every error return leaves all five
+      `pgc_engine_apply` out-params untouched (§4 / §8).
 - [ ] No chess logic in Go — reviewer greps `internal/engine` + `internal/game`.
 - [ ] `make test` green end-to-end (codec parity NOT regressed), `gofmt`/`vet` clean,
       golangci-lint clean if installed (else noted).
