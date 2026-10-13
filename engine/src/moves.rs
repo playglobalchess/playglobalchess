@@ -201,15 +201,15 @@ mod tests {
     #[test]
     fn uci_rejects_non_ascii_without_panic() {
         // Regression (found by the GS-2 engine-cgo fuzz sweep): a non-ASCII
-        // string whose BYTE length is 4 or 5 must NOT panic on the internal
-        // slices — it must be rejected as malformed. Byte lengths chosen to hit
-        // the old len()==4/5 guard: '·' (U+00B7) is 2 bytes, '€' is 3 bytes.
+        // string whose BYTE length is 4-6 must NOT panic on the internal slices
+        // — it must be rejected as malformed. '·' (U+00B7) is 2 bytes, '€' is 3,
+        // so these drive the old len()==4/5 guard and the slice boundaries,
+        // including a multi-byte char in the promotion slot (last case).
         assert_eq!(Move::from_uci("··"), None); // 2 chars, 4 bytes
         assert_eq!(Move::from_uci("a·b"), None); // 1+2+1 = 4 bytes
         assert_eq!(Move::from_uci("·a·"), None); // 2+1+2 = 5 bytes
         assert_eq!(Move::from_uci("€a"), None); // 3+1 = 4 bytes
         assert_eq!(Move::from_uci("e2e€"), None); // valid prefix, non-ASCII tail
-        // A multi-byte char as the "promotion" slot.
         assert_eq!(Move::from_uci("e2e4·"), None); // 4 ascii + 2-byte = 6 bytes
     }
 
