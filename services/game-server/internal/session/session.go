@@ -94,6 +94,17 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: fold: %w", err)
 	}
+	// Seed the idle baseline from the LAST move's server timestamp, not now():
+	// after a node-failover/reconnect rebuild (§3.5), the side to move may be
+	// deep in a think, and that already-elapsed idle time must not be forgotten.
+	// MovePlayed.ServerTS (§4A.8, epoch ms) is the move's wall-clock instant, so
+	// now()-lastMoveAt correctly includes pre-rebuild idle time. A game with no
+	// moves yet falls back to now() (the clock has not started ticking on a
+	// specific side's think).
+	lastMoveAt := now()
+	if ts, ok := lastMoveServerTS(events); ok {
+		lastMoveAt = time.UnixMilli(int64(ts))
+	}
 	s := &Session{
 		gameID:     cfg.GameID,
 		stream:     stream,
@@ -113,7 +124,7 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		rated:      st.Rated,
 		ended:      st.Phase == game.PhaseEnded,
 		terminal:   st.Termination, // meaningful when already ended at construction
-		lastMoveAt: now(),
+		lastMoveAt: lastMoveAt,
 	}
 	return s, nil
 }
@@ -161,4 +172,17 @@ func (s *Session) dispatch(ctx context.Context, c command, done <-chan struct{})
 	case <-done:
 		return nil
 	}
+}
+
+// lastMoveServerTS returns the ServerTS of the most recent MovePlayed in the
+// stream (and true), or (0,false) if no move has been played. Used to seed the
+// idle baseline so a reconnect/failover rebuild does not forget pre-rebuild
+// think time (§3.5).
+func lastMoveServerTS(events []game.Event) (uint64, bool) {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == game.EvMovePlayed && events[i].MovePlayed != nil {
+			return events[i].MovePlayed.ServerTS, true
+		}
+	}
+	return 0, false
 }

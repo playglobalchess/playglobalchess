@@ -409,3 +409,170 @@ func TestConcurrentCallsRaceSafe(t *testing.T) {
 		t.Errorf("ply = %d, want 1", snap.Ply)
 	}
 }
+
+// TestIdempotentReackDoesNotCorrupt covers the finding that a client resend
+// (lost ack) must NOT advance/corrupt the projection. The pipeline re-acks an
+// already-persisted ply with NewFEN="" / NewZobrist=0; the session must detect
+// that (ply does not advance) and leave curFEN / priorKeys / clocks / turn
+// untouched.
+func TestIdempotentReackDoesNotCorrupt(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+
+	fc.add(time.Second)
+	if o, _ := s.SubmitMove(ctx, 0, 1, "e2e4", 1); !o.Accepted {
+		t.Fatal("first move not accepted")
+	}
+	before, _ := s.StateSnapshot(ctx)
+
+	// Resend the SAME (ply 1) move — a routine client retry after a lost ack.
+	fc.add(time.Second)
+	reack, err := s.SubmitMove(ctx, 0, 1, "e2e4", 1)
+	if err != nil {
+		t.Fatalf("re-ack: %v", err)
+	}
+	if !reack.Accepted {
+		t.Fatalf("re-ack not accepted: %+v", reack)
+	}
+	after, _ := s.StateSnapshot(ctx)
+	if after.FEN != before.FEN {
+		t.Errorf("re-ack corrupted FEN: %q -> %q", before.FEN, after.FEN)
+	}
+	if after.Ply != before.Ply {
+		t.Errorf("re-ack advanced ply: %d -> %d", before.Ply, after.Ply)
+	}
+	if after.Turn != before.Turn {
+		t.Errorf("re-ack flipped turn: %d -> %d", before.Turn, after.Turn)
+	}
+	if after.RemainingMs[0] != before.RemainingMs[0] {
+		t.Errorf("re-ack changed clock: %d -> %d", before.RemainingMs[0], after.RemainingMs[0])
+	}
+	// A genuine next move still works (the session is not wedged).
+	fc.add(time.Second)
+	if o, _ := s.SubmitMove(ctx, 1, 2, "e7e5", 2); !o.Accepted || o.Ply != 2 {
+		t.Fatalf("real next move after re-ack failed: %+v", o)
+	}
+}
+
+// TestDoubleTakeback covers the finding that two takebacks over the same ply
+// region must re-fold from the correct prefix (one cut algorithm). A prior
+// takeback leaves undone MovePlayed events in the stream with recurring ply
+// numbers; the second takeback must still project the right position.
+func TestDoubleTakeback(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+
+	play := func(seat uint8, ply uint32, uci string) {
+		fc.add(time.Second)
+		if o, _ := s.SubmitMove(ctx, seat, ply, uci, uint64(ply)); !o.Accepted {
+			t.Fatalf("move %q (ply %d) not accepted: %+v", uci, ply, o)
+		}
+	}
+	// 1.e4 e5 2.Nf3
+	play(0, 1, "e2e4")
+	play(1, 2, "e7e5")
+	play(0, 3, "g1f3")
+	afterThree, _ := s.StateSnapshot(ctx)
+	if afterThree.Ply != 3 {
+		t.Fatalf("ply = %d, want 3", afterThree.Ply)
+	}
+
+	// First takeback: undo Nf3 (1 ply) -> back to ply 2, black... no, white to move? ply2 means black just moved, white to move. White re-plays a DIFFERENT move, re-using ply 3.
+	if err := s.Takeback(ctx, 0, 1); err != nil {
+		t.Fatalf("takeback 1: %v", err)
+	}
+	back1, _ := s.StateSnapshot(ctx)
+	if back1.Ply != 2 {
+		t.Fatalf("after takeback1 ply = %d, want 2", back1.Ply)
+	}
+	// White re-plays ply 3 with a different move (Nc3). This appends a new
+	// MovePlayed ply 3, so the stream now has TWO ply-3 moves (the undone Nf3 and
+	// the new Nc3) — the recurring-ply condition the finding is about.
+	play(0, 3, "b1c3")
+
+	// Second takeback over the same region: undo the new ply-3 move. The cut
+	// must target the FIRST ply-3... actually the re-fold must land on the
+	// correct current position. We assert it rolls back to ply 2 and the board
+	// matches a fresh fold of the retained stream (the real correctness check).
+	if err := s.Takeback(ctx, 0, 1); err != nil {
+		t.Fatalf("takeback 2: %v", err)
+	}
+	back2, _ := s.StateSnapshot(ctx)
+	if back2.Ply != 2 {
+		t.Fatalf("after takeback2 ply = %d, want 2", back2.Ply)
+	}
+	// The position after both takebacks must equal the position after 1.e4 e5
+	// (ply 2) — not corrupted by the stale undone moves. back1 was that position;
+	// back2 must match it exactly.
+	if back2.FEN != back1.FEN {
+		t.Errorf("double-takeback desync: back2 FEN %q != back1 %q", back2.FEN, back1.FEN)
+	}
+}
+
+// TestResyncPreservesIdleThink covers the finding that a reconstructed session
+// must not forget pre-rebuild idle time. We play a move at a known server time,
+// then build a FRESH session from the same stream at a much later wall time and
+// assert that an immediate TickFlagCheck sees the elapsed idle (and flags if the
+// side to move is out of time), rather than restarting the idle baseline from
+// the reconstruction instant.
+func TestResyncPreservesIdleThink(t *testing.T) {
+	ctx := context.Background()
+	// 2s base, no increment. Seed + play one move, stamping ServerTS from a clock.
+	store := game.NewMemStore()
+	sid := game.StreamIDFor(gameID)
+	for _, ev := range []game.Event{
+		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
+			PoolID: "x", Rated: false,
+			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
+			StartFEN: startFEN, TimeControl: "t-2+0",
+		}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
+		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
+	} {
+		store.Append(ctx, sid, ev)
+	}
+	o, _ := engine.New()
+	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 2_000, IncrementMs: 0}}
+
+	// Session A plays White's move at t=1000ms (ServerTS stamped from its clock).
+	fcA := &fakeClock{t: time.UnixMilli(0)}
+	sA, err := NewSession(ctx, Config{GameID: gameID, Store: store, Oracle: o, Opts: opts, Now: fcA.now})
+	if err != nil {
+		t.Fatalf("session A: %v", err)
+	}
+	rctxA, cancelA := context.WithCancel(ctx)
+	go sA.Run(rctxA)
+	fcA.add(1000 * time.Millisecond) // 1s think -> white has 1s left; it's black to move
+	if oA, _ := sA.SubmitMove(ctx, 0, 1, "e2e4", 0); !oA.Accepted {
+		t.Fatal("session A move not accepted")
+	}
+	cancelA()
+
+	// Node failover: a FRESH session B rebuilds from the stream at a much later
+	// wall time (the move was stamped ~t=1000ms; B boots at t=5000ms). Black (to
+	// move) has a 2s base and has now idled ~4s since the move.
+	fcB := &fakeClock{t: time.UnixMilli(5000)}
+	sB, err := NewSession(ctx, Config{GameID: gameID, Store: store, Oracle: o, Opts: opts, Now: fcB.now})
+	if err != nil {
+		t.Fatalf("session B: %v", err)
+	}
+	rctxB, cancelB := context.WithCancel(ctx)
+	defer cancelB()
+	go sB.Run(rctxB)
+
+	// An immediate tick on B must flag black: ~4s idle > black's 2s. If the idle
+	// baseline had reset to B's boot instant, no time would have elapsed and it
+	// would NOT flag — that is the bug this guards.
+	ended, err := sB.TickFlagCheck(ctx)
+	if err != nil {
+		t.Fatalf("tick B: %v", err)
+	}
+	if !ended {
+		t.Fatal("rebuilt session did not flag despite ~4s idle since the last move " +
+			"(idle baseline reset on rebuild?)")
+	}
+}

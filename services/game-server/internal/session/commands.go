@@ -58,7 +58,14 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		c.out = game.MoveOutcome{Rejected: true, Reason: game.RejectGameOver, PlyExpected: s.ply}
 		return
 	}
-	elapsedMs := s.now().Sub(s.lastMoveAt).Milliseconds()
+	// Server-authoritative timing: stamp BOTH the think-time measurement and the
+	// persisted MovePlayed.ServerTS from the session's own clock, captured once.
+	// This keeps them consistent so a later reconnect/failover rebuild recovers
+	// the exact same idle baseline from the stored ServerTS (finding: resync
+	// clock baseline). The caller-supplied serverTS is not trusted for timing
+	// (never trust a client clock, T-1/T-2).
+	moveAt := s.now()
+	elapsedMs := moveAt.Sub(s.lastMoveAt).Milliseconds()
 	if elapsedMs < 0 {
 		elapsedMs = 0
 	}
@@ -69,7 +76,7 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		UCI:         c.uci,
 		CurFEN:      s.curFEN,
 		ElapsedMs:   elapsedMs,
-		ServerTS:    c.serverTS,
+		ServerTS:    uint64(moveAt.UnixMilli()),
 		PriorKeys:   s.priorKeys,
 	}
 	out, err := s.pipe.SubmitMove(ctx, intent)
@@ -83,6 +90,19 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 
 	switch {
 	case out.Accepted:
+		// Distinguish a genuinely NEW move from the pipeline's idempotent re-ack
+		// of an already-persisted ply (§5 duplicate-MOVE: a client resend after a
+		// lost ack). A new move advances the ply by exactly one; a re-ack returns
+		// the EXISTING move's ply (<= our current ply) with an empty NewFEN /
+		// zero NewZobrist / nil Terminal. Advancing the projection on a re-ack
+		// would overwrite curFEN with "", append a bogus 0 key, and flip turn —
+		// corrupting the game. So we only advance on a new move; a re-ack is
+		// returned as-is for the transport to re-emit MOVE_ACCEPTED, with no
+		// projection change.
+		if out.Ply != s.ply+1 {
+			// Idempotent re-ack (or any non-advancing accept): do not touch state.
+			break
+		}
 		s.curFEN = out.NewFEN
 		s.priorKeys = append(s.priorKeys, out.NewZobrist)
 		s.ply = out.Ply
@@ -95,7 +115,7 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		// with the stream, so StateSnapshot and TickFlagCheck see the real
 		// remaining time (§3.5 resync + idle-flag correctness).
 		s.clocks = s.clocks.CloneWith(int(c.seat), int64(out.ClockAfterMs))
-		s.lastMoveAt = s.now()
+		s.lastMoveAt = moveAt
 		if out.Terminal != nil {
 			// Engine-detected terminal (mate / stalemate / insufficient /
 			// automatic draw). Append GameEnded; the game is over.
@@ -295,28 +315,20 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 	}
 	// Re-derive the rolled-back projection. A takeback is a re-fold of the
 	// retained move prefix (SPEC §3.2); because the stream is append-only the
-	// undone moves stay in it, so we fold only the prefix BEFORE the first undone
-	// move. FoldWithEngine gives the complete rolled-back projection in one pass
-	// — phase/ply/turn/clock AND CurFEN + the Zobrist history — so there is no
-	// separate pure-vs-engine state to reconcile. RefoldTakeback is consulted
-	// first only to enforce the preconditions (unrated, Live, enough plies) and
-	// surface a precise error.
+	// undone moves stay in it. RefoldTakebackWithEngine does the cut AND the
+	// engine projection in ONE place (the same cut the pure RefoldTakeback uses),
+	// so there is no second cut algorithm that could pick a different prefix —
+	// important because a prior takeback leaves undone MovePlayed events with
+	// recurring ply numbers in the stream. The trailing TakebackReq/Accepted we
+	// just appended are not MovePlayed, so they do not affect the cut.
 	events, err := s.store.Load(ctx, s.stream)
 	if err != nil {
 		c.err = fmt.Errorf("session: takeback reload: %w", err)
 		return
 	}
-	// The trailing TakebackReq/Accepted we just appended are governance markers,
-	// not board moves; the move history for the re-fold excludes them.
-	moveHistory := events[:len(events)-2]
-	if _, err := game.RefoldTakeback(moveHistory, s.opts, c.plies); err != nil {
-		c.err = fmt.Errorf("session: takeback refold: %w", err)
-		return
-	}
-	prefix := moveHistoryMinusPlies(moveHistory, c.plies)
-	eng, err := game.FoldWithEngine(ctx, prefix, s.opts, s.oracle)
+	eng, err := game.RefoldTakebackWithEngine(ctx, events, s.opts, c.plies, s.oracle)
 	if err != nil {
-		c.err = fmt.Errorf("session: takeback engine refold: %w", err)
+		c.err = fmt.Errorf("session: takeback refold: %w", err)
 		return
 	}
 	s.curFEN = eng.CurFEN
@@ -326,22 +338,6 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 	s.turn = eng.TurnIdx
 	s.phase = eng.Phase
 	s.lastMoveAt = s.now()
-}
-
-// moveHistoryMinusPlies returns the event prefix with the last `plies`
-// MovePlayed events (and everything after the earliest undone move) dropped —
-// the retained prefix a takeback re-folds, matching RefoldTakeback's cut point.
-func moveHistoryMinusPlies(events []game.Event, plies uint32) []game.Event {
-	seen := uint32(0)
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Type == game.EvMovePlayed && events[i].MovePlayed != nil {
-			seen++
-			if seen == plies {
-				return events[:i]
-			}
-		}
-	}
-	return events
 }
 
 // winnerFromMover builds the result vector for a move-produced terminal. A mate
