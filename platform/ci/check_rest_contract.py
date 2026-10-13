@@ -58,7 +58,12 @@ def read_openapi() -> tuple[set[str], set[str], bool]:
         if in_paths:
             if re.match(r"^\S", line):  # dedented to col 0 → left paths:
                 break
-            m = re.match(r"^  (/[^:]+):\s*$", line)
+            # A top-level path key: 2-space indented, starts with '/', then ':'.
+            # Tolerate anything after the colon (trailing '# comment' or an inline
+            # mapping) so a maintainer's annotation does not silently drop the
+            # path from the parsed set (which could let a two-sided deletion pass
+            # vacuously). The key itself has no ':' (REST paths never do).
+            m = re.match(r"^  (/[^:]*?):(?:\s|$)", line)
             if m:
                 paths.add("/v1" + m.group(1))
     # Problem.type enum values (full URIs under .../problems/<suffix>).
