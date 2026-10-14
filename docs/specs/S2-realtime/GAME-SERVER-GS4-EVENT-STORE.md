@@ -11,15 +11,16 @@
 | Depends on | SPEC-S2-GAME-SERVER (RATIFIED); GS-1 (the `game.EventStore` interface + `MemStore` stub, PR #34); GS-3 (the live session that consumes it, PR #42); ADR-10 (DECIDED: game truth = append-only event store) |
 | Gates it feeds | Contributes to NFR-2/NFR-7 being real (not stubbed); a hard prerequisite for the F-01 vertical slice. Does **not** make a lettered gate green by itself. |
 
-> **Implementation slice — but it carries one real ADR-level sub-decision.**
+> **Implementation slice — and it carried one real ADR-level decision, now made.**
 > ADR-10 DECIDED that game truth is an append-only event store, but it did NOT
 > pin the concrete *technology* (it names Postgres for relational and Redis for
-> ephemeral, but leaves the event store's product open). GS-4 must pick one.
-> That choice is surfaced as **Q-GS4A** below with a proposed reading; it rides
-> ADR-10's "event store" decision and needs architecture-group sign-off, but is
-> a sub-decision, not a new top-level ADR unless the owner wants it recorded as
-> one. Everything else here is implementing the already-ratified `game.EventStore`
-> contract. No wire bytes change.
+> ephemeral, but left the event store's product open). GS-4 had to pick one.
+> That choice (**Q-GS4A**) is now **DECIDED: DynamoDB (AWS)**, recorded as
+> **ADR-16** refining ADR-10 and scoped to the game-event store only — it does
+> NOT ratify AWS as the platform for anything else (accounts stay Postgres,
+> cache stays Redis, media stays S3-compatible; which cloud those run on is a
+> separate per-chunk decision). Everything else here implements the
+> already-ratified `game.EventStore` contract. No wire bytes change.
 
 ## 1. Purpose & scope
 
