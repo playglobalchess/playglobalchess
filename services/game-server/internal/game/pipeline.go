@@ -227,11 +227,60 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 			ServerTS:     in.ServerTS,
 		},
 	}
-	seq, err := p.Store.Append(ctx, streamID, ev)
-	if err != nil {
-		// Persist failed after validation: do NOT ack (§5). Surface the error so
-		// the transport emits ERROR{INTERNAL}; the move did not happen.
-		return MoveOutcome{}, fmt.Errorf("pipeline: persist: %w", err)
+	// The expected seq is the current event count — we already Loaded the full
+	// stream above (len(events)), so the hot path passes it with NO extra read
+	// (Q-GS4E). A concurrent (cross-node) writer that took this seq yields
+	// ErrSeqConflict; the store CANNOT tell a true duplicate from a valid move
+	// that lost the race, so recovery lives HERE (the caller that owns game
+	// truth): on conflict we reload, check whether OUR move already landed
+	// (idempotent — a resend/duplicate, re-ack it) or genuinely lost the seq to a
+	// DIFFERENT event (re-sequence at the new head and retry), so a valid move is
+	// never dropped (NFR-2, §3.2). Single-writer-per-game makes a conflict rare
+	// today; the contract is in place for when multi-node writers land.
+	seq := uint32(len(events))
+	const maxSeqRetries = 8
+	for attempt := 0; ; attempt++ {
+		err := p.Store.Append(ctx, streamID, seq, ev)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrSeqConflict) {
+			// A real persist failure after validation: do NOT ack (§5).
+			return MoveOutcome{}, fmt.Errorf("pipeline: persist: %w", err)
+		}
+		if attempt >= maxSeqRetries {
+			return MoveOutcome{}, fmt.Errorf("pipeline: persist: seq contention unresolved after %d retries: %w", maxSeqRetries, err)
+		}
+		// Seq conflict — reconcile against the current head.
+		events, err = p.Store.Load(ctx, streamID)
+		if err != nil {
+			return MoveOutcome{}, fmt.Errorf("pipeline: reload on conflict: %w", err)
+		}
+		if mv := findMove(events, ply); mv != nil {
+			// OUR move (this ply) is already persisted — the conflict was our own
+			// duplicate/resend. Idempotent re-ack: return the existing move, no
+			// second append (same shape as the ply-already-persisted path above).
+			return MoveOutcome{
+				Accepted:     true,
+				AppliedSeq:   uint32(len(events)),
+				Ply:          mv.Ply,
+				ClockAfterMs: mv.ClockAfterMs,
+			}, nil
+		}
+		// A DIFFERENT event took the seq. Re-fold to confirm it is still our turn
+		// at this ply (a genuinely conflicting move from the other seat would
+		// change the turn/ply and must be rejected, not forced in), then retry at
+		// the new head.
+		rst, ferr := Fold(events, p.Opts)
+		if ferr != nil {
+			return MoveOutcome{}, fmt.Errorf("pipeline: refold on conflict: %w", ferr)
+		}
+		if rst.Phase != PhaseLive || in.PlyExpected != rst.Ply+1 || in.SeatIdx != rst.TurnIdx {
+			// The stream advanced past us (another move landed first): this is no
+			// longer a valid move at this ply — a stale-ply reject, not a drop.
+			return reject(RejectStalePly, rst.Ply), nil
+		}
+		seq = uint32(len(events)) // re-sequence the valid loser at the new head
 	}
 
 	// (5) accepted — only now, after the durable commit.

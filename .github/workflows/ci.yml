@@ -218,11 +218,24 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.services == 'true' }}
     runs-on: ubuntu-latest
+    # DynamoDB Local backs the GS-4 event-store integration test (Q-GS4D): the
+    # store's conditional-put / TransactWriteItems semantics are proven against a
+    # real DynamoDB engine here, not just the in-process fake. The gated test
+    # (store_local_test.go) skips when DYNAMODB_LOCAL_ENDPOINT is unset, so this
+    # service only matters for the game-server store tests.
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    env:
+      DYNAMODB_LOCAL_ENDPOINT: http://localhost:8000
+      AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24"
       - name: Build + test changed services
         run: |
           # game-server (X-2, Go, ADR-12): the move/event hot path links the
@@ -230,8 +243,10 @@ jobs:
           # cross-compiles protocol/codec-cgo into a staticlib and runs the Go
           # golden-vector parity test THROUGH the actual .a + C header link —
           # the Go leg of NFR-10 and the staticlib/header-drift guard that the
-          # Rust-only `protocol` job cannot reach. Honest stub-guard: no-op until
-          # the Go module exists.
+          # Rust-only `protocol` job cannot reach. The GS-4 store integration
+          # test (store_local_test.go) additionally runs against the
+          # dynamodb-local service above via DYNAMODB_LOCAL_ENDPOINT. Honest
+          # stub-guard: no-op until the Go module exists.
           if [ -f services/game-server/go.mod ]; then
             rustup toolchain install stable --profile minimal
             rustup default stable

@@ -263,15 +263,15 @@ func (s *Session) flag(ctx context.Context, flaggedSeat uint8) error {
 	}
 	rv := flagResultVector(term, flaggedSeat, s.seatCount)
 
-	// (2) Append ClockFlagged, then (3) GameEnded. A failure between them is the
-	// recoverable half-terminal case (see finishTrailingFlag).
-	if _, err := s.store.Append(ctx, s.stream, game.Event{
-		Type: game.EvClockFlagged, SeatAction: &game.SeatAction{SeatIdx: flaggedSeat},
+	// (2) Append ClockFlagged + GameEnded ATOMICALLY (SPEC-GS4 §3.4): a single
+	// AppendBatch commits both or neither, so a crash cannot leave a
+	// half-terminal stream. appendBatchAtHead derives the seq from the head and
+	// retries on a cross-node conflict (NFR-2).
+	if err := s.appendBatchAtHead(ctx, []game.Event{
+		{Type: game.EvClockFlagged, SeatAction: &game.SeatAction{SeatIdx: flaggedSeat}},
+		{Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: term}},
 	}); err != nil {
-		return fmt.Errorf("session: append ClockFlagged: %w", err)
-	}
-	if err := s.appendGameEnded(ctx, term, rv); err != nil {
-		return err
+		return fmt.Errorf("session: append flag ending: %w", err)
 	}
 	s.endGame(term)
 	return nil
@@ -305,13 +305,52 @@ func (s *Session) endGame(term game.Termination) {
 }
 
 func (s *Session) appendGameEnded(ctx context.Context, term game.Termination, rv []game.Result) error {
-	if _, err := s.store.Append(ctx, s.stream, game.Event{
+	// GameEnded is an ending append (not the per-move hot path). appendBatchAtHead
+	// derives the seq from a fresh Load and retries on a cross-node conflict, so
+	// it stays correct regardless of recurring-ply quirks on the move path (e.g.
+	// after a takeback) that make a tracked counter fragile.
+	if err := s.appendBatchAtHead(ctx, []game.Event{{
 		Type:      game.EvGameEnded,
 		GameEnded: &game.GameEnded{ResultVector: rv, Termination: term},
-	}); err != nil {
+	}}); err != nil {
 		return fmt.Errorf("session: append GameEnded: %w", err)
 	}
 	return nil
+}
+
+// streamLen returns the current stream length (= the next free seq). Used by the
+// session's own batch/ending appends to set expectedSeq correctly; these are
+// off the per-move hot path (endings, takebacks), so the extra Load is fine.
+func (s *Session) streamLen(ctx context.Context) (uint32, error) {
+	events, err := s.store.Load(ctx, s.stream)
+	if err != nil {
+		return 0, fmt.Errorf("session: load for seq: %w", err)
+	}
+	return uint32(len(events)), nil
+}
+
+// appendBatchAtHead commits evs atomically at the current stream head, with a
+// bounded retry if a concurrent (cross-node) writer takes the seq first
+// (ErrSeqConflict). The session is single-writer per game, so a conflict is the
+// across-node case (§3.2/Q-GS4E); re-deriving the head and retrying re-sequences
+// our events rather than dropping them (NFR-2). Used by the ending/takeback
+// paths (not the per-move hot path).
+func (s *Session) appendBatchAtHead(ctx context.Context, evs []game.Event) error {
+	const maxRetries = 8
+	for attempt := 0; ; attempt++ {
+		seq, err := s.streamLen(ctx)
+		if err != nil {
+			return err
+		}
+		err = s.store.AppendBatch(ctx, s.stream, seq, evs)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, game.ErrSeqConflict) || attempt >= maxRetries {
+			return err
+		}
+		// lost the seq to a concurrent writer — reload head and retry.
+	}
 }
 
 // --- Takeback (F-01.4, unrated) ---------------------------------------------
@@ -348,16 +387,15 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 		return
 	}
 	// Append the takeback request + acceptance (append-only; the OTHER seat
-	// accepts — the fold enforces that a seat cannot accept its own request).
+	// accepts — the fold enforces that a seat cannot accept its own request). One
+	// atomic batch at the head, with cross-node conflict retry.
 	other := uint8((int(c.by) + 1) % s.seatCount)
-	for _, ev := range []game.Event{
+	if err := s.appendBatchAtHead(ctx, []game.Event{
 		{Type: game.EvTakebackReq, SeatAction: &game.SeatAction{SeatIdx: c.by}},
 		{Type: game.EvTakebackAccepted, SeatAction: &game.SeatAction{SeatIdx: other}},
-	} {
-		if _, err := s.store.Append(ctx, s.stream, ev); err != nil {
-			c.err = fmt.Errorf("session: append takeback: %w", err)
-			return
-		}
+	}); err != nil {
+		c.err = fmt.Errorf("session: append takeback: %w", err)
+		return
 	}
 	// Re-derive the rolled-back projection. A takeback is a re-fold of the
 	// retained move prefix (SPEC §3.2); because the stream is append-only the
