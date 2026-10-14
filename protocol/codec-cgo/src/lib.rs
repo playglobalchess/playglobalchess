@@ -412,10 +412,12 @@ mod tests {
 
     /// ABI fuzz sweep (ADR-15 convention): fire ~100k malformed / random /
     /// oversize inputs at BOTH new seam fns. Asserts: no crash (a panic would
-    /// abort the test binary), every PGC_OK buffer is freed exactly once (the
-    /// `reencode` helper frees on the OK path; a leak would show under a leak
-    /// checker / repeated-run RSS, and double-free would abort), and every
-    /// non-OK result is a TYPED non-zero code — never a silent 0 with no buffer.
+    /// abort the test binary), and every non-OK result is a TYPED non-zero code
+    /// — never a silent 0 with no buffer. Every PGC_OK buffer goes through the
+    /// `reencode` helper's copy-then-`pgc_free` path, so a DOUBLE free would
+    /// abort here; a single-free LEAK, however, is NOT proven by this test alone
+    /// — that needs the sweep run under a leak checker (ASan/valgrind) in CI,
+    /// which this unit test does not itself enforce.
     #[test]
     fn event_seam_abi_fuzz_sweep() {
         // A cheap deterministic LCG so the sweep is reproducible without a dep.

@@ -123,6 +123,10 @@ func unmarshalIntermediate(b []byte) (EventHeader, game.Event, error) {
 	if ts, err = r.uvarint(); err != nil {
 		return h, game.Event{}, err
 	}
+	// Narrowing from uvarint's u64 is safe on the DECODE path: the only producer
+	// of this intermediate is Rust's encode_envelope_intermediate, whose
+	// EventEnvelope already types seq as u32 and schema_ver as u16, so an
+	// over-wide value cannot occur here (N2).
 	h.Seq = uint32(seq)
 	h.SchemaVer = uint16(schemaVer)
 	h.TS = ts

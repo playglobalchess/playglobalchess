@@ -296,6 +296,76 @@ fn in_domain_result_and_color_still_accepted() {
     }
 }
 
+// --- encode-side domain validation (GS-4a / S1) -----------------------------
+//
+// encode_event must reject the SAME out-of-domain closed-domain values that
+// decode_event rejects, so a durable store built on this seam can never persist
+// an event frame it cannot read back (NFR-9). Before this fix encode_event was
+// permissive while decode_event validated — a write/read asymmetry.
+
+#[test]
+fn out_of_domain_termination_rejected_on_encode() {
+    use pgc_protocol::{encode_event, EventEnvelope, GameEvent};
+    let env = EventEnvelope {
+        stream_id: "game/x".into(),
+        seq: 1,
+        schema_ver: 0,
+        ts: 0,
+        event: GameEvent::GameEnded {
+            result_vector: vec![2, 0],
+            termination: pgc_protocol::Termination(0x00), // 0x00 is reserved/unknown
+        },
+    };
+    assert!(
+        matches!(encode_event(&env), Err(CodecError::MalformedPayload(_))),
+        "encode_event must reject termination 0x00"
+    );
+}
+
+#[test]
+fn out_of_domain_result_rejected_on_encode() {
+    use pgc_protocol::{encode_event, EventEnvelope, GameEvent};
+    let env = EventEnvelope {
+        stream_id: "game/x".into(),
+        seq: 1,
+        schema_ver: 0,
+        ts: 0,
+        event: GameEvent::GameEnded {
+            result_vector: vec![9, 0], // 9 ∉ {0,1,2}
+            termination: pgc_protocol::Termination::MATE,
+        },
+    };
+    assert!(
+        matches!(encode_event(&env), Err(CodecError::MalformedPayload(_))),
+        "encode_event must reject result 9"
+    );
+}
+
+#[test]
+fn out_of_domain_color_rejected_on_encode() {
+    use pgc_protocol::{encode_event, EventEnvelope, GameEvent, PoolId, SeatColor, TimeControlId};
+    let env = EventEnvelope {
+        stream_id: "game/x".into(),
+        seq: 1,
+        schema_ver: 0,
+        ts: 0,
+        event: GameEvent::GameCreated {
+            pool_id: PoolId::from("p"),
+            rated: true,
+            seats: vec![SeatColor {
+                seat_idx: 0,
+                color: 7,
+            }], // 7 ∉ {0,1}
+            start_fen: "f".into(),
+            time_control: TimeControlId::from("tc"),
+        },
+    };
+    assert!(
+        matches!(encode_event(&env), Err(CodecError::MalformedPayload(_))),
+        "encode_event must reject seat color 7"
+    );
+}
+
 // --- a frame exactly at the cap is accepted (boundary) ----------------------
 
 #[test]

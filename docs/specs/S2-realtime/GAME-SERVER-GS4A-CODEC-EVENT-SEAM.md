@@ -156,6 +156,15 @@ describing the IN/OUT byte shapes and the shared `pgc_free` ownership. Avoid the
 - **Null-arg / panic-guard:** null out-pointer → `PGC_ERR_NULL_ARG`; the
   `catch_unwind` guard maps any panic to `PGC_ERR_PANIC` (mirrors the existing
   seam tests).
+- **Encode/decode domain symmetry (S1):** `encode_event` must REJECT every
+  out-of-domain closed-domain value `decode_event` rejects — an unknown
+  `termination`, a `result_vector` byte ∉ {0,1,2}, a seat `color` ∉ {0,1}. This
+  closes a write/read asymmetry: before the fix `encode_event` was permissive
+  while `decode_event` validated, so the store could persist a frame it could
+  never read back (an NFR-9 violation, since the stored event becomes
+  un-replayable). Tests assert each is `MalformedPayload` on ENCODE, and that
+  in-domain values still encode+decode (no over-rejection). The §4A byte layout
+  is unchanged — only the previously-missing encode-side guard is added.
 - `cargo test`/`fmt`/`clippy` clean on `codec` + `codec-cgo`; `make test` green
   in the game-server (the Go binding + its parity test).
 
