@@ -631,6 +631,59 @@ This covers `pgc-protocol` → `codec-cgo` (PLAN-S2-CODEC v1.1, building now) an
 
 **Unblocks.** SPEC-S2-GAME-SERVER §4 (Q-GS4) and the engine's Go consumption. **DECIDED by the architecture group 2026-10-13.**
 
+## ADR-16 (new) · Event-store product — **DECIDED: DynamoDB (AWS), scoped to the game-event store only**
+
+> Refines ADR-10's "game truth = append-only event store" by pinning the concrete
+> product, which ADR-10 deliberately left open (it named Postgres for relational
+> and Redis for ephemeral but not the event store's technology). **DECIDED by the
+> owner 2026-10-14**, surfaced via SPEC-S2-GAME-SERVER-GS4 Q-GS4A.
+
+**Context.** GS-4 implements the ratified `game.EventStore` interface and must
+pick a concrete store. The access pattern is narrow and well-defined: per-stream
+append-only writes keyed `(stream_id, seq)`, ordered full-stream reads for
+replay/resync (NFR-9, §3.5), a persist-before-ack durable commit on the move hot
+path (NFR-7/NFR-1), an atomic multi-event terminal append (GS-4 §3.4), and a
+strict gap-free seq with conflict rejection (§4A.8). This is a textbook
+key-value / log fit, not a relational one. The business is **greenfield on the
+cloud** (no prior non-AWS investment to write off), so there is no migration cost
+pushing toward portability, and the cheapest, lowest-ops posture is to pick one
+cloud's best-fit primitive.
+
+**Decision.** Use **Amazon DynamoDB** as the game-event store: a single table
+keyed `stream_id` (partition) / `seq` (sort), on-demand capacity for F-01 (no
+idle cost, scales linearly with traffic). Its native primitives match the
+contract directly — a **conditional put** on the sort key gives the exact
+`ErrSeqConflict` seq-rejection semantics for free, and **`TransactWriteItems`**
+gives the atomic terminal append (ClockFlagged+GameEnded) natively, both of which
+had to be layered onto SQL under the earlier Postgres proposal. Rows carry a
+per-item `encoding_version` (GS-4 §3.1) so the stream stays replayable across any
+future wire-codec evolution (NFR-9). The choice stays behind the `game.EventStore`
+interface (GS-1), so a different store can replace it at G-E scale with no change
+to the session/pipeline.
+
+**Scope / boundary — deliberately narrow.** This ADR pins the **event store
+only**. It does NOT ratify AWS as the platform for anything else: ADR-10's other
+roles stay abstract and portable — accounts/ratings remain "PostgreSQL," cache
+remains "Redis," object storage remains "S3-compatible," analytics remains a
+"columnar warehouse." Which cloud *those* run on (RDS vs self-run Postgres,
+ElastiCache vs Redis, etc.) is a **separate, still-open decision** to be made
+deliberately as each chunk (accounts, matchmaking, media, warehouse) comes up —
+not pre-committed by this storage choice. The tradeoff accepted here is a bounded,
+interface-abstracted AWS/DynamoDB coupling for the truth store; the tradeoff
+explicitly NOT accepted is silent AWS-as-platform lock-in by accumulation.
+
+**Alternatives rejected.** *Postgres* (RDS/Aurora) — correct and portable, but a
+relational engine is not shaped like an append-only log; it is the right
+*relational* store (ADR-10) but would hit a write-throughput + operational cliff
+as the *event* store at G-E, requiring self-built sharding. *Dedicated event-log
+products* (Kafka/Redpanda, EventStoreDB) — Kafka is a feed, not a transactional
+queryable truth store (no per-game atomic multi-append or easy point resync);
+EventStoreDB fits the domain but is a 24/7 self-run cluster — real standing infra
++ ops cost now for scale F-01 does not need. *Cassandra/ScyllaDB* — good fit,
+portable, but heavier ops than serverless DynamoDB for a greenfield team.
+
+**Unblocks.** SPEC-S2-GAME-SERVER-GS4 (Q-GS4A resolved) and the GS-4 build.
+
 ### ADR summary
 
 
@@ -651,6 +704,7 @@ This covers `pgc-protocol` → `codec-cgo` (PLAN-S2-CODEC v1.1, building now) an
 | ADR-12 | delegated | Go for services, Rust for engine/core | **DECIDED** | S2/S3/S6/S7 |
 | ADR-14 | new | One schema-defined binary wire codec in the shared Rust core | **DECIDED** | S2/S4/S5 |
 | ADR-15 | new | Go↔Rust via one uniform in-process cgo/staticlib C-ABI (a `<crate>-cgo` sibling per consumed crate) | **DECIDED** | S2/S1 + Architecture |
+| ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
 
 ---
 
