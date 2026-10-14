@@ -223,19 +223,27 @@ jobs:
     # real DynamoDB engine here, not just the in-process fake. The gated test
     # (store_local_test.go) skips when DYNAMODB_LOCAL_ENDPOINT is unset, so this
     # service only matters for the game-server store tests.
+    # Redis backs the GS-5 matchmaking integration test (Q-MM5): the atomic
+    # Lua claim (no double-match under concurrent seeks) is proven against a
+    # real Redis. redis_integration_test.go skips when REDIS_ENDPOINT is unset.
     services:
       dynamodb-local:
         image: amazon/dynamodb-local:latest
         ports:
           - 8000:8000
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
     env:
       DYNAMODB_LOCAL_ENDPOINT: http://localhost:8000
       AWS_REGION: us-east-1
+      REDIS_ENDPOINT: localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.26"
       - name: Build + test changed services
         run: |
           # game-server (X-2, Go, ADR-12): the move/event hot path links the
