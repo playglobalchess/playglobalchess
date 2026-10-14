@@ -41,7 +41,7 @@ func seedLive(t *testing.T, startpos string, rated bool, now func() time.Time) (
 	store := game.NewMemStore()
 	ctx := context.Background()
 	sid := game.StreamIDFor(gameID)
-	for _, ev := range []game.Event{
+	for i, ev := range []game.Event{
 		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
 			PoolID: "blitz-standard", Rated: rated,
 			Seats:       []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
@@ -51,7 +51,7 @@ func seedLive(t *testing.T, startpos string, rated bool, now func() time.Time) (
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
 	} {
-		if _, err := store.Append(ctx, sid, ev); err != nil {
+		if err := store.Append(ctx, sid, uint32(i), ev); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
@@ -137,7 +137,7 @@ func TestFlagUsesAdvancedClock(t *testing.T) {
 	store := game.NewMemStore()
 	ctx := context.Background()
 	sid := game.StreamIDFor(gameID)
-	for _, ev := range []game.Event{
+	for i, ev := range []game.Event{
 		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
 			PoolID: "x", Rated: false,
 			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
@@ -146,7 +146,7 @@ func TestFlagUsesAdvancedClock(t *testing.T) {
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
 	} {
-		store.Append(ctx, sid, ev)
+		store.Append(ctx, sid, uint32(i), ev)
 	}
 	o, _ := engine.New()
 	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 10_000, IncrementMs: 0}}
@@ -298,7 +298,7 @@ func TestFlagOnTimeout(t *testing.T) {
 	store := game.NewMemStore()
 	ctx := context.Background()
 	sid := game.StreamIDFor(gameID)
-	for _, ev := range []game.Event{
+	for i, ev := range []game.Event{
 		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
 			PoolID: "bullet", Rated: false,
 			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
@@ -307,7 +307,7 @@ func TestFlagOnTimeout(t *testing.T) {
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
 	} {
-		store.Append(ctx, sid, ev)
+		store.Append(ctx, sid, uint32(i), ev)
 	}
 	o, _ := engine.New()
 	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 1_000, IncrementMs: 0}}
@@ -552,7 +552,7 @@ func TestResyncPreservesIdleThink(t *testing.T) {
 	// 2s base, no increment. Seed + play one move, stamping ServerTS from a clock.
 	store := game.NewMemStore()
 	sid := game.StreamIDFor(gameID)
-	for _, ev := range []game.Event{
+	for i, ev := range []game.Event{
 		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
 			PoolID: "x", Rated: false,
 			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
@@ -561,7 +561,7 @@ func TestResyncPreservesIdleThink(t *testing.T) {
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
 	} {
-		store.Append(ctx, sid, ev)
+		store.Append(ctx, sid, uint32(i), ev)
 	}
 	o, _ := engine.New()
 	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 2_000, IncrementMs: 0}}
@@ -683,7 +683,7 @@ func TestRecoverHalfTerminalFlag(t *testing.T) {
 	sid := game.StreamIDFor(gameID)
 	// Seed a live game, then a MovePlayed, then a bare ClockFlagged with NO
 	// GameEnded — the half-terminal flag stream.
-	for _, ev := range []game.Event{
+	for i, ev := range []game.Event{
 		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
 			PoolID: "x", Rated: false,
 			Seats:    []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}},
@@ -694,7 +694,7 @@ func TestRecoverHalfTerminalFlag(t *testing.T) {
 		{Type: game.EvMovePlayed, MovePlayed: &game.MovePlayed{Ply: 1, SeatIdx: 0, UCI: "e2e4", ClockAfterMs: 9000, ServerTS: 1000}},
 		{Type: game.EvClockFlagged, SeatAction: &game.SeatAction{SeatIdx: 1}}, // black flagged, no GameEnded
 	} {
-		if _, err := store.Append(ctx, sid, ev); err != nil {
+		if err := store.Append(ctx, sid, uint32(i), ev); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
@@ -752,8 +752,8 @@ func TestRecoverHalfTerminalMate(t *testing.T) {
 	for _, m := range mates {
 		seed = append(seed, game.Event{Type: game.EvMovePlayed, MovePlayed: &game.MovePlayed{Ply: m.ply, SeatIdx: m.seat, UCI: m.uci, ClockAfterMs: 300000, ServerTS: uint64(m.ply) * 1000}})
 	}
-	for _, ev := range seed {
-		if _, err := store.Append(ctx, sid, ev); err != nil {
+	for i, ev := range seed {
+		if err := store.Append(ctx, sid, uint32(i), ev); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}

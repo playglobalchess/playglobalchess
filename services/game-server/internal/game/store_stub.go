@@ -38,24 +38,59 @@ func (m *MemStore) FailNextAppend(err error) {
 	m.failAppend = err
 }
 
-// Append commits one event and returns its 0-based seq (SPEC-S2-PROTOCOL §4A.8:
-// strictly increasing, no gaps). It honors context cancellation before
-// committing. On the armed-failure path it commits nothing and returns the
-// error, so the caller must not ack (NFR-7).
-func (m *MemStore) Append(ctx context.Context, streamID string, ev Event) (uint32, error) {
+// Append commits one event at the caller-supplied expectedSeq (SPEC-S2-PROTOCOL
+// §4A.8: strictly increasing, no gaps). It honors context cancellation before
+// committing. If expectedSeq is not the stream's next free seq (already
+// occupied, or a gap), it commits nothing and returns ErrSeqConflict — the
+// in-memory analogue of the DynamoDB conditional-put rejection (Q-GS4E). On the
+// armed-failure path it commits nothing and returns the error, so the caller
+// must not ack (NFR-7).
+func (m *MemStore) Append(ctx context.Context, streamID string, expectedSeq uint32, ev Event) error {
 	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("memstore: context: %w", err)
+		return fmt.Errorf("memstore: context: %w", err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failAppend != nil {
 		err := m.failAppend
 		m.failAppend = nil
-		return 0, fmt.Errorf("memstore: append failed (not committed): %w", err)
+		return fmt.Errorf("memstore: append failed (not committed): %w", err)
 	}
-	seq := uint32(len(m.streams[streamID]))
+	if int(expectedSeq) != len(m.streams[streamID]) {
+		return fmt.Errorf("memstore: expected seq %d, next is %d: %w",
+			expectedSeq, len(m.streams[streamID]), ErrSeqConflict)
+	}
 	m.streams[streamID] = append(m.streams[streamID], ev)
-	return seq, nil
+	return nil
+}
+
+// AppendBatch commits evs atomically at consecutive seqs from expectedSeq. If
+// any target seq is occupied (or the batch would not start at the next free
+// seq), it commits NOTHING and returns ErrSeqConflict — the all-or-nothing
+// analogue of DynamoDB TransactWriteItems (SPEC-GS4 §3.4). Empty slice: no-op.
+func (m *MemStore) AppendBatch(ctx context.Context, streamID string, expectedSeq uint32, evs []Event) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("memstore: context: %w", err)
+	}
+	if len(evs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failAppend != nil {
+		err := m.failAppend
+		m.failAppend = nil
+		return fmt.Errorf("memstore: append-batch failed (not committed): %w", err)
+	}
+	if int(expectedSeq) != len(m.streams[streamID]) {
+		return fmt.Errorf("memstore: batch expected seq %d, next is %d: %w",
+			expectedSeq, len(m.streams[streamID]), ErrSeqConflict)
+	}
+	// All-or-nothing: append to a copy conceptually, but since we hold the lock
+	// and the only failure above is the seq check, a straight append is atomic
+	// w.r.t. other callers.
+	m.streams[streamID] = append(m.streams[streamID], evs...)
+	return nil
 }
 
 // Load returns a copy of the ordered event slice for a stream (empty for an

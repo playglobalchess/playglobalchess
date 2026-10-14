@@ -34,8 +34,8 @@ func seedLive(t *testing.T, store *game.MemStore, gameID, startFEN string) {
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 0, UserID: "u0"}},
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: "u1"}},
 	}
-	for _, e := range evs {
-		if _, err := store.Append(ctx, sid, e); err != nil {
+	for i, e := range evs {
+		if err := store.Append(ctx, sid, uint32(i), e); err != nil {
 			t.Fatalf("seed append: %v", err)
 		}
 	}

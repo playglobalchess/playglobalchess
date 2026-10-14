@@ -259,7 +259,7 @@ func finishIfHalfTerminal(ctx context.Context, cfg Config, events []game.Event, 
 			return game.State{}, fmt.Errorf("recover flag termination: %w", err)
 		}
 		rv := flagResultVector(term, seat, len(st.Seats))
-		if _, err := cfg.Store.Append(ctx, stream, game.Event{
+		if err := cfg.Store.Append(ctx, stream, uint32(len(events)), game.Event{
 			Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: term},
 		}); err != nil {
 			return game.State{}, fmt.Errorf("recover append GameEnded(flag): %w", err)
@@ -271,7 +271,7 @@ func finishIfHalfTerminal(ctx context.Context, cfg Config, events []game.Event, 
 	if st.LastMoveTerminal != nil {
 		mover := lastMover(events)
 		rv := winnerFromMover(mover, *st.LastMoveTerminal, len(st.Seats))
-		if _, err := cfg.Store.Append(ctx, stream, game.Event{
+		if err := cfg.Store.Append(ctx, stream, uint32(len(events)), game.Event{
 			Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: *st.LastMoveTerminal},
 		}); err != nil {
 			return game.State{}, fmt.Errorf("recover append GameEnded(terminal move): %w", err)

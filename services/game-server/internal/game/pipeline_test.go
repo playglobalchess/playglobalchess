@@ -13,8 +13,8 @@ func seedLiveGame(t *testing.T, store *MemStore, rated bool) (string, string) {
 	gameID := "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 	streamID := StreamIDFor(gameID)
 	ctx := context.Background()
-	for _, ev := range liveStream(rated) {
-		if _, err := store.Append(ctx, streamID, ev); err != nil {
+	for i, ev := range liveStream(rated) {
+		if err := store.Append(ctx, streamID, uint32(i), ev); err != nil {
 			t.Fatalf("seed append: %v", err)
 		}
 	}
@@ -25,14 +25,17 @@ func TestMemStoreSeqMonotonic(t *testing.T) {
 	store := NewMemStore()
 	ctx := context.Background()
 	sid := "game/x"
-	for want := uint32(0); want < 5; want++ {
-		got, err := store.Append(ctx, sid, evSeat(EvDrawOffered, 0))
-		if err != nil {
-			t.Fatalf("append: %v", err)
+	for seq := uint32(0); seq < 5; seq++ {
+		if err := store.Append(ctx, sid, seq, evSeat(EvDrawOffered, 0)); err != nil {
+			t.Fatalf("append seq %d: %v", seq, err)
 		}
-		if got != want {
-			t.Fatalf("seq = %d, want %d", got, want)
-		}
+	}
+	// A wrong expected seq (gap or reuse) must be rejected with ErrSeqConflict.
+	if err := store.Append(ctx, sid, 7, evSeat(EvDrawOffered, 0)); !errors.Is(err, ErrSeqConflict) {
+		t.Fatalf("append at gap seq 7: want ErrSeqConflict, got %v", err)
+	}
+	if err := store.Append(ctx, sid, 2, evSeat(EvDrawOffered, 0)); !errors.Is(err, ErrSeqConflict) {
+		t.Fatalf("append at occupied seq 2: want ErrSeqConflict, got %v", err)
 	}
 	evs, err := store.Load(ctx, sid)
 	if err != nil {
@@ -176,8 +179,10 @@ func TestPipelineRejections(t *testing.T) {
 	t.Run("move after game over", func(t *testing.T) {
 		store := NewMemStore()
 		gameID, streamID := seedLiveGame(t, store, false)
-		_, _ = store.Append(ctx, streamID, evSeat(EvResigned, 0))
-		_, _ = store.Append(ctx, streamID, evEnded(TermResign, []Result{ResultLoss, ResultWin}))
+		seeded, _ := store.Load(ctx, streamID)
+		n := uint32(len(seeded))
+		_ = store.Append(ctx, streamID, n, evSeat(EvResigned, 0))
+		_ = store.Append(ctx, streamID, n+1, evEnded(TermResign, []Result{ResultLoss, ResultWin}))
 		o := newFakeOracle()
 		o.allow("e2e4", "x", nil)
 		p := &Pipeline{Oracle: o, Store: store, Opts: tc53opts()}

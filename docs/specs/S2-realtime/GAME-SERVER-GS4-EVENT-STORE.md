@@ -51,12 +51,18 @@ behind the interface; the session, pipeline, and engine seam are unchanged.
   / `codec.DecodeEvent` over the `pgc_encode_event`/`pgc_decode_event` C-ABI) —
   the pre-GS4a `codec-cgo` surface only re-encoded existing frames and could not
   serialize a domain `game.Event`.
-- **Atomic terminal append** — the thing that lets GS-4 *remove* GS-3's
-  half-terminal recovery window: ClockFlagged+GameEnded (and MovePlayed+GameEnded
-  on a terminal move) are committed in a **single `TransactWriteItems`**, so a
-  crash can never leave a half-terminal stream. GS-3's `finishIfHalfTerminal`
-  stays as defense-in-depth but is no longer the correctness guarantee. (Q-GS4C:
-  expose this as `AppendBatch([]Event)` on the interface — see §4/§10.)
+- **Atomic terminal append** — closes GS-3's half-terminal recovery window for
+  the **flag ending**: ClockFlagged+GameEnded (and the takeback pair) are
+  committed in a **single `TransactWriteItems`** via `AppendBatch`, so a crash
+  cannot leave a half-terminal flagged stream. **Scope note (impl):** the
+  *terminal-move* ending (a mate/stalemate MovePlayed followed by GameEnded) is
+  NOT yet one transaction — the MovePlayed is persisted by the move pipeline and
+  the GameEnded is a separate session append, because the pipeline validates the
+  move and does not know the result vector. For that path GS-3's
+  `finishIfHalfTerminal` recovery REMAINS the correctness guarantee (not merely
+  defense-in-depth); making the terminal-move ending a single transaction is a
+  follow-up (it needs the pipeline to accept an optional trailing GameEnded).
+  (Q-GS4C: expose the batch as `AppendBatch([]Event)` — see §4/§10.)
 - **Table definition + provisioning** for the store (Q-GS4A — DynamoDB,
   on-demand capacity; table created via IaC, not an in-app migration).
 - **Config + client lifecycle** (AWS region + credentials from env/secret/role,
@@ -97,7 +103,7 @@ game_events  (ADR-16)
   seq              N   (sort key)       -- 0-based, strictly increasing per stream
   event_type       N                    -- the §4A event type code
   encoding_version N                    -- the codec version `payload` is encoded with (Q-GS4B)
-  payload          B                    -- the serialized event body, raw bytes (Q-GS4B)
+  payload          B                    -- the full canonical §4A event frame (Q-GS4B; Q-GS4a-2 DECIDED: full frame)
   committed_at     S                    -- RFC-3339 commit timestamp
 ```
 
@@ -362,3 +368,33 @@ keeps the stream replayable across codec evolution (NFR-9).
   under single-writer. **Proposed: caller-expected seq + conditional put +
   `ErrSeqConflict` + session-owned reconcile.** Revisit if multi-node writers to
   one stream become routine (the recovery contract already covers it).
+- **Q-GS4a-2 — stored frame includes `stream_id`/`seq`? — DECIDED (full frame).**
+  The GS-4a seam (which GS-4a §8 Q-GS4a-2 deferred here) emits the full §4A event
+  frame; GS-4 stores it verbatim in `payload`. The `stream_id`/`seq` bytes are
+  thus present both in the frame and as the DynamoDB key — a few redundant bytes
+  per item, negligible against item overhead — in exchange for "stored bytes ==
+  wire bytes" being literally true (NFR-10): a stored event replays to the exact
+  frame a live consumer saw, with no key-field reconstruction on Load. Rejected:
+  stripping the key fields (smaller, but then stored ≠ wire and Load must rebuild
+  the envelope header from the item key). **DECIDED: full frame.**
+- **Implementation status (this chunk).** The `EventStore` interface was evolved
+  per Q-GS4E (caller-passed `expectedSeq`, additive `AppendBatch`, shared
+  `game.ErrSeqConflict`) and the §3.4 atomic terminal is implemented in the
+  session via `AppendBatch` (flag + takeback ending pairs). The session derives
+  each batch/ending append's seq from a fresh `Load` (off the per-move hot path),
+  so there is no fragile seq counter to drift against the pipeline's move-seq.
+  On an `ErrSeqConflict` the pipeline/session reconcile with a bounded retry
+  (idempotent re-ack vs re-sequence a valid loser), and a re-ack reports the
+  move's REAL seq as `AppliedSeq` (not the next free seq) so a future transport
+  that echoes it into the ack frame is correct.
+- **Tracked follow-ups (not blockers for this chunk).** (1) The seq-conflict
+  reconcile path (retries + the exhausted-retries give-up) has NO metric/log yet
+  — deliberately: the pipeline is currently logger/metrics-free and real
+  observability is **X-14**. When X-14 wires the server's metrics, surface a
+  seq-contention counter + a retry-exhausted signal there (the caller, which will
+  own logging), rather than bolting a logger onto the pure pipeline now. Rare
+  today under single-writer-per-game; it fires exactly when multi-node writers
+  land (GS-5+), which is when the metric matters. (2) IaC table definition
+  (tests self-create the table). (3) `New` verifying the key schema, not just
+  reachability. (4) The atomic terminal-MOVE batch (needs the pipeline to accept
+  an optional trailing GameEnded).
