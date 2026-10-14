@@ -38,17 +38,18 @@ appended `GameCreated`+`PlayerJoined`.
   - `Cancel(ctx, seeker)` — withdraw an unmatched seeker (disconnect / explicit).
   - the pairing + widening-window logic (pure, unit-testable, Redis-free core).
 - A **Redis seek-pool store** (ADR-10 ephemeral): a sorted-set per pool keyed by
-  rating, with atomic pair-and-remove so two nodes cannot both claim the same
-  waiting seeker (§4).
+  rating, with an **atomic claim** so two nodes cannot both claim the same
+  waiting seeker; removal is deferred until after the opening stream is appended
+  (§3.3/§3.4, Q-MM6).
 - **Game creation on a pair:** allocate a `game_id` (UUID), assign seats + colors
-  (Q-GS5c), build the `GameCreated`+two `PlayerJoined` events, and commit them to
-  the GS-4 store via a single `AppendBatch` at seq 0 (atomic opening — Q-GS5d),
+  (Q-MM3), build the `GameCreated`+two `PlayerJoined` events, and commit them to
+  the GS-4 store via a single `AppendBatch` at seq 0 (atomic opening — Q-MM4),
   then hand the stream id back so the caller emits `MATCHED{start_state}`.
 - **Config + Redis client lifecycle** (endpoint/credentials from env/secret,
   `context.Context` on every call — ADR-12), with `New` fail-fast on an
   unreachable Redis.
 - Tests: pure pairing/windowing unit tests + a Redis-backed integration tier
-  (Q-GS5e: a Redis service container in CI, gated like GS-4's DynamoDB Local).
+  (Q-MM5: a Redis service container in CI, gated like GS-4's DynamoDB Local).
 
 **Out of scope (later chunks — do NOT start):**
 - The WS transport that carries `SEEK`/`MATCHED` frames and binds a connection to
@@ -99,27 +100,46 @@ unit-testable without Redis:
 
 - `Enqueue(seeker)` — `ZADD pool:{id} rating seek_id` + `HSET seek:{seek_id} …`
   with a TTL (an abandoned seek expires rather than lingering).
-- `TryPair(newSeeker)` — the **atomic** claim: read candidates near the window,
-  pick the pure-core winner, then **remove both seek_ids atomically** (a Lua
-  script / `MULTI` so two nodes cannot both claim the same waiting seeker). The
-  loser of a concurrent claim retries pairing against the updated set. Redis holds
-  no game truth — a node loss drops only unmatched seekers, who re-seek (§3.4).
-- `Cancel(seek_id)` — `ZREM` + `DEL` the hash.
+- `TryClaim(newSeeker)` — the **atomic claim**: read candidates near the window,
+  pick the pure-core winner, and **atomically mark both seek_ids as claimed** (a
+  Lua script / `MULTI` that flips a `claimed` flag — e.g. moves them to a
+  per-node `claimed:{node}` set with a short TTL — so two nodes cannot both claim
+  the same waiting seeker). It does **not** delete them yet. The loser of a
+  concurrent claim retries against the updated set. **Removal is deferred to
+  after the opening stream is durably appended** (§3.4 step 5, Q-MM6) — the claim
+  reserves the pair; game creation commits it. Redis holds no game truth — a node
+  loss drops only unmatched/claimed-but-uncommitted seekers (their claim TTL
+  lapses and they re-seek).
+- `Release(seek_id)` — undo a claim (claim held but creation failed): clear the
+  `claimed` flag so the seeker is pairable again (bounded by the claim TTL anyway).
+- `Remove(seek_id)` — `ZREM` + `DEL` the hash; called in §3.4 step 5 AFTER the
+  opening append, to finalize the match.
+- `Cancel(seek_id)` — a seeker withdraws: `ZREM` + `DEL` the hash (same as Remove,
+  caller-initiated).
 
 ### 3.4 Game creation on a pair (writes the opening stream)
 
-On a successful atomic pair of A and B:
+On a successful atomic **claim** of A and B (the pair is reserved in Redis, not
+yet removed), in this exact order so a crash never consumes a seeker without a
+created game (Q-MM6):
 1. allocate `game_id` = a v4 UUID; `stream_id = StreamIDFor(game_id)`.
-2. assign seats + colors (Q-GS5c): seat 0 / seat 1, colors white/black.
+2. assign seats + colors (Q-MM3): seat 0 / seat 1, colors white/black.
 3. build `GameCreated{pool_id, rated, seats:[{0,white},{1,black}], start_fen =
    Standard startpos string, time_control}` + `PlayerJoined{0, A}` +
    `PlayerJoined{1, B}` (seat↔user per the color assignment).
-4. commit all three as a **single `AppendBatch` at seq 0** to the GS-4 store
-   (Q-GS5d) — an atomic opening: a crash can never leave a half-created game
-   (GameCreated with no players), mirroring GS-4's atomic-terminal guarantee.
-5. return `(game_id, start_state)` so the caller (GS-6 transport) emits
-   `MATCHED{start_state}` to both seats. The `start_state` is the §4A.6
-   `StateBody` for the opening position (reused per Q-P4 — one state format).
+4. **FIRST** commit all three as a **single `AppendBatch` anchored at seq 0**
+   (seqs 0,1,2 in one atomic batch) to the GS-4 store (Q-MM4) — an atomic
+   opening: a crash can never leave a half-created game (GameCreated with no
+   players), mirroring GS-4's atomic-terminal guarantee. The created stream is
+   now durable truth.
+5. **THEN** `Remove` both seek_ids from Redis (finalize the claim), and return
+   `(game_id, start_state)` so the caller (GS-6 transport) emits
+   `MATCHED{start_state}` to both seats. If step 4 fails, `Release` the claims
+   (the pair becomes pairable again) and surface the error — nothing was created,
+   nothing lost. If the crash lands BETWEEN step 4 and step 5, the game exists and
+   is reachable; the stale claims lapse via TTL — the safe direction (Q-MM6).
+   The `start_state` is the §4A.6 `StateBody` for the opening position (reused per
+   Q-P4 — one state format).
 
 The live session (GS-3) is then constructed from the durable stream exactly as it
 is for a reconnect — matchmaking has no special handoff beyond the committed
@@ -144,9 +164,11 @@ events.
 | Case | Behavior |
 |---|---|
 | No compatible waiting seeker | the seeker is enqueued; `Seek` returns "no match yet" (not an error); a later counter-seek pairs it. |
-| Two nodes claim the same waiting seeker | the atomic `TryPair` (Lua/`MULTI`) lets exactly one win; the loser retries pairing against the updated set — no double-match, no lost seeker. |
+| Two nodes claim the same waiting seeker | the atomic `TryClaim` (Lua/`MULTI`) lets exactly one win; the loser retries pairing against the updated set — no double-match, no lost seeker. |
 | Seeker disconnects while waiting | `Cancel` (or the hash TTL) removes it; no stale pairing. |
-| Crash AFTER atomic pair-remove, BEFORE the opening AppendBatch | both seekers are removed from Redis but no game exists — they are unmatched and must re-seek. Mitigation: do the AppendBatch FIRST on a *reserved* game_id, then remove from Redis; if the remove fails the game exists and the session is reachable, which is the safe direction (a created game is truth; a lingering Redis seek self-expires). (Q-GS5f — ordering.) |
+| Crash BETWEEN the atomic claim and the opening AppendBatch | the claim is held but no game exists; the claim TTL lapses and both seekers re-seek. No game lost (none created). |
+| Crash BETWEEN the opening AppendBatch and the Redis Remove | the game IS created (durable truth) and reachable; the stale claims lapse via TTL. The safe direction — claim→append→remove (Q-MM6). |
+| Opening AppendBatch fails | `Release` both claims (they become pairable again); surface the error. Nothing created, nothing lost. |
 | Opening AppendBatch conflict at seq 0 | only possible on a game_id reuse (UUID collision, ~never) — abandon and re-allocate; never overwrite an existing stream. |
 | Redis unavailable | `New` fail-fasts; an in-flight `Seek` returns an error and the client retries — no game is lost (none created yet). |
 | Rated seeker vs unrated pool | impossible by pool_id construction; asserted, not filtered. |
@@ -168,7 +190,7 @@ events.
 - A seeker is bound to an authenticated `user_id` (GS-6 supplies it from the
   authed connection); the matchmaker never trusts a client-supplied rating — it
   reads the rating from X-4/accounts (for F-01 bring-up, a seed rating until X-4
-  lands, flagged Q-GS5b).
+  lands, flagged Q-MM2).
 - Seek-flood / rapid re-seek rate-limiting is a GS-6/transport concern (Redis
   rate-limit counters, ADR-10); noted, not implemented here.
 
@@ -177,9 +199,9 @@ events.
 - **Pairing core (pure, no Redis):** closest-rating match within the window;
   widening over the oldest seeker's age; no self-pair; rated/unrated invariant;
   deterministic tie-break — table-driven against fixed waiting sets.
-- **Atomic claim (Redis):** two concurrent `TryPair` for the same waiting seeker
+- **Atomic claim (Redis):** two concurrent `TryClaim` for the same waiting seeker
   → exactly one match, the other re-queued; asserted against a real Redis
-  (Q-GS5e service container), not just the fake.
+  (Q-MM5 service container), not just the fake.
 - **Game creation:** a pair writes exactly `GameCreated`+2×`PlayerJoined` at seqs
   0,1,2 via one `AppendBatch`; folding the stream (GS-3 `FoldWithEngine`) yields a
   LIVE game with the right seats/colors/time-control; `MATCHED.start_state` equals
@@ -187,7 +209,7 @@ events.
 - **Opening atomicity:** inject a mid-batch failure → neither opening event lands
   (no half-created game).
 - **Cancel / TTL:** a cancelled or expired seeker is not paired.
-- **Crash-ordering (Q-GS5f):** the AppendBatch-before-Redis-remove ordering leaves
+- **Crash-ordering (Q-MM6):** the AppendBatch-before-Redis-remove ordering leaves
   a created game reachable even if the Redis remove is lost.
 - `make test` green (existing suites not regressed), `gofmt`/`vet` clean; the
   Redis integration tier runs against a `redis` service container in CI.
@@ -211,26 +233,26 @@ events.
 
 ## 10. Open questions
 
-- **Q-GS5a — Redis client library.** `redis/go-redis/v9` (the de-facto standard,
+- **Q-MM1 — Redis client library.** `redis/go-redis/v9` (the de-facto standard,
   maintained, supports Lua + cluster). Alternative: `rueidis` (faster, heavier
   API). **Proposed: go-redis/v9** for F-01; revisit at G-E if latency demands.
-- **Q-GS5b — seeker rating source before X-4.** The matchmaker needs a rating to
+- **Q-MM2 — seeker rating source before X-4.** The matchmaker needs a rating to
   order the pool, but the rating service (X-4) isn't built. **Proposed:** a seed
   rating (e.g. 1500) read behind a `RatingSource` interface, so X-4 swaps in later
   with no matchmaker change. Pairing still works (everyone near 1500 early on).
-- **Q-GS5c — seat/color assignment.** **Proposed:** seat 0 = white, seat 1 =
+- **Q-MM3 — seat/color assignment.** **Proposed:** seat 0 = white, seat 1 =
   black; the two seekers are assigned by a coin-flip (deterministic in tests via
   an injected RNG) so color is fair. Alternative: alternate by rating — rejected
   (no fairness basis). Revisit for rematch (color-swap) in a later chunk.
-- **Q-GS5d — opening-stream atomicity.** **Proposed:** one `AppendBatch` of all
+- **Q-MM4 — opening-stream atomicity.** **Proposed:** one `AppendBatch` of all
   three opening events at seq 0 (reusing GS-4's `TransactWriteItems`), so a
   half-created game is impossible — symmetric with GS-4's atomic terminal.
   Alternative: three separate appends + recovery — rejected (reintroduces the
   half-state window GS-4 removed).
-- **Q-GS5e — Redis in CI.** **Proposed:** a `redis` service container on the
+- **Q-MM5 — Redis in CI.** **Proposed:** a `redis` service container on the
   `services` job (like GS-4's DynamoDB Local), with the atomic-claim integration
   test gated on a `REDIS_ENDPOINT` env (skips locally, runs in CI).
-- **Q-GS5f — pair/create ordering under crash.** **Proposed:** AppendBatch the
+- **Q-MM6 — pair/create ordering under crash.** **Proposed:** AppendBatch the
   opening stream on a reserved game_id FIRST, THEN remove the two seekers from
   Redis — so a crash between leaves a *created, reachable* game (truth) rather
   than two silently-consumed seekers with no game. The lingering Redis seeks
