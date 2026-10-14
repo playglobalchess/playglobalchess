@@ -72,8 +72,17 @@ func TestPipelineSeqConflict_ValidLoserReSequenced(t *testing.T) {
 	if len(events) != base+2 {
 		t.Fatalf("stream len %d, want %d (competing event + re-sequenced move)", len(events), base+2)
 	}
-	if findMove(events, out.Ply) == nil {
+	mv, mvSeq := findMove(events, out.Ply)
+	if mv == nil {
 		t.Fatalf("the valid move was DROPPED — not in the stream (NFR-2 violation)")
+	}
+	// AppliedSeq must be the move's REAL seq (where it sits), not the next free
+	// seq — the re-sequenced move landed at base+1 (after the competing event).
+	if out.AppliedSeq != mvSeq {
+		t.Fatalf("AppliedSeq %d != the move's real seq %d (F1)", out.AppliedSeq, mvSeq)
+	}
+	if mvSeq != uint32(base+1) {
+		t.Fatalf("re-sequenced move at seq %d, want %d", mvSeq, base+1)
 	}
 }
 
@@ -104,6 +113,11 @@ func TestPipelineSeqConflict_OwnMoveIdempotentReAck(t *testing.T) {
 	}
 	if !out.Accepted {
 		t.Fatalf("idempotent re-ack not accepted: %+v", out)
+	}
+	// AppliedSeq must point at where our move actually landed (base), not the
+	// next free seq (F1).
+	if out.AppliedSeq != uint32(base) {
+		t.Fatalf("re-ack AppliedSeq %d != the move's real seq %d (F1)", out.AppliedSeq, base)
 	}
 	events, _ := mem.Load(ctx, streamID)
 	count := 0

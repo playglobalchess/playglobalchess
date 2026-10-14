@@ -383,3 +383,18 @@ keeps the stream replayable across codec evolution (NFR-9).
   session via `AppendBatch` (flag + takeback ending pairs). The session derives
   each batch/ending append's seq from a fresh `Load` (off the per-move hot path),
   so there is no fragile seq counter to drift against the pipeline's move-seq.
+  On an `ErrSeqConflict` the pipeline/session reconcile with a bounded retry
+  (idempotent re-ack vs re-sequence a valid loser), and a re-ack reports the
+  move's REAL seq as `AppliedSeq` (not the next free seq) so a future transport
+  that echoes it into the ack frame is correct.
+- **Tracked follow-ups (not blockers for this chunk).** (1) The seq-conflict
+  reconcile path (retries + the exhausted-retries give-up) has NO metric/log yet
+  — deliberately: the pipeline is currently logger/metrics-free and real
+  observability is **X-14**. When X-14 wires the server's metrics, surface a
+  seq-contention counter + a retry-exhausted signal there (the caller, which will
+  own logging), rather than bolting a logger onto the pure pipeline now. Rare
+  today under single-writer-per-game; it fires exactly when multi-node writers
+  land (GS-5+), which is when the metric matters. (2) IaC table definition
+  (tests self-create the table). (3) `New` verifying the key schema, not just
+  reachability. (4) The atomic terminal-MOVE batch (needs the pipeline to accept
+  an optional trailing GameEnded).

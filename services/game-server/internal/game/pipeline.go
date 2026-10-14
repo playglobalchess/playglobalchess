@@ -171,12 +171,13 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 	// Idempotent retry: a MOVE whose ply is already persisted re-acks the
 	// existing move, no second append (§5 duplicate-MOVE).
 	if in.PlyExpected <= st.Ply && in.PlyExpected > 0 {
-		if mv := findMove(events, in.PlyExpected); mv != nil {
+		if mv, mvSeq := findMove(events, in.PlyExpected); mv != nil {
 			if mv.SeatIdx != in.SeatIdx {
 				return reject(RejectNotYourSeat, st.Ply), nil
 			}
 			return MoveOutcome{
 				Accepted:     true,
+				AppliedSeq:   mvSeq, // the move's REAL seq, not 0
 				Ply:          mv.Ply,
 				ClockAfterMs: mv.ClockAfterMs,
 			}, nil
@@ -256,13 +257,13 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		if err != nil {
 			return MoveOutcome{}, fmt.Errorf("pipeline: reload on conflict: %w", err)
 		}
-		if mv := findMove(events, ply); mv != nil {
+		if mv, mvSeq := findMove(events, ply); mv != nil {
 			// OUR move (this ply) is already persisted — the conflict was our own
 			// duplicate/resend. Idempotent re-ack: return the existing move, no
-			// second append (same shape as the ply-already-persisted path above).
+			// second append, reporting its REAL seq (where it sits).
 			return MoveOutcome{
 				Accepted:     true,
-				AppliedSeq:   uint32(len(events)),
+				AppliedSeq:   mvSeq,
 				Ply:          mv.Ply,
 				ClockAfterMs: mv.ClockAfterMs,
 			}, nil
@@ -299,14 +300,16 @@ func reject(r RejectReason, serverPly uint32) MoveOutcome {
 	return MoveOutcome{Rejected: true, Reason: r, PlyExpected: serverPly}
 }
 
-// findMove returns the MovePlayed body with the given ply, or nil.
-func findMove(events []Event, ply uint32) *MovePlayed {
+// findMove returns the MovePlayed body with the given ply and its 0-based seq
+// (its index in the stream), or (nil, 0) if absent. The seq lets a re-ack report
+// the move's REAL AppliedSeq (where it sits), not the next free seq.
+func findMove(events []Event, ply uint32) (*MovePlayed, uint32) {
 	for i := range events {
 		if events[i].Type == EvMovePlayed && events[i].MovePlayed != nil && events[i].MovePlayed.Ply == ply {
-			return events[i].MovePlayed
+			return events[i].MovePlayed, uint32(i)
 		}
 	}
-	return nil
+	return nil, 0
 }
 
 // StreamIDFor builds the stream id for a game (SPEC-S2-PROTOCOL §4A.8:
