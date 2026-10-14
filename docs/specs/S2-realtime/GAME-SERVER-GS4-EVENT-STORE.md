@@ -5,8 +5,8 @@
 | Spec ID | SPEC-S2-GAME-SERVER-GS4 (implementation slice of SPEC-S2-GAME-SERVER §2c / ADR-10) |
 | Owner | S2 Real-time |
 | Status | REVIEW |
-| Version | 0.1 |
-| Last updated | 2026-10-13 |
+| Version | 0.2 |
+| Last updated | 2026-10-14 |
 | Implements (master IDs) | X-2, X-14 (game-event store), NFR-2 (no game loss), NFR-7 (persist-before-ack), NFR-9 (fully replayable), ADR-10, ADR-12 |
 | Depends on | SPEC-S2-GAME-SERVER (RATIFIED); GS-1 (the `game.EventStore` interface + `MemStore` stub, PR #34); GS-3 (the live session that consumes it, PR #42); ADR-10 (DECIDED: game truth = append-only event store) |
 | Gates it feeds | Contributes to NFR-2/NFR-7 being real (not stubbed); a hard prerequisite for the F-01 vertical slice. Does **not** make a lettered gate green by itself. |
@@ -42,8 +42,10 @@ behind the interface; the session, pipeline, and engine seam are unchanged.
 - **Serialization of `game.Event` to/from durable rows** — the stored form of
   each event body (GameCreated, MovePlayed, …). Q-GS4B decides whether this
   reuses the frozen §4A wire codec (via the Go cgo binding) or a store-local
-  encoding; proposed: reuse the codec so stored bytes == wire bytes (one
-  encoding, NFR-10 spirit; replay/audit produce identical frames).
+  encoding; proposed: reuse the codec, **tagged with a per-row `encoding_version`**
+  so stored bytes == wire bytes for that version and the stream stays replayable
+  across any future codec evolution (NFR-9 — the version, not the byte-identity,
+  is the guarantee; see §3.1).
 - **Atomic terminal append** — the thing that lets GS-4 *remove* GS-3's
   half-terminal recovery window: ClockFlagged+GameEnded (and MovePlayed+GameEnded
   on a terminal move) can be committed in a **single transaction**, so a crash
@@ -73,9 +75,9 @@ behind the interface; the session, pipeline, and engine seam are unchanged.
 |---|---|
 | ADR-10 game truth = append-only event store | §3 — the whole slice. |
 | NFR-7 persist-before-ack | §3.2 — Append returns only after the durable commit; the pipeline already waits on it. |
-| NFR-2 no game loss / §3.5 resume on any node | §3.3 — Load replays the durable stream; a rebuilt session on any node reproduces state. |
-| §4A.8 strictly-increasing gap-free seq | §3.2 — unique `(stream_id, seq)`; seq assigned transactionally. |
-| NFR-9 fully replayable / audit / anti-cheat feed | §3 — the stream is the immutable record; replay == fold. |
+| NFR-2 no game loss / §3.5 resume on any node | §3.3 — Load replays the durable stream; §3.2 — a valid move that loses a cross-node seq race is re-sequenced by the session, never dropped. |
+| §4A.8 strictly-increasing gap-free seq | §3.2 — unique `(stream_id, seq)`; seq assigned transactionally; conflicts typed + reconciled. |
+| NFR-9 fully replayable / audit / anti-cheat feed | §3.1/§3.3 — the stream is the immutable record; each row self-describes its `encoding_version` so replay == fold across any future codec evolution. |
 | GS-3 terminal atomicity | §3.4 — transactional multi-event append removes the half-terminal window. |
 | NFR-5 (no chess logic) | unchanged — the store moves opaque event bytes; no game logic. |
 
@@ -87,11 +89,12 @@ A single `game_events` table (one row per event):
 
 ```
 game_events(
-  stream_id   text    not null,   -- "game/{uuid}" (SPEC-S2-PROTOCOL §4A.8)
-  seq         bigint  not null,   -- 0-based, strictly increasing per stream
-  event_type  smallint not null,  -- the §4A event type code
-  payload     bytea   not null,   -- the serialized event body (Q-GS4B)
-  committed_at timestamptz not null default now(),
+  stream_id        text     not null,  -- "game/{uuid}" (SPEC-S2-PROTOCOL §4A.8)
+  seq              bigint   not null,  -- 0-based, strictly increasing per stream
+  event_type       smallint not null,  -- the §4A event type code
+  encoding_version smallint not null,  -- the codec version `payload` is encoded with (Q-GS4B)
+  payload          bytea    not null,  -- the serialized event body (Q-GS4B)
+  committed_at     timestamptz not null default now(),
   primary key (stream_id, seq)
 )
 ```
@@ -100,6 +103,22 @@ The `(stream_id, seq)` primary key is the ordering + idempotency guarantee: a
 second attempt to write an already-occupied seq fails the insert (unique
 violation), which is how a racing/duplicate append is rejected rather than
 silently reordered. Reads are `WHERE stream_id = $1 ORDER BY seq`.
+
+**Why `encoding_version` exists (NFR-9).** The store is the *immutable,
+forever-replayable* record (NFR-9) — it outlives every version of the wire
+codec. Storing payloads with the §4A codec (Q-GS4B) makes stored bytes identical
+to wire bytes *for a given codec version*, but "byte-identical to the wire" is
+**not** the durability guarantee — the per-row `encoding_version` is. Without it,
+a row written with codec v1 and a row written with a future codec v2 are
+indistinguishable `bytea`, and Load has no way to pick the right decoder, so
+replay/audit of historical games silently misdecodes or fails — the exact
+guarantee the store exists to provide. With it, every row is self-describing:
+Load dispatches on `encoding_version`, so a v1 row stays replayable forever even
+after a v2 codec ships. The `event_type` code is pinned to the encoding version
+(a type-code's meaning is only defined within a codec version), so the single
+version column covers both. GS-4 writes the current version (`1`) on every
+append; a codec evolution adds a new version value and a decode branch, and never
+rewrites or reinterprets existing rows.
 
 *Why Postgres (proposed):* it is already the mandated relational store (ADR-10),
 so GS-4 adds **no new operational dependency** for P1/F-01; it gives real
@@ -115,18 +134,47 @@ a separate event-store technology now — is more infra for no F-01 benefit.
 1. open a transaction;
 2. compute the next seq = `coalesce(max(seq)+1, 0)` for the stream (or pass the
    expected seq and rely on the PK to reject a gap/dup — see Q-GS4E);
-3. insert the row;
+3. insert the row, writing `encoding_version` = the current codec version (`1`)
+   alongside the §4A-encoded `payload`;
 4. commit — and return the seq **only after** the commit succeeds. A failed
    commit returns a non-nil error and NO seq, so the caller (pipeline) does not
    ack (NFR-7). This is the exact contract the `MemStore` stub modelled
    synchronously; GS-4 makes it a real durable commit.
 
+**Seq-conflict is a typed, recoverable error (NFR-2).** A PK unique violation on
+step 3 is returned as a **distinguishable** `store.ErrSeqConflict`, never a
+generic error. This matters because the store **cannot** tell a genuine duplicate
+from a valid move that lost a cross-node seq race — the two are identical bytes
+at the store layer (Q-GS4E). Treating the rejection as a plain failure would
+silently drop a legitimate move (an NFR-2 violation). So the store does the
+narrow thing it can do correctly — reject the occupied seq and *say which error
+it is* — and **recovery lives in the caller that owns game truth, the GS-3
+session actor**, not in the store (the store has no game context to reconcile
+with). On `ErrSeqConflict` the session reloads the stream head (`Load`) and
+reconciles:
+- if its event is **already present** at that seq (idempotent re-ack — the same
+  reload-and-reconcile shape GS-3's existing re-ack path uses), it is a true
+  duplicate → treat as the already-committed event, do not re-append;
+- if its event is **genuinely new** (it lost the race to a *different* event),
+  re-fold on the new head, re-validate the move against the engine, and append at
+  the next free seq — so a valid loser is **re-sequenced, never dropped**.
+
+The session is single-writer per game (the GS-3 actor serializes its own stream),
+so this reconciliation is the *across-node* case Q-GS4E identifies; in the common
+single-node case the conflict does not arise. Keeping recovery in the session
+reuses its fold/re-ack machinery and keeps the store a dumb, correct append log.
+
 ### 3.3 Load (NFR-2, §3.5)
 
 `Load(ctx, streamID)` reads all rows for the stream ordered by seq, deserializes
-each payload back to a `game.Event`, and returns the slice. The live session
-folds it (`FoldWithEngine`) to rebuild state on any node — no original-node
-affinity. Unknown stream → empty slice, nil error.
+each payload back to a `game.Event` **by dispatching on the row's
+`encoding_version`** (so a stream mixing rows written across a codec evolution
+decodes correctly, each row with the decoder matching its own version), and
+returns the slice. A row whose `encoding_version` is unknown to this build is a
+hard error (the server refuses to project a stream it cannot faithfully replay —
+same posture as a corrupt `event_type`). The live session folds the slice
+(`FoldWithEngine`) to rebuild state on any node — no original-node affinity.
+Unknown stream → empty slice, nil error.
 
 ### 3.4 Atomic terminal append (removes GS-3's recovery window)
 
@@ -141,20 +189,26 @@ primary guarantee once the session uses the batch append.
 ## 4. Interfaces & contracts
 
 GS-4 implements the existing `game.EventStore` with no change to its two
-methods. It MAY **additively** extend the interface with `AppendBatch` for §3.4
-(Q-GS4C) — a coordinated change (the stub, the session's two-append ending
-paths, and tests update together, like the GS-3 Q-GS3B change). No wire bytes
+methods' signatures. It MAY **additively** extend the interface with
+`AppendBatch` for §3.4 (Q-GS4C) — a coordinated change (the stub, the session's
+two-append ending paths, and tests update together, like the GS-3 Q-GS3B
+change). Both `Append` and `AppendBatch` surface a seq collision as the typed
+`store.ErrSeqConflict` (§3.2), so the session can branch on it. No wire bytes
 change; the serialized payload format is an internal store contract (Q-GS4B),
-not the §4A wire contract (though proposed to be byte-identical to it).
+not the §4A wire contract — it is byte-identical to the wire *for a given codec
+version*, and the row's `encoding_version` (§3.1), not that identity, is what
+keeps the stream replayable across codec evolution (NFR-9).
 
 ## 5. Edge cases & failure modes
 
 | Case | Behavior |
 |---|---|
-| Append at an occupied seq (concurrent/dup) | PK unique violation → error, not silent reorder/overwrite; caller does not ack. |
+| Append at an occupied seq (true duplicate) | PK unique violation → typed `ErrSeqConflict`; the session reloads the head, finds its event already present, treats it as the committed event (idempotent), does not re-append. |
+| Append at an occupied seq (valid move lost a cross-node race) | same `ErrSeqConflict`; the session reloads the head, re-folds, re-validates, and re-appends at the next free seq — the move is re-sequenced, **never dropped** (NFR-2). |
 | Commit fails after insert (crash/disconnect mid-tx) | transaction rolls back; no row; Append returns error; move did not happen (NFR-7). |
 | Load an unknown stream | empty slice, nil error (interface contract). |
 | Corrupt/unknown event_type on Load | error (refuse to project a corrupt stream — mirrors FoldWithEngine's corrupt-stream refusal). |
+| Unknown `encoding_version` on Load | error (refuse to project a stream this build cannot faithfully decode — NFR-9 fidelity over best-effort). |
 | Terminal ending appended non-atomically (pre-batch) | GS-3 recovery still closes it on rebuild; §3.4 batch removes the window. |
 | DB unavailable at startup | NewStore fails fast with a clear error; the server does not start serving games it cannot persist. |
 | Very long stream | O(n) Load; fine at F-01 scale; snapshotting is deferred (out of scope). |
@@ -183,8 +237,18 @@ not the §4A wire contract (though proposed to be byte-identical to it).
 - **Append/Load round-trip:** append a sequence, Load returns the identical
   ordered slice; payloads deserialize byte-for-byte to the original events.
 - **Seq integrity:** seq is 0-based, strictly increasing, gap-free; a second
-  append at an occupied seq errors (concurrency: parallel appends to one stream
-  produce a consistent gap-free order, exactly one winner per seq).
+  append at an occupied seq returns the typed `ErrSeqConflict` (concurrency:
+  parallel appends to one stream produce a consistent gap-free order, exactly one
+  winner per seq).
+- **Seq-conflict recovery (NFR-2):** two tests, one per case the store cannot
+  distinguish — (a) the session re-appends its *own* already-committed event →
+  reconciled as idempotent, no duplicate row; (b) a *different*, valid event
+  lost the seq → the session reloads, re-folds, re-validates, and the event
+  lands at the next free seq (asserted present in the stream, nothing dropped).
+- **Encoding-version replay (NFR-9):** a stream containing rows tagged with the
+  current version Loads and folds correctly; a row carrying an unknown
+  `encoding_version` makes Load error (not silently misdecode); the test fixes
+  the current codec version so a future bump is a deliberate, visible change.
 - **Persist-before-ack (NFR-7):** a forced commit failure returns an error and
   commits NO row (the real-store analogue of `MemStore.FailNextAppend`); the
   pipeline/session do not advance.
@@ -205,7 +269,12 @@ not the §4A wire contract (though proposed to be byte-identical to it).
 
 - [ ] `services/game-server/internal/store` implements `game.EventStore`
       (durable, strict gap-free seq, persist-before-ack) against the chosen store.
-- [ ] Schema + migrations committed; `NewStore` validates connectivity + schema.
+- [ ] Schema + migrations committed; `NewStore` validates connectivity + schema;
+      `game_events` carries `encoding_version` and Load dispatches decoding on it.
+- [ ] A seq collision returns the typed `store.ErrSeqConflict`; the GS-3 session
+      reconciles it (idempotent re-ack vs re-sequence a valid loser) with the §8
+      recovery tests green — a valid move that loses a cross-node race is never
+      dropped (NFR-2).
 - [ ] §8 suite green against a REAL store instance in CI (not just a mock).
 - [ ] The GS-3 session integration tests pass with the real store swapped in for
       `MemStore`.
@@ -227,12 +296,18 @@ not the §4A wire contract (though proposed to be byte-identical to it).
   append, and is replaceable behind the interface at G-E. Alternative: stand up a
   dedicated event-store/log product now (more infra, no F-01 benefit). **Proposed:
   Postgres.** Needs architecture-group sign-off (sub-decision of ADR-10).
-- **Q-GS4B — stored payload encoding — PROPOSED (reuse the §4A codec).** Store
-  each event body using the frozen wire codec (via the Go cgo binding) so stored
-  bytes == wire bytes — replay/audit emit identical frames, one encoding (NFR-10
-  spirit). Alternative: a store-local encoding (e.g. JSONB for queryability).
-  **Proposed: wire codec**; revisit if analytics needs a queryable column (that
-  is the columnar warehouse's job, not the truth store's).
+- **Q-GS4B — stored payload encoding — PROPOSED (reuse the §4A codec, versioned
+  per row).** Store each event body using the frozen wire codec (via the Go cgo
+  binding), tagged with a per-row `encoding_version` (§3.1). For a given version,
+  stored bytes == wire bytes — replay/audit emit identical frames, one encoding
+  (NFR-10 spirit). The version column, **not** that byte-identity, is the
+  durability guarantee: the store outlives any single wire-codec version (NFR-9),
+  so Load must dispatch on the row's version to stay replayable across a future
+  codec change — otherwise old rows become ambiguous and misdecode. GS-4 writes
+  version `1`; a codec evolution adds a value + a decode branch and never
+  rewrites existing rows. Alternative: a store-local encoding (e.g. JSONB for
+  queryability) — rejected; analytics queryability is the columnar warehouse's
+  job (ADR-10), not the truth store's. **Proposed: versioned §4A codec.**
 - **Q-GS4C — atomic multi-event append — PROPOSED (add AppendBatch).** Add
   `AppendBatch(ctx, streamID, []Event) ([]seq, error)` to `game.EventStore` so
   the session commits ClockFlagged+GameEnded (and MovePlayed+GameEnded)
@@ -244,9 +319,19 @@ not the §4A wire contract (though proposed to be byte-identical to it).
   suite against a Postgres service container in the `services` CI job.
   Alternative: an embedded/in-memory PG shim (less faithful). **Proposed: service
   container** so the durability/concurrency tests exercise real transactions.
-- **Q-GS4E — seq assignment — PROPOSED (server-side max+1 in-tx).** Assign seq as
-  `max(seq)+1` within the append transaction, relying on the PK to reject a race.
-  Alternative: the caller passes the expected seq (optimistic concurrency,
-  surfaces conflicts explicitly). **Proposed: server-side in-tx**; the session is
-  single-writer per game (GS-3 actor), so contention is only across nodes, which
-  the PK handles. Revisit if multi-node writers to one stream become possible.
+- **Q-GS4E — seq assignment & conflict recovery — PROPOSED (server-side max+1
+  in-tx; typed error; session reconciles).** Assign seq as `max(seq)+1` within
+  the append transaction, relying on the PK to reject a race. The session is
+  single-writer per game (GS-3 actor), so a conflict is the *across-node* case,
+  not an in-process one. Critically, a rejection is **not** terminal: the store
+  returns a typed `store.ErrSeqConflict` (it cannot itself tell a true duplicate
+  from a valid move that lost the race — identical bytes), and the **GS-3 session
+  actor owns recovery** (§3.2) — reload the head, then idempotent re-ack if its
+  event is already present, or re-fold/re-validate/re-append at the next seq if
+  it is a genuinely new loser, so a valid move is never dropped (NFR-2).
+  Alternative: the caller passes the expected seq (optimistic concurrency) —
+  equivalent, and still needs the same session reconciliation on conflict; the
+  in-tx form keeps the seq source single. **Proposed: server-side in-tx +
+  `ErrSeqConflict` + session-owned reconcile.** Revisit the assignment detail if
+  multi-node writers to one stream become routine (the recovery contract already
+  covers it).
