@@ -22,7 +22,16 @@ use crate::types::{
 /// The canonical v1 game-event set (§3.2, §4A.8). Exactly MASTER §VIII.3 — no
 /// additions. Carries only the event *body*; `seq`/`ts`/`schema_ver`/`stream_id`
 /// live on the [`EventEnvelope`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are derived ONLY for the in-process GS-4a cgo
+/// boundary (the postcard-of-envelope intermediate the Go server hands to the
+/// `pgc_encode_event` seam). That derive encodes a `GameEvent` by serde's
+/// VARIANT INDEX — which is correct for the symmetric intermediate (Rust/Go both
+/// use the same derive) but is NEVER the §4A wire form: the frozen §4A bytes are
+/// produced only by [`crate::codec::encode_event`], which selects the body by the
+/// §4A.9 `type` byte. The two paths are independent; the golden-vector freeze
+/// test proves the §4A encoding is unchanged by this derive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GameEvent {
     /// `pool_id, rated, seats:[{seat_idx,color}], start_fen, time_control`.
     GameCreated {
@@ -93,7 +102,12 @@ impl GameEvent {
 /// Encoding (positional, §4A.8): `stream_id, seq, type, schema_ver, ts, body`.
 /// `type` is derived from `event` on encode and validated against it on decode;
 /// it is not stored twice in this struct (the body IS the typed `GameEvent`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are for the GS-4a cgo boundary only (see
+/// [`GameEvent`]): the postcard bytes of an `EventEnvelope` are the intermediate
+/// the Go server hands across to `pgc_encode_event`. This derive is NOT the §4A
+/// frame — the frame is produced by [`crate::codec::encode_event`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     /// `"game/{uuid}"` (§4A.8). The stream this event belongs to.
     pub stream_id: String,

@@ -378,6 +378,27 @@ pub fn encode_event(env: &EventEnvelope) -> Result<Vec<u8>, CodecError> {
     Ok(out)
 }
 
+/// Serialize a full [`EventEnvelope`] as the GS-4a cgo-boundary **intermediate**
+/// (postcard of the whole envelope struct). This is NOT the §4A frame — it is a
+/// self-contained, in-process byte payload the Go server hands to
+/// `pgc_encode_event` so Rust can rebuild the envelope and call [`encode_event`].
+/// Symmetric with [`decode_envelope_intermediate`]; both sides (Rust seam + the
+/// Go mirror) use the same postcard derive, so field order is the only contract
+/// and it is proven by the GS-4a parity test. Lives here (not in `codec-cgo`) so
+/// the C-ABI crate stays delegate-only (no serialization logic).
+pub fn encode_envelope_intermediate(env: &EventEnvelope) -> Result<Vec<u8>, CodecError> {
+    ser(env)
+}
+
+/// Deserialize a GS-4a cgo-boundary intermediate back to an [`EventEnvelope`].
+/// The inverse of [`encode_envelope_intermediate`]. A malformed intermediate is a
+/// `MalformedPayload` error (the seam maps it to its own `BAD_INTERMEDIATE` code,
+/// distinct from a bad §4A frame).
+pub fn decode_envelope_intermediate(bytes: &[u8]) -> Result<EventEnvelope, CodecError> {
+    postcard::from_bytes::<EventEnvelope>(bytes)
+        .map_err(|e| CodecError::MalformedPayload(e.to_string()))
+}
+
 fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {
     match ev {
         GameEvent::GameCreated {
