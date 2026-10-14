@@ -296,6 +296,150 @@ fn in_domain_result_and_color_still_accepted() {
     }
 }
 
+// --- encode-side domain validation (GS-4a / S1) -----------------------------
+//
+// encode_event must reject the SAME out-of-domain closed-domain values that
+// decode_event rejects, so a durable store built on this seam can never persist
+// an event frame it cannot read back (NFR-9). Before this fix encode_event was
+// permissive while decode_event validated — a write/read asymmetry.
+
+#[test]
+fn out_of_domain_termination_rejected_on_encode() {
+    use pgc_protocol::{encode_event, EventEnvelope, GameEvent};
+    let env = EventEnvelope {
+        stream_id: "game/x".into(),
+        seq: 1,
+        schema_ver: 0,
+        ts: 0,
+        event: GameEvent::GameEnded {
+            result_vector: vec![2, 0],
+            termination: pgc_protocol::Termination(0x00), // 0x00 is reserved/unknown
+        },
+    };
+    assert!(
+        matches!(encode_event(&env), Err(CodecError::MalformedPayload(_))),
+        "encode_event must reject termination 0x00"
+    );
+}
+
+#[test]
+fn out_of_domain_result_rejected_on_encode() {
+    use pgc_protocol::{encode_event, EventEnvelope, GameEvent};
+    let env = EventEnvelope {
+        stream_id: "game/x".into(),
+        seq: 1,
+        schema_ver: 0,
+        ts: 0,
+        event: GameEvent::GameEnded {
+            result_vector: vec![9, 0], // 9 ∉ {0,1,2}
+            termination: pgc_protocol::Termination::MATE,
+        },
+    };
+    assert!(
+        matches!(encode_event(&env), Err(CodecError::MalformedPayload(_))),
+        "encode_event must reject result 9"
+    );
+}
+
+#[test]
+fn out_of_domain_color_rejected_on_encode() {
+    use pgc_protocol::{encode_event, EventEnvelope, GameEvent, PoolId, SeatColor, TimeControlId};
+    let env = EventEnvelope {
+        stream_id: "game/x".into(),
+        seq: 1,
+        schema_ver: 0,
+        ts: 0,
+        event: GameEvent::GameCreated {
+            pool_id: PoolId::from("p"),
+            rated: true,
+            seats: vec![SeatColor {
+                seat_idx: 0,
+                color: 7,
+            }], // 7 ∉ {0,1}
+            start_fen: "f".into(),
+            time_control: TimeControlId::from("tc"),
+        },
+    };
+    assert!(
+        matches!(encode_event(&env), Err(CodecError::MalformedPayload(_))),
+        "encode_event must reject seat color 7"
+    );
+}
+
+// --- GameEvent serde variant-index freeze (GS-4a drift guard) ---------------
+//
+// The GS-4a cgo boundary intermediate encodes a `GameEvent` by its serde VARIANT
+// INDEX (declaration order), and the Go mirror hard-codes those indices
+// (vGameCreated=0 .. vRatingApplied=11). The §4A frame encodes by the explicit
+// `event_type()` byte instead, so the frame-based golden_freeze test does NOT
+// notice a variant REORDER — but a reorder would silently shift the intermediate
+// index and corrupt the Go round-trip. This pins each variant's serde index, so
+// a reorder/insertion fails HERE, at the source, before it reaches GS-4's store.
+#[test]
+fn game_event_serde_variant_index_is_frozen() {
+    use pgc_protocol::types::{PoolId, SeatColor, SeatRating, Termination, TimeControlId};
+    use pgc_protocol::GameEvent;
+
+    // postcard serializes an enum as uvarint(variant_index) ++ body; for indices
+    // 0..=11 the uvarint is a single byte == the index.
+    fn index_of(ev: &GameEvent) -> u8 {
+        postcard::to_allocvec(ev).expect("event serializes")[0]
+    }
+
+    assert_eq!(
+        index_of(&GameEvent::GameCreated {
+            pool_id: PoolId::from("p"),
+            rated: true,
+            seats: vec![SeatColor {
+                seat_idx: 0,
+                color: 0
+            }],
+            start_fen: "f".into(),
+            time_control: TimeControlId::from("tc"),
+        }),
+        0,
+        "GameCreated must be serde variant 0"
+    );
+    assert_eq!(
+        index_of(&GameEvent::PlayerJoined {
+            seat_idx: 0,
+            user_id: "u".into()
+        }),
+        1
+    );
+    assert_eq!(
+        index_of(&GameEvent::MovePlayed {
+            ply: 0,
+            seat_idx: 0,
+            uci: "e2e4".into(),
+            clock_after_ms: 0,
+            server_ts: 0
+        }),
+        2
+    );
+    assert_eq!(index_of(&GameEvent::DrawOffered { seat_idx: 0 }), 3);
+    assert_eq!(index_of(&GameEvent::DrawAccepted { seat_idx: 0 }), 4);
+    assert_eq!(index_of(&GameEvent::Resigned { seat_idx: 0 }), 5);
+    assert_eq!(index_of(&GameEvent::Aborted { by: 0 }), 6);
+    assert_eq!(index_of(&GameEvent::TakebackReq { seat_idx: 0 }), 7);
+    assert_eq!(index_of(&GameEvent::TakebackAccepted { seat_idx: 0 }), 8);
+    assert_eq!(index_of(&GameEvent::ClockFlagged { seat_idx: 0 }), 9);
+    assert_eq!(
+        index_of(&GameEvent::GameEnded {
+            result_vector: vec![],
+            termination: Termination::MATE
+        }),
+        10
+    );
+    assert_eq!(
+        index_of(&GameEvent::RatingApplied {
+            pool_id: PoolId::from("p"),
+            per_seat: Vec::<SeatRating>::new()
+        }),
+        11
+    );
+}
+
 // --- a frame exactly at the cap is accepted (boundary) ----------------------
 
 #[test]

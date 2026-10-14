@@ -75,6 +75,17 @@ ADR-14 DECIDED "one schema-defined binary codec in the shared Rust core" and lef
 
 **ADR-12 "FFI/gRPC boundary or sidecar" read by path:** the codec + engine (hot, per-move, latency-critical) → **in-process FFI (cgo/staticlib)**; a service that scales independently with its own lifecycle (e.g. a heavy analysis/NNUE worker) → gRPC/sidecar. Do not sidecar the move path. **This plan owns the existence + shape of the `codec-cgo` sibling crate and its C-ABI surface** (§2, §4.5); the `services/game-server` spec (OPEN-C4) owns only the *consumption* detail on the Go side — link flags, cross-compile, buffer-ownership rules, and the Go contract test. Its contract test decodes the golden vectors too.
 
+> **Amendment (2026-10-14, GS-4a).** The initial `codec-cgo` surface was
+> `reencode`-shaped only (`pgc_reencode_{client,server,event}`: frame→frame),
+> which serves the hot-path relay but cannot serialize a domain `game.Event` for
+> the durable store. SPEC-S2-GAME-SERVER-GS4A **additively** extends the C-ABI
+> with `pgc_encode_event` (postcard-of-`EventEnvelope` intermediate → canonical
+> §4A frame) and `pgc_decode_event` (the inverse), keeping §4A encoding entirely
+> in Rust (NFR-5). No existing function, byte layout, or golden vector changes;
+> the header stays hand-written (not cbindgen) as it already is. This is the
+> additive seam extension this section anticipates for new store needs, not a
+> change to any §4.5 decision.
+
 **4.6 Wire the CI job.** Add a path-filtered `protocol` job to `.github/workflows/ci.yml` (mirrors the engine job): `cargo test` on `pgc-protocol` + `pgc-protocol-ffi`, and the golden-vector cross-check. Add the web + mobile vector checks as those toolchains are wired.
 
 ## 5. Test strategy (ties to SPEC-S2-PROTOCOL §8)

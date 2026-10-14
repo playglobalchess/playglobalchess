@@ -378,6 +378,27 @@ pub fn encode_event(env: &EventEnvelope) -> Result<Vec<u8>, CodecError> {
     Ok(out)
 }
 
+/// Serialize a full [`EventEnvelope`] as the GS-4a cgo-boundary **intermediate**
+/// (postcard of the whole envelope struct). This is NOT the §4A frame — it is a
+/// self-contained, in-process byte payload the Go server hands to
+/// `pgc_encode_event` so Rust can rebuild the envelope and call [`encode_event`].
+/// Symmetric with [`decode_envelope_intermediate`]; both sides (Rust seam + the
+/// Go mirror) use the same postcard derive, so field order is the only contract
+/// and it is proven by the GS-4a parity test. Lives here (not in `codec-cgo`) so
+/// the C-ABI crate stays delegate-only (no serialization logic).
+pub fn encode_envelope_intermediate(env: &EventEnvelope) -> Result<Vec<u8>, CodecError> {
+    ser(env)
+}
+
+/// Deserialize a GS-4a cgo-boundary intermediate back to an [`EventEnvelope`].
+/// The inverse of [`encode_envelope_intermediate`]. A malformed intermediate is a
+/// `MalformedPayload` error (the seam maps it to its own `BAD_INTERMEDIATE` code,
+/// distinct from a bad §4A frame).
+pub fn decode_envelope_intermediate(bytes: &[u8]) -> Result<EventEnvelope, CodecError> {
+    postcard::from_bytes::<EventEnvelope>(bytes)
+        .map_err(|e| CodecError::MalformedPayload(e.to_string()))
+}
+
 fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {
     match ev {
         GameEvent::GameCreated {
@@ -386,13 +407,29 @@ fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {
             seats,
             start_fen,
             time_control,
-        } => ser(&GameCreatedBody {
-            pool_id: pool_id.clone(),
-            rated: *rated,
-            seats: seats.clone(),
-            start_fen: start_fen.clone(),
-            time_control: time_control.clone(),
-        }),
+        } => {
+            // Validate the frozen closed domain on ENCODE too, so encode and
+            // decode agree: a frame this produces must be one decode_event can
+            // read back (GS-4a / S1 — otherwise the durable store could persist
+            // an un-replayable event, defeating NFR-9). Mirrors the seat-color
+            // check in decode_event_body.
+            if let Some(bad) = seats
+                .iter()
+                .map(|s| s.color)
+                .find(|&c| !crate::types::is_known_color(c))
+            {
+                return Err(CodecError::MalformedPayload(format!(
+                    "seat color 0x{bad:02x} is not a frozen v1 color value (0=white,1=black)"
+                )));
+            }
+            ser(&GameCreatedBody {
+                pool_id: pool_id.clone(),
+                rated: *rated,
+                seats: seats.clone(),
+                start_fen: start_fen.clone(),
+                time_control: time_control.clone(),
+            })
+        }
         GameEvent::PlayerJoined { seat_idx, user_id } => ser(&PlayerJoinedBody {
             seat_idx: *seat_idx,
             user_id: user_id.clone(),
@@ -422,10 +459,22 @@ fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {
         GameEvent::GameEnded {
             result_vector,
             termination,
-        } => ser(&GameEndedBody {
-            result_vector: result_vector.clone(),
-            termination: *termination,
-        }),
+        } => {
+            // Symmetric with decode (GS-4a / S1): reject an out-of-domain
+            // termination or result byte on ENCODE so the store never persists a
+            // GameEnded frame decode_event would reject (NFR-9).
+            if !termination.is_known() {
+                return Err(CodecError::MalformedPayload(format!(
+                    "termination 0x{:02x} is not a frozen v1 value",
+                    termination.value()
+                )));
+            }
+            check_result_vector(result_vector)?;
+            ser(&GameEndedBody {
+                result_vector: result_vector.clone(),
+                termination: *termination,
+            })
+        }
         GameEvent::RatingApplied { pool_id, per_seat } => ser(&RatingAppliedBody {
             pool_id: pool_id.clone(),
             per_seat: per_seat.clone(),

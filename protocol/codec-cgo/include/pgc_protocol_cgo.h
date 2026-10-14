@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 /* Status codes. 0 = success; 1..6 mirror pgc_protocol::CodecError;
+ * 97 = a bad GS-4a boundary intermediate handed to pgc_encode_event;
  * 98 = a null/!0-length-null argument; 99 = a panic caught at the boundary. */
 #define PGC_OK 0
 #define PGC_ERR_TOO_SHORT 1
@@ -29,6 +30,7 @@ extern "C" {
 #define PGC_ERR_WRONG_DIRECTION 4
 #define PGC_ERR_TOO_LARGE 5
 #define PGC_ERR_MALFORMED 6
+#define PGC_ERR_BAD_INTERMEDIATE 97
 #define PGC_ERR_NULL_ARG 98
 #define PGC_ERR_PANIC 99
 
@@ -45,6 +47,19 @@ int32_t pgc_reencode_server(const uint8_t *buf, size_t len,
 /* Decode a stored event and re-encode it. See pgc_reencode_client. */
 int32_t pgc_reencode_event(const uint8_t *buf, size_t len,
                            uint8_t **out, size_t *out_len);
+
+/* GS-4a event seam. pgc_encode_event: IN = the postcard intermediate (an
+ * EventEnvelope the Go server built), OUT = the canonical PROTOCOL-4A event
+ * frame. A bad intermediate returns PGC_ERR_BAD_INTERMEDIATE. Keeps 4A encoding
+ * entirely in Rust (NFR-5). Out-params/ownership as pgc_reencode_client. */
+int32_t pgc_encode_event(const uint8_t *buf, size_t len,
+                         uint8_t **out, size_t *out_len);
+
+/* GS-4a event seam. pgc_decode_event: IN = a stored 4A event frame, OUT = the
+ * postcard intermediate the Go server reads. Inverse of pgc_encode_event. See
+ * pgc_reencode_client for out-params and ownership. */
+int32_t pgc_decode_event(const uint8_t *buf, size_t len,
+                         uint8_t **out, size_t *out_len);
 
 /* Free a buffer handed out by a reencode_* success (same ptr+len). NULL = no-op. */
 void pgc_free(uint8_t *ptr, size_t len);

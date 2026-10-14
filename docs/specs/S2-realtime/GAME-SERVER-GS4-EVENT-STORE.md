@@ -46,7 +46,11 @@ behind the interface; the session, pipeline, and engine seam are unchanged.
   encoding; proposed: reuse the codec, **tagged with a per-item `encoding_version`**
   so stored bytes == wire bytes for that version and the stream stays replayable
   across any future codec evolution (NFR-9 — the version, not the byte-identity,
-  is the guarantee; see §3.1).
+  is the guarantee; see §3.1). **The `game.Event ⇄ §4A bytes` seam this requires
+  is built by the prerequisite slice SPEC-S2-GAME-SERVER-GS4A** (`codec.EncodeEvent`
+  / `codec.DecodeEvent` over the `pgc_encode_event`/`pgc_decode_event` C-ABI) —
+  the pre-GS4a `codec-cgo` surface only re-encoded existing frames and could not
+  serialize a domain `game.Event`.
 - **Atomic terminal append** — the thing that lets GS-4 *remove* GS-3's
   half-terminal recovery window: ClockFlagged+GameEnded (and MovePlayed+GameEnded
   on a terminal move) are committed in a **single `TransactWriteItems`**, so a
