@@ -165,6 +165,19 @@ describing the IN/OUT byte shapes and the shared `pgc_free` ownership. Avoid the
   un-replayable). Tests assert each is `MalformedPayload` on ENCODE, and that
   in-domain values still encode+decode (no over-rejection). The §4A byte layout
   is unchanged — only the previously-missing encode-side guard is added.
+- **Anti-drift between the Go mirror and the Rust enum (two guards).** The Go
+  postcard subset + `game.Event ⇄ EventEnvelope` mapping mirror Rust's derive
+  and the enum's declaration order; a Rust reorder/field-change would otherwise
+  drift silently. Closed by: (1) **a shared-corpus round-trip** — the Go test
+  loads the Rust-generated `protocol/vectors/vectors.json` event frames
+  (regenerated only via `gen_vectors`, guarded by the Rust `golden_freeze`) and
+  round-trips each through the real seam, so a regenerated corpus flows into the
+  Go test with no hand edit and a drifted mirror fails to reproduce the frame;
+  (2) **a Rust serde-variant-index freeze** — pins each `GameEvent` variant's
+  index (which the §4A frame does NOT encode, so `golden_freeze` cannot see a
+  reorder), so a reorder/insertion fails at the source. The hand-copied
+  intermediate fixtures remain only as a readable spec of the postcard shape; the
+  two generated-artifact guards are the authoritative anti-drift net.
 - `cargo test`/`fmt`/`clippy` clean on `codec` + `codec-cgo`; `make test` green
   in the game-server (the Go binding + its parity test).
 
