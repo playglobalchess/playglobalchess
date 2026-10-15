@@ -4,8 +4,8 @@
 |---|---|
 | Spec ID | SPEC-S4-WEB-F01 (first slice of the S4 Web Client stream; implements F-01 on web) |
 | Owner | S4 Web |
-| Status | REVIEW |
-| Version | 0.1 |
+| Status | RATIFIED (owner-approved 2026-10-16; all 5 Q-S4 decided) |
+| Version | 1.0 |
 | Last updated | 2026-10-16 |
 | Implements (master IDs) | F-01 (Play Online, Standard 2-seat), X-2 (via the GS-6 WS edge), X-1 (engine, via the shared codec/wasm), NFR-5 (one codec — the client binds it, never re-implements §4A), NFR-8 (accessibility), NFR-11 (i18n), ADR-9 (web = TypeScript + React), ADR-14 (one shared binary codec), §4A v1.1 (RESYNC/DRAW_OFFERED, ADR-17) |
 | Depends on | GS-6 WS transport (merged), §4A v1.1 (merged), the `codec-wasm` binding (exists). **Carries a prerequisite: a wasm MESSAGE seam (S4a) — see §3.0.** |
@@ -41,10 +41,13 @@ matchmaking, WS transport) is merged.
   single read loop dispatching `ServerMsg` to UI state; a send path building
   `ClientMsg` frames via the seam.
 - A **board component**: render a position from a FEN, show the clock, accept a
-  move by click/drag, and present legal-move affordances. Legal-move UX is driven
-  by the **shared engine via the codec/wasm**, NOT a re-implementation (NFR-5) —
-  the client proposes a UCI move and the server is authoritative; the client may
-  pre-validate for UX only via the engine binding.
+  move by click/drag, and present legal-move affordances. **Built from scratch**
+  (Q-S4d, owner-decided) — no third-party board renderer, so the web client takes
+  on NO third-party UI dependency and there is zero risk of pulling in a JS
+  chess-rules library (NFR-5). Legal-move UX is driven by the **shared engine via
+  the codec/wasm**, NOT a re-implementation (NFR-5) — the client proposes a UCI
+  move and the server is authoritative; the client may pre-validate for UX only
+  via the engine binding.
 - The F-01 loop: SEEK→MATCHED (render board + clocks), MOVE→MOVE_ACCEPTED (apply)
   /MOVE_REJECTED (revert + show reason), opponent moves applied, RESIGN/
   OFFER_DRAW/DRAW_OFFERED/accept, STATE resync on reconnect (RESYNC on demand),
@@ -158,10 +161,11 @@ hard-coded strings.
   revert, game-end) are pure-function tested.
 - **WS client (fake socket):** a fake `WebSocket` feeds frames; assert the client
   builds the right `ClientMsg` frames and reaches the right state — no browser.
-- **e2e (optional for this slice, recommended):** a headless browser (or a node
-  WS client) plays a full game against a locally-run game-server (the GS-6 e2e
-  harness already proves the server side; this proves the real client speaks to
-  the real server). Gated like the other real-dependency tiers.
+- **e2e (nightly, not a per-commit gate — Q-S4d/e decided):** a headless browser
+  (or a node WS client) plays a full game against a locally-run game-server (the
+  GS-6 e2e harness already proves the server side; this proves the real client
+  speaks to the real server). Runs as a nightly against the real-dependency
+  stack, so first-playable is not blocked on CI browser infra.
 - Accessibility: automated axe checks on the board; keyboard-only move entry test.
 - `npm run build` + typecheck (strict) + lint clean; CI job added
   (path-filtered on `clients/web/**` + `protocol/codec-wasm/**`).
@@ -169,7 +173,7 @@ hard-coded strings.
 ## 7. Acceptance criteria (Definition of Done, F-01-web)
 
 - [ ] S4a wasm seam: typed encode/decode for every §4A message, node-parity green
-      against the shared golden corpus. (May be its own PR first — Q-S4a.)
+      against the shared golden corpus. (Its own PR first — Q-S4a decided.)
 - [ ] `clients/web` shell (Vite+React+TS strict, lint, i18n-externalized).
 - [ ] WS client: AUTHENTICATE→SEEK→MATCHED→MOVE→(accepted/rejected)→…→GAME_END,
       server-authoritative, optimistic-with-revert move UX.
@@ -181,26 +185,28 @@ hard-coded strings.
 - [ ] A human can play a full Standard game in a browser against the server
       (demonstrated). Makes no lettered gate green (rated needs G-B + G-C).
 
-## 8. Open questions
+## 8. Open questions — DECIDED (owner-approved 2026-10-16)
 
 - **Q-S4a — S4a (wasm seam) as its own PR first?** Like GS-6a before GS-6.
-  **Proposed: yes** — the wasm seam is a `protocol/codec-wasm` change with its own
-  node-parity gate, reviewed as a codec change; then the client builds on it.
-- **Q-S4b — framework: React vs Svelte.** MASTER §IV lists "React (or Svelte)".
-  **Proposed: React + Vite + TypeScript** — the master's first-named option, the
-  largest ecosystem for a reference client, and TS-strict throughout.
+  **DECIDED: yes, separate PR** — the wasm seam is a `protocol/codec-wasm` change
+  with its own node-parity gate, reviewed as a codec change (its own context-free
+  review); then the client builds on the merged, parity-proven seam.
+- **Q-S4b — framework: React vs Svelte.** MASTER §V.5 lists "React (or Svelte)".
+  **DECIDED: React + Vite + TypeScript (strict)** — the master's first-named
+  option, the largest ecosystem for the reference client, TS-strict throughout.
 - **Q-S4c — auth before X-3.** Same seam as GS-6's `Authenticator`: a dev-token
   input field whose value is sent in AUTHENTICATE; X-3 later replaces it with a
-  real login. **Proposed: dev-token field.**
-- **Q-S4d — board library: build vs adopt.** A board renderer is well-trodden
-  (chessground, react-chessboard). **Proposed:** adopt a permissively-licensed,
-  maintained board renderer for RENDER + interaction only, and drive
-  legality/state from OUR engine+codec (never a JS chess-rules lib — NFR-5 says
-  one rules engine). Pin the exact version. Alternative: build the board from
-  scratch — more control, much more time for no F-01 value. Flagging because it
-  introduces the web client's first third-party UI dependency.
+  real login (one-line swap, no protocol change). **DECIDED: dev-token field.**
+- **Q-S4d — board: build vs adopt.** **DECIDED: build the board from scratch** —
+  render + interaction (click/drag, highlights, coordinates, a11y) hand-built, NO
+  third-party board renderer. Tradeoff accepted: more build time, in exchange for
+  full control over interaction + accessibility, no third-party UI dependency, no
+  license question, and the strongest possible NFR-5 posture (no JS UI lib that
+  could drag in a chess-rules dependency). Legality/state still come from OUR
+  engine+codec; the server stays authoritative. (Recommendation had been to adopt
+  a render-only lib; owner chose build-from-scratch — recorded as decided.)
 - **Q-S4e — e2e against a real server in CI.** Standing up game-server + redis +
-  dynamodb + a headless browser in CI is heavier than the server-side gated
-  tiers. **Proposed:** ship the fake-socket + reducer + node-parity tests as the
-  per-commit gate this slice; add the full browser-vs-server e2e as a follow-up
-  (or a nightly), so first-playable is not blocked on CI browser infra.
+  dynamodb + a headless browser per-commit is heavier than the server-side gated
+  tiers. **DECIDED: nightly for now** — the per-commit gate is fake-socket +
+  reducer + node-parity; the full browser-vs-server e2e runs as a nightly (not a
+  per-commit gate), so first-playable is not blocked on CI browser infra.
