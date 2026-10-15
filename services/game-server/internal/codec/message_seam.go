@@ -97,6 +97,27 @@ type PingPayload struct {
 // ServerMsgType is the discriminant of a server message to encode.
 type ServerMsgType uint8
 
+// Frozen §4A.4 MOVE_REJECTED reason codes (mirrors game.RejectReason and the
+// Rust Reason enum8). Named so callers never scatter magic bytes.
+const (
+	ReasonIllegal     uint8 = 0x01
+	ReasonStalePly    uint8 = 0x02
+	ReasonGameOver    uint8 = 0x03
+	ReasonNotYourTurn uint8 = 0x04
+	ReasonNotYourSeat uint8 = 0x05
+	ReasonUnknownGame uint8 = 0x06
+)
+
+// Frozen §4A.7 ERROR codes (mirrors the Rust ErrorCode enum8).
+const (
+	ECUnsupportedVersion uint8 = 0x01
+	ECProtocolViolation  uint8 = 0x02
+	ECUnknownGame        uint8 = 0x03
+	ECUnauthenticated    uint8 = 0x04
+	ECRateLimited        uint8 = 0x05
+	ECInternal           uint8 = 0x06
+)
+
 // Server message discriminants — serde VARIANT INDEX (declaration order of the
 // ServerMsg enum in message.rs), NOT the §4A.2 type code.
 const (
@@ -215,6 +236,33 @@ func EncodeServer(msg ServerMsg) ([]byte, error) {
 	return callSeam(func(b *C.uint8_t, l C.size_t, o **C.uint8_t, ol *C.size_t) C.int32_t {
 		return C.pgc_encode_server(b, l, o, ol)
 	}, inter)
+}
+
+// EncodeClient serializes a ClientMsg to its canonical §4A client-frame bytes via
+// the Rust seam (pgc_encode_client) — the mirror of DecodeClient. The SERVER
+// never calls this (it only receives client frames); it exists for a CLIENT and
+// for the transport's own end-to-end test, which acts as a client.
+func EncodeClient(msg ClientMsg) ([]byte, error) {
+	inter, err := marshalClientIntermediate(msg)
+	if err != nil {
+		return nil, err
+	}
+	return callSeam(func(b *C.uint8_t, l C.size_t, o **C.uint8_t, ol *C.size_t) C.int32_t {
+		return C.pgc_encode_client(b, l, o, ol)
+	}, inter)
+}
+
+// DecodeServer parses a §4A server-frame to a typed ServerMsg via the Rust seam
+// (pgc_decode_server) — the mirror of EncodeServer. For a CLIENT / the transport
+// e2e test (the server never decodes a server frame in production).
+func DecodeServer(frame []byte) (ServerMsg, error) {
+	inter, err := callSeam(func(b *C.uint8_t, l C.size_t, o **C.uint8_t, ol *C.size_t) C.int32_t {
+		return C.pgc_decode_server(b, l, o, ol)
+	}, frame)
+	if err != nil {
+		return ServerMsg{}, err
+	}
+	return unmarshalServerIntermediate(inter)
 }
 
 // --- ClientMsg intermediate (decode side; marshal provided for the drift test) ---

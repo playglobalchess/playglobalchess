@@ -74,6 +74,16 @@ int32_t pgc_decode_client(const uint8_t *buf, size_t len,
 int32_t pgc_encode_server(const uint8_t *buf, size_t len,
                           uint8_t **out, size_t *out_len);
 
+/* GS-6 client-side mirrors (for a client / the transport e2e test, not the
+ * server hot path). pgc_encode_client: IN = postcard ClientMsg intermediate,
+ * OUT = client->server 4A frame. pgc_decode_server: IN = server->client 4A
+ * frame, OUT = postcard ServerMsg intermediate. Out-params/ownership as
+ * pgc_reencode_client. */
+int32_t pgc_encode_client(const uint8_t *buf, size_t len,
+                          uint8_t **out, size_t *out_len);
+int32_t pgc_decode_server(const uint8_t *buf, size_t len,
+                          uint8_t **out, size_t *out_len);
+
 /* Free a buffer handed out by a reencode_* success (same ptr+len). NULL = no-op. */
 void pgc_free(uint8_t *ptr, size_t len);
 
