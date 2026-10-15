@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 )
 
 // Integration test against a REAL Redis, gated on REDIS_ENDPOINT so it runs in
@@ -184,5 +186,50 @@ func TestRedis_ReadPoolPrunesClaimedExpiredMember(t *testing.T) {
 	}
 	if c, _ := p.rdb.Exists(ctx, claimKey("rpr")).Result(); c != 0 {
 		t.Fatal("stale claim not cleared on prune")
+	}
+}
+
+// F1 against REAL Redis: two compatible seekers via the full Matchmaker,
+// concurrently, must pair into exactly one game (no mutual-miss stall). This
+// exercises the enqueue-before-claim ordering + the Lua atomic claim end to end.
+func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
+	p := redisPool(t)
+	ctx := context.Background()
+	pool := "it-mutual-" + t.Name()
+	defer p.Remove(ctx, pool, "ma", "mb")
+
+	store := game.NewMemStore()
+	m := New(p, store, SeedRatingSource{})
+	m.coin = func() bool { return true }
+
+	var wg sync.WaitGroup
+	matches := make([]bool, 2)
+	seekers := []Seeker{
+		{SeekID: "ma", UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: "mb", UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+	}
+	for i, s := range seekers {
+		wg.Add(1)
+		go func(i int, s Seeker) {
+			defer wg.Done()
+			_, matched, err := m.Seek(ctx, s)
+			if err != nil {
+				t.Errorf("seek %s: %v", s.SeekID, err)
+			}
+			matches[i] = matched
+		}(i, s)
+	}
+	wg.Wait()
+	wins := 0
+	for _, mt := range matches {
+		if mt {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("real-redis concurrent mutual seek: %d matches, want exactly 1 (0 = mutual-miss stall)", wins)
+	}
+	if n := store.StreamCount(); n != 1 {
+		t.Fatalf("real-redis concurrent mutual seek created %d games, want 1", n)
 	}
 }

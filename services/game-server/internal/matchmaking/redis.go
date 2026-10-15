@@ -69,32 +69,60 @@ func (p *RedisPool) Enqueue(ctx context.Context, s Seeker) error {
 
 // readPool loads the current UNCLAIMED waiting seekers for a pool, pruning any
 // pool member whose seek hash has expired (lazy TTL cleanup for ZSET members).
+// Reads are PIPELINED: one ZRANGE, then one pipeline fetching every member's
+// hash + claim-existence in a single round-trip (not 2N serial RTTs — F2), then
+// one pipeline to prune dead members.
 func (p *RedisPool) readPool(ctx context.Context, poolID string) ([]Seeker, error) {
 	ids, err := p.rdb.ZRange(ctx, poolKey(poolID), 0, -1).Result()
 	if err != nil {
 		return nil, fmt.Errorf("matchmaking: redis zrange: %w", err)
 	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// One pipeline: HGETALL + EXISTS(claim) for every member.
+	pipe := p.rdb.Pipeline()
+	hcmds := make([]*redis.MapStringStringCmd, len(ids))
+	ccmds := make([]*redis.IntCmd, len(ids))
+	for i, id := range ids {
+		hcmds[i] = pipe.HGetAll(ctx, seekKey(id))
+		ccmds[i] = pipe.Exists(ctx, claimKey(id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("matchmaking: redis readpool pipeline: %w", err)
+	}
+
 	var out []Seeker
-	for _, id := range ids {
-		// Check the hash FIRST: if it has TTL-expired, the seeker is gone — prune
-		// the lingering ZSET member AND clear any stale claim, regardless of
-		// whether a claim key still lingers (a claim must never shield a
-		// hash-expired member from being reclaimed). This is the lazy TTL cleanup
-		// for ZSET members, which carry no TTL of their own.
-		h, err := p.rdb.HGetAll(ctx, seekKey(id)).Result()
-		if err != nil {
-			return nil, fmt.Errorf("matchmaking: redis hgetall: %w", err)
-		}
+	var deadIDs []string // members whose hash expired — prune below
+	for i, id := range ids {
+		h := hcmds[i].Val()
 		if len(h) == 0 {
-			p.rdb.ZRem(ctx, poolKey(poolID), id)
-			p.rdb.Del(ctx, claimKey(id))
+			// Hash TTL-expired: the seeker is gone. Prune the lingering ZSET
+			// member and any stale claim, regardless of a lingering claim key (a
+			// claim must never shield a dead member — §3 fix).
+			deadIDs = append(deadIDs, id)
 			continue
 		}
-		// Live hash: skip it only if it is currently claimed.
-		if n, _ := p.rdb.Exists(ctx, claimKey(id)).Result(); n > 0 {
-			continue
+		if ccmds[i].Val() > 0 {
+			continue // live but currently claimed — skip
 		}
 		out = append(out, hashToSeeker(id, h))
+	}
+
+	if len(deadIDs) > 0 {
+		// Prune in one pipeline. A prune failure is NOT fatal to the read (the
+		// members are already excluded from `out`), but we surface it rather than
+		// swallow it so orphaned-member cleanup failures are visible (F3). The
+		// error is attached to the successful read as a best-effort signal; the
+		// caller (and, once X-14 lands, a metric) can act on it.
+		prune := p.rdb.Pipeline()
+		for _, id := range deadIDs {
+			prune.ZRem(ctx, poolKey(poolID), id)
+			prune.Del(ctx, claimKey(id))
+		}
+		if _, perr := prune.Exec(ctx); perr != nil && !errors.Is(perr, redis.Nil) {
+			return out, fmt.Errorf("matchmaking: redis prune (read succeeded, %d dead members not reclaimed): %w", len(deadIDs), perr)
+		}
 	}
 	return out, nil
 }

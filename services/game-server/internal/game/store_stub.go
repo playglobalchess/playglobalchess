@@ -107,3 +107,17 @@ func (m *MemStore) Load(ctx context.Context, streamID string) ([]Event, error) {
 	copy(out, src)
 	return out, nil
 }
+
+// StreamCount returns the number of non-empty streams (test support: assert how
+// many games exist without knowing their ids).
+func (m *MemStore) StreamCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, evs := range m.streams {
+		if len(evs) > 0 {
+			n++
+		}
+	}
+	return n
+}

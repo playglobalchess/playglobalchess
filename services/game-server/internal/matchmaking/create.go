@@ -66,7 +66,9 @@ type Matchmaker struct {
 	coin func() bool
 }
 
-// New builds a Matchmaker. rng may be nil (defaults to a time-seeded source).
+// New builds a Matchmaker with the default window and a time-seeded coin for
+// seat/color assignment. Tests override m.coin (and m.now) after construction
+// for determinism — there is no rng parameter.
 func New(pool SeekPool, store game.EventStore, ratings RatingSource) *Matchmaker {
 	if ratings == nil {
 		ratings = SeedRatingSource{}
@@ -84,12 +86,23 @@ func New(pool SeekPool, store game.EventStore, ratings RatingSource) *Matchmaker
 
 // Seek enters a seeker into its pool and attempts an immediate pair. On a pair
 // it creates the game and returns (match, true, nil). With no partner available
-// now it enqueues the seeker and returns (Match{}, false, nil) — NOT an error.
+// now it leaves the seeker enqueued and returns (Match{}, false, nil) — NOT an
+// error.
 //
-// Ordering (Q-MM6, the durability-safe path): TryClaim reserves the pair →
-// createGame AppendBatches the opening stream (durable truth) → Remove finalizes
-// the claim. A crash before the append loses only ephemeral claims (they TTL out
-// and the seekers re-seek); a crash after it leaves a created, reachable game.
+// Ordering matters twice:
+//   - ENQUEUE BEFORE CLAIM (closes the mutual-miss race): if two compatible
+//     seekers A and B arrive concurrently and we claimed before enqueuing, each
+//     could read an empty pool, miss the other, and both sit idle until a third
+//     seek or the TTL. Enqueuing FIRST means a concurrent partner is already
+//     visible; the atomic claim then resolves the "both try to claim each other"
+//     case — exactly one wins the (A,B) claim and creates the game, the loser's
+//     claim fails and it stays enqueued (and is removed by the winner), so a
+//     ready couple always pairs on the second of the two seeks.
+//   - CLAIM → APPEND → REMOVE (Q-MM6, the durability-safe path): createGame
+//     AppendBatches the opening stream (durable truth) BEFORE Remove finalizes
+//     the claim. A crash before the append loses only ephemeral claims (they TTL
+//     out and the seekers re-seek); a crash after it leaves a created, reachable
+//     game.
 func (m *Matchmaker) Seek(ctx context.Context, s Seeker) (Match, bool, error) {
 	if s.SeekID == "" {
 		s.SeekID = uuid.NewString()
@@ -106,15 +119,20 @@ func (m *Matchmaker) Seek(ctx context.Context, s Seeker) (Match, bool, error) {
 		s.Rating = r
 	}
 
+	// Enqueue FIRST so a concurrently-arriving compatible seeker can see us (the
+	// mutual-miss fix). TryClaim excludes our own SeekID, so being in the pool
+	// does not let us claim ourselves.
+	if err := m.pool.Enqueue(ctx, s); err != nil {
+		return Match{}, false, fmt.Errorf("matchmaking: enqueue: %w", err)
+	}
+
 	partner, claimed, err := m.pool.TryClaim(ctx, s, m.window, m.now())
 	if err != nil {
 		return Match{}, false, fmt.Errorf("matchmaking: claim: %w", err)
 	}
 	if !claimed {
-		// No partner now — join the waiting set and wait for a counter-seek.
-		if err := m.pool.Enqueue(ctx, s); err != nil {
-			return Match{}, false, fmt.Errorf("matchmaking: enqueue: %w", err)
-		}
+		// No partner now — remain enqueued; a counter-seek (or a concurrent
+		// arrival that won its own claim) will pair us.
 		return Match{}, false, nil
 	}
 

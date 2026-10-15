@@ -183,6 +183,41 @@ func TestSeek_CreateFailureReleasesClaims(t *testing.T) {
 	}
 }
 
+// Two compatible seekers arriving CONCURRENTLY must pair — not both miss and
+// stall (the mutual-miss race, F1). With enqueue-before-claim + the atomic
+// claim, exactly one Seek creates the game; the other is consumed into it.
+func TestSeek_ConcurrentMutualPair(t *testing.T) {
+	m, _, store := newTestMatchmaker(t, true)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	matches := make([]bool, 2)
+	seekers := []Seeker{seeker("sa", "alice"), seeker("sb", "bob")}
+	for i, s := range seekers {
+		wg.Add(1)
+		go func(i int, s Seeker) {
+			defer wg.Done()
+			_, matched, err := m.Seek(ctx, s)
+			if err != nil {
+				t.Errorf("seek %s: %v", s.SeekID, err)
+			}
+			matches[i] = matched
+		}(i, s)
+	}
+	wg.Wait()
+	wins := 0
+	for _, mt := range matches {
+		if mt {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("concurrent mutual seek: %d matches reported, want exactly 1 (0 = mutual-miss stall)", wins)
+	}
+	if n := store.StreamCount(); n != 1 {
+		t.Fatalf("concurrent mutual seek created %d games, want exactly 1", n)
+	}
+}
+
 var errForced = &forcedErr{}
 
 type forcedErr struct{}
