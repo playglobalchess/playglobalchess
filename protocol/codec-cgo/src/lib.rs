@@ -295,6 +295,49 @@ pub unsafe extern "C" fn pgc_encode_server(
     })
 }
 
+/// GS-6: encode a client→server §4A frame FROM the postcard `ClientMsg`
+/// intermediate — the mirror of [`pgc_decode_client`]. The server itself never
+/// encodes a client frame, but a CLIENT (and the transport's own end-to-end
+/// test, which acts as one) does. IN = postcard(ClientMsg); OUT = §4A client
+/// frame. Keeps §4A encoding in Rust (NFR-5). Malformed intermediate →
+/// `PGC_ERR_BAD_INTERMEDIATE`; §4A encode failure → `code_of`.
+///
+/// # Safety
+/// Same contract as [`pgc_reencode_client`].
+#[no_mangle]
+pub unsafe extern "C" fn pgc_encode_client(
+    buf: *const u8,
+    len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    boundary_impl(buf, len, out, out_len, |b| {
+        let msg =
+            pgc_protocol::decode_client_intermediate(b).map_err(|_| PGC_ERR_BAD_INTERMEDIATE)?;
+        pgc_protocol::encode_client(&msg).map_err(|e| code_of(&e))
+    })
+}
+
+/// GS-6: decode a server→client §4A frame to the postcard `ServerMsg`
+/// intermediate — the mirror of [`pgc_encode_server`]. For a CLIENT (and the
+/// transport e2e test). IN = §4A server frame; OUT = postcard(ServerMsg).
+/// A bad §4A frame → `code_of`.
+///
+/// # Safety
+/// Same contract as [`pgc_reencode_client`].
+#[no_mangle]
+pub unsafe extern "C" fn pgc_decode_server(
+    buf: *const u8,
+    len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    boundary_impl(buf, len, out, out_len, |b| {
+        let msg = pgc_protocol::decode_server(b).map_err(|e| code_of(&e))?;
+        pgc_protocol::encode_server_intermediate(&msg).map_err(|e| code_of(&e))
+    })
+}
+
 /// Free a buffer previously handed out by a `pgc_reencode_*` call. Must be
 /// called exactly once per successful call, with the SAME `ptr` and `len` that
 /// call wrote. A null `ptr` is a no-op.

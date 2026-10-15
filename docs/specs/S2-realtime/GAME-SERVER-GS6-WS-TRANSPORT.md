@@ -4,11 +4,11 @@
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS6 (implementation slice of SPEC-S2-GAME-SERVER §3.5/§3.6/§3.1) |
 | Owner | S2 Real-time |
-| Status | REVIEW |
+| Status | RATIFIED |
 | Version | 0.1 |
 | Last updated | 2026-10-15 |
 | Implements (master IDs) | X-2, F-01 (Play Online end-to-end), F-01.5 (reconnection), NFR-7 (persist-before-ack), NFR-5, ADR-12, ADR-14/15 (codec over cgo) |
-| Depends on | GS-1/2/3 (session + pipeline + engine legality), GS-4 (durable store), GS-5 (matchmaking), the codec seam (frames + the GS-6a message seam below). All merged except the GS-6a prerequisite. |
+| Depends on | GS-1/2/3 (session + pipeline + engine legality), GS-4 (durable store), GS-5 (matchmaking), GS-3b (resign/abort/draw session commands), the codec seam incl. the GS-6a message seam. **All merged** (GS-6a = PR #51; GS-3b = PR #53). |
 | Gates it feeds | **The first chunk after which a move travels browser→server→browser** — the F-01 vertical slice's transport. Does NOT by itself make a lettered gate green (a *rated* game still needs G-B anti-cheat + G-C rating). |
 
 > **The milestone chunk — but it carries a codec-seam prerequisite (GS-6a).**
@@ -103,14 +103,24 @@ WS). Teardown unbinds the seat; the game is untouched (it lives in the store).
 
 ### 3.2 Dispatch & matchmaking
 
-- `SEEK` → `matchmaker.Seek(ctx, seeker)`. On a `Match`, the transport looks up
-  BOTH seats' connections (its seat→conn registry) and sends `MATCHED{start_state}`
-  to each, then constructs/attaches the GS-3 live `Session` for the game.
+- `SEEK` → `matchmaker.Seek(ctx, seeker)`. On a `Match`, the transport delivers
+  `MATCHED{start_state}` to BOTH seats by looking up each player's connection in
+  a `userID → conn` map (bound at AUTHENTICATE) — NOT a seat→conn map, because
+  the already-waiting seeker's handler has already returned (enqueued), so it must
+  be reached by user id, not through its own goroutine. The transport then
+  `GetOrCreate`s the game's live `Session` via the **`Registry`** (the node's live
+  set of sessions keyed by game id; builds from the durable stream on first touch,
+  §6.3 no node affinity).
 - `MOVE` → the seat's `Session.SubmitMove`; the session's outcome
   (`MoveAccepted`/`MoveRejected`/flag→`GameEnd`) is encoded and sent. Persist
   happens inside the pipeline BEFORE the ack (NFR-7) — the transport sends only
   after `SubmitMove` returns success.
-- `RESIGN`/`ABORT`/`OFFER_DRAW`/`TAKEBACK` → the matching `Session` command.
+- `RESIGN`/`ABORT`/`OFFER_DRAW`/`TAKEBACK` → the matching **GS-3/GS-3b `Session`
+  command** (`Resign`/`Abort`/`OfferDraw`/`Takeback`; `AcceptDraw` is reached via
+  a second `OFFER_DRAW` from the other seat — §4A has no distinct accept code, so
+  the session's mutual-offer path turns it into the agreement). A command's
+  typed error (`ErrAbortTooLate`/`ErrNoDrawToAccept`/`ErrGameNotLive`) maps to a
+  `MOVE_REJECTED`/`ERROR` reply.
 
 ### 3.3 Move hot path & persist-before-ack
 
@@ -120,21 +130,79 @@ persist-before-ack and seq-conflict recovery (GS-4); the transport must not ack 
 MOVE until `SubmitMove` returns, and must send the EXACT authoritative fields the
 session returns (never a client-asserted clock/result).
 
-### 3.4 Reconnection & clock-aware forfeit (§3.5)
+### 3.4 Reconnection & clock-aware forfeit (§3.5) — server-push, Option A
 
-A reconnecting client re-`AUTHENTICATE`s and sends its last `ply`; the server
-builds (or finds) the `Session` from the durable stream and replies
-`STATE{fen,turn,clocks}` — authoritative, any node (GS-3 folds from GS-4). The
+§4A has NO client resync/state-request message (`STATE` is server→client only),
+so reconnection is **server-initiated**: on a successful (re-)`AUTHENTICATE`, the
+server looks up any live game the user is seated in (a `userID → game` index,
+populated at MATCHED), rebinds that seat to the NEW connection, and pushes
+`STATE{fen,turn,clocks}` folded from the durable stream (authoritative; any node,
+GS-3 folds from GS-4). The client sends nothing to trigger this — the earlier
+"sends its last ply" wording was vestigial and is corrected here. The
 disconnected seat's clock keeps running; the timer-driven `TickFlagCheck` ends the
-game `FLAG` (or `TIMEOUT_VS_INSUFFICIENT`, the engine's call) if it flags first. A
-shorter pre-first-move abort window applies (config). The MATCHED-but-never-joined
-case (GS-5 ghost-claim residual) uses the same join-timeout → abort path.
+game `FLAG` (or `TIMEOUT_VS_INSUFFICIENT`) if it flags first. The
+MATCHED-but-never-joined case (GS-5 ghost-claim residual) uses the join-timeout →
+abort path.
 
-### 3.5 Heartbeat & teardown
+### 3.5 Heartbeat, flag-forfeit & teardown
 
-`PING{t}` → `PONG{t, server_t}` (liveness + RTT). A connection silent past the
-heartbeat window is closed; its seat is unbound but the game persists and the
-clock keeps running (reconnect window applies).
+The transport drives the idle/disconnect **forfeit** path, which GS-3 delegates
+to the caller ("the session does not own a ticker", Q-GS3C): a per-game flag
+ticker calls `Session.TickFlagCheck` every `flagInterval` (config, default 1s),
+charging elapsed-since-last-move against the side to move; if that flags, the
+session ends the game (`FLAG` / `TIMEOUT_VS_INSUFFICIENT`) and the transport
+broadcasts `GAME_END` to both seats. The ticker is armed at MATCHED and exits
+when the game is gone (ended by any path), so there is exactly one driver per
+live game and it stops with the game — this is also what reclaims a game whose
+players both disconnect (the session + goroutines + indices are freed, not
+leaked). Without this driver a disconnected or stalled player's clock would run
+forever and the game would hang; it is NOT a deferred limitation.
+
+`PING{t}` → `PONG{t, server_t}` (liveness + RTT). On close, the connection's
+seat is unbound (via `unbindAll`, which only drops bindings still pointing at
+that connection, so a reconnect's rebind survives) but the game persists and its
+clock keeps running under the flag ticker (reconnect window applies).
+
+### 3.6 Client-mirror codec seam (added in this slice)
+
+The GS-6a seam gave Go `DecodeClient`/`EncodeServer` (the server's directions).
+This slice adds the mirror — `codec.EncodeClient` / `codec.DecodeServer`, backed
+by new cgo `pgc_encode_client` / `pgc_decode_server` — which the SERVER never
+uses (it only receives client frames and sends server frames) but a CLIENT and
+the transport's own end-to-end test (which acts as a client) do. Additive C-ABI,
+§4A bytes unchanged.
+
+### 3.8 Observability (deferred to X-14) & dependency notes
+
+The transport is deliberately logger-free, like the GS-1 pipeline (GS-4 F2): the
+server-side failure points — `deliverMatched` session-build failure,
+`handleMove` persist failure, `send`'s write error, the flag ticker's
+`TickFlagCheck` error (now bounded-retry), and `dropGame` — each produce a client
+`ERROR` but NO operator signal today. These are the X-14 punch-list: wire a
+log/metric at each when the observability stack lands, rather than scattering
+ad-hoc logging now that X-14 would have to unify. Named here so the list is not
+lost.
+
+WS library: `github.com/coder/websocket` (the maintained successor to the
+archived `nhooyr.io/websocket` — same codebase, API-compatible; migrated in this
+slice while the import is isolated to one file behind the `Conn` interface,
+Q-GS6a).
+
+### 3.7 Known v1 limitations (frozen-§4A consequences)
+
+Two gaps fall out of the frozen §4A message set, recorded honestly rather than
+worked around with an invented frame; both are slated for a deliberate §4A v1.1
+amendment slice (see §10):
+
+- **Reconnection is server-push-on-auth, not client-requestable** (§3.4): §4A has
+  no `RESYNC` client code, so a client cannot ask for STATE on demand.
+- **A pending (non-ending) draw OFFER is not push-notified**: §4A has no
+  `DRAW_OFFERED` server code, so when a first `OFFER_DRAW` does not immediately
+  end the game, the opponent is not proactively told. The offer IS recorded
+  (GS-3b `drawOfferBy` + the `DrawOffered` event) and IS acceptable (the
+  opponent's own `OFFER_DRAW` triggers the agreement) — it is only the
+  notification that has no v1 frame. Agreed draws, resign, and abort all notify
+  both seats via `GAME_END`.
 
 ## 4. Interfaces & contracts
 
@@ -215,6 +283,23 @@ clock keeps running (reconnect window applies).
       needs G-B (anti-cheat) + G-C (rating). Stated in the PR.
 
 ## 10. Open questions
+
+> **Resolution status (this slice is RATIFIED + implemented):** Q-GS6a =
+> nhooyr.io/websocket behind the `Conn` interface. Q-GS6b = GS-6a landed as its
+> own PR (#51). Q-GS6c = `Authenticator` seam + `DevAuthenticator`. Q-GS6d =
+> web client DEFERRED to S4 (GS-6 e2e uses in-process fake clients). Q-GS6e =
+> reconnect/abort windows are config (`Server.joinTTL`, session `AbortBeforePly`).
+> NEW seam added: a `TimeControlResolver` (dev `ConventionResolver` parses
+> `blitz-5+3`/`custom-…`/`daily-…`) stands in until the REST `GET /v1/pools`
+> expansion (X-13) lands — same placeholder-behind-a-seam pattern as the others.
+>
+> **QUEUED next: §4A v1.1 amendment slice.** The two v1 limitations in §3.7 (no
+> client `RESYNC`, no server `DRAW_OFFERED`) are closed by a deliberate,
+> owner-approved §4A amendment (new ADR, two message codes, codec + GS-6a-style
+> seam + golden/parity) — timed BEFORE the web client freezes behavior against
+> v1, so the freeze window (open while there are zero deployed clients) is used
+> once and deliberately rather than eroded.
+
 
 - **Q-GS6a — WS library.** `nhooyr.io/websocket` (modern, context-aware, smaller)
   vs `gorilla/websocket` (ubiquitous, battle-tested). **Proposed:
