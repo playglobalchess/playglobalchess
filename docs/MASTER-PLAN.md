@@ -684,6 +684,62 @@ portable, but heavier ops than serverless DynamoDB for a greenfield team.
 
 **Unblocks.** SPEC-S2-GAME-SERVER-GS4 (Q-GS4A resolved) and the GS-4 build.
 
+## ADR-17 (new) · §4A protocol v1.1 — additive `RESYNC` + `DRAW_OFFERED` messages · **PROPOSED (awaiting owner approval)**
+
+> Amends the frozen SPEC-S2-PROTOCOL §4A wire contract (G-D) with two ADDITIVE
+> message codes. Surfaced by SPEC-S2-GAME-SERVER-GS6, whose transport exposed two
+> gaps the frozen v1.0 message set cannot express. Per PROTOCOL §4.2, a post-G-D
+> wire change is a new protocol version and requires both-affected-streams +
+> architecture-group review — recorded here as that decision. **NOT yet owner-approved.**
+
+**Context.** The GS-6 WS transport (merged) is complete for the F-01 move loop,
+but surfaced two things the frozen §4A v1.0 message set has no frame for:
+1. **No client resync request.** `STATE` (0x84) is server→client only, and there
+   is no `C→S` code to ASK for it, so GS-6 had to make reconnection
+   server-push-only (STATE auto-sent on AUTHENTICATE, Option A). A client cannot
+   request a fresh snapshot on demand (after a UI glitch, a suspected desync).
+2. **No pending-draw-offer notification.** The server set has `GAME_END` for an
+   *agreed* draw but no `DRAW_OFFERED`, so when a first `OFFER_DRAW` does not end
+   the game the opponent is not proactively told (the offer is recorded and
+   acceptable, just invisible until a STATE/UI convention surfaces it).
+
+**Decision (proposed).** Add two codes, both in currently-reserved slots so NO
+existing code moves (the frozen golden-vector corpus for v1.0 stays valid; this
+is additive, not a reordering):
+- **`RESYNC` — client→server, `0x0A`** — `{game_id: str}`. The client asks for a
+  fresh `STATE` for a game it is seated in; the server replies with the
+  authoritative `STATE` (same fold path as the Option-A auto-push). Server-push
+  on AUTHENTICATE stays — RESYNC is the on-demand complement.
+- **`DRAW_OFFERED` — server→client, `0x87`** — `{game_id: str, by: u8}`. Pushed
+  to the opponent when a first (non-ending) `OFFER_DRAW` is recorded, so a pending
+  offer is a first-class notification, not a UI inference.
+
+Framed **§4A v1.1** (major `ver` stays `0x01`; minor-additive). Safe within v1
+because all three clients bind the ONE shared Rust codec (ADR-9/NFR-10) and
+upgrade with it — there is no "old client with a different codec" in v1 (and no
+client deployed yet), so the archived-contract concern the codec's
+error-on-unknown-type would otherwise raise does not arise. The window is used
+once, deliberately, BEFORE the S4 web client freezes behavior against v1.0 — not
+eroded by repeated amendment.
+
+**Scope / boundary.** Pins ONLY these two additive codes + their payloads. Does
+NOT reopen the frozen value tables (reason/termination/error/event enums), the
+frame envelope, or the event-store schema. Not a variant extension (that is the
+deferred `PROTOCOL-VARIANTS.md`). Not a `ver` major bump.
+
+**Alternatives rejected.** *Keep v1.0 frozen, live with the two gaps* — leaves
+reconnection un-requestable and draw offers unnotified on a product meant to rival
+servers that have both; the gaps are small now but calcify once a client ships.
+*A `ver` 2 major bump* — overkill for two additive codes that break nothing.
+*Carry a "pending offer" flag inside the STATE body instead of a DRAW_OFFERED
+frame* — overloads STATE's resync meaning and still needs a client to poll STATE
+to see an offer; a dedicated push is cleaner.
+
+**Unblocks.** The §4A v1.1 implementation slice (codec `ClientMsg::Resync` /
+`ServerMsg::DrawOffered` + encode/decode + regenerated golden vectors + the
+GS-6a/GS-6 seam extension + the transport wiring: RESYNC→STATE, push DRAW_OFFERED
+on a pending offer) and the mobile parity re-run.
+
 ### ADR summary
 
 
@@ -705,6 +761,7 @@ portable, but heavier ops than serverless DynamoDB for a greenfield team.
 | ADR-14 | new | One schema-defined binary wire codec in the shared Rust core | **DECIDED** | S2/S4/S5 |
 | ADR-15 | new | Go↔Rust via one uniform in-process cgo/staticlib C-ABI (a `<crate>-cgo` sibling per consumed crate) | **DECIDED** | S2/S1 + Architecture |
 | ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
+| ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **PROPOSED** (awaiting owner approval) | S2 + Architecture |
 
 ---
 
