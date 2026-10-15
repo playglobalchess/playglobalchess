@@ -87,5 +87,3 @@ func (s *Server) ListenAndServe(addr, path string) error {
 	}
 	return srv.ListenAndServe()
 }
-
-var _ context.Context // keep context imported for the Conn interface signatures

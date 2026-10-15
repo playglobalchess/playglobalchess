@@ -16,6 +16,11 @@ import (
 // a just-expired seeker whose connection never joins). Config via Server.joinTTL.
 const defaultJoinTTL = 30 * time.Second
 
+// defaultFlagInterval is how often the per-game flag ticker charges idle time
+// against the side to move (§3.4). 1s is well under any real time control's
+// resolution for forfeit purposes while being cheap (one actor command/game/sec).
+const defaultFlagInterval = 1 * time.Second
+
 // --- SEEK -> matchmaking -> MATCHED ----------------------------------------
 
 func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec.SeekPayload) bool {
@@ -92,6 +97,41 @@ func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match
 		}})
 	}
 	s.armJoinTimeout(match.GameID)
+	s.armFlagTicker(match.GameID)
+}
+
+// armFlagTicker starts the per-game idle/disconnect FORFEIT driver (§3.4). GS-3's
+// session does not own a ticker — "the transport/scheduler calls TickFlagCheck on
+// a timer" — so the transport must drive it, or a disconnected/stalled player's
+// clock runs forever and the game hangs (and its session/goroutines leak). Every
+// flagInterval it charges elapsed time against the side to move; if that flags,
+// the session ends the game (FLAG / TIMEOUT_VS_INSUFFICIENT) and we broadcast
+// GAME_END + drop. The ticker also exits when the game is gone (ended by any
+// other path: mate/resign/draw/abort), so there is exactly one driver per live
+// game and it stops with the game.
+func (s *Server) armFlagTicker(gameID string) {
+	iv := s.flagInterval
+	if iv == 0 {
+		iv = defaultFlagInterval
+	}
+	go func() {
+		t := time.NewTicker(iv)
+		defer t.Stop()
+		for range t.C {
+			sess, ok := s.reg.Get(gameID)
+			if !ok {
+				return // game ended/dropped by some path — stop the ticker.
+			}
+			ended, err := sess.TickFlagCheck(context.Background())
+			if err != nil {
+				continue // transient; try again next tick.
+			}
+			if ended {
+				s.broadcastGameEnd(context.Background(), gameID)
+				return
+			}
+		}
+	}()
 }
 
 // registerJoin creates the game's joined signal channel if absent (open =

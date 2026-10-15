@@ -144,12 +144,24 @@ game `FLAG` (or `TIMEOUT_VS_INSUFFICIENT`) if it flags first. The
 MATCHED-but-never-joined case (GS-5 ghost-claim residual) uses the join-timeout →
 abort path.
 
-### 3.5 Heartbeat & teardown
+### 3.5 Heartbeat, flag-forfeit & teardown
 
-`PING{t}` → `PONG{t, server_t}` (liveness + RTT). A connection silent past the
-heartbeat window is closed; its seat is unbound (via `unbindAll`, which only drops
-bindings still pointing at that connection, so a reconnect's rebind survives) but
-the game persists and the clock keeps running (reconnect window applies).
+The transport drives the idle/disconnect **forfeit** path, which GS-3 delegates
+to the caller ("the session does not own a ticker", Q-GS3C): a per-game flag
+ticker calls `Session.TickFlagCheck` every `flagInterval` (config, default 1s),
+charging elapsed-since-last-move against the side to move; if that flags, the
+session ends the game (`FLAG` / `TIMEOUT_VS_INSUFFICIENT`) and the transport
+broadcasts `GAME_END` to both seats. The ticker is armed at MATCHED and exits
+when the game is gone (ended by any path), so there is exactly one driver per
+live game and it stops with the game — this is also what reclaims a game whose
+players both disconnect (the session + goroutines + indices are freed, not
+leaked). Without this driver a disconnected or stalled player's clock would run
+forever and the game would hang; it is NOT a deferred limitation.
+
+`PING{t}` → `PONG{t, server_t}` (liveness + RTT). On close, the connection's
+seat is unbound (via `unbindAll`, which only drops bindings still pointing at
+that connection, so a reconnect's rebind survives) but the game persists and its
+clock keeps running under the flag ticker (reconnect window applies).
 
 ### 3.6 Client-mirror codec seam (added in this slice)
 

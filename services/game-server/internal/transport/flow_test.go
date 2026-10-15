@@ -314,3 +314,50 @@ func TestTakebackPushesStateToBoth(t *testing.T) {
 		t.Fatalf("takeback STATE game mismatch: %s / %s", stW.State.GameID, stB.State.GameID)
 	}
 }
+
+// TestFlagForfeitOnIdle is the regression for the missing TickFlagCheck driver:
+// a joined game whose side-to-move simply stops (or disconnects) must be ended
+// by the transport's flag ticker when its clock expires — the core clocked-chess
+// forfeit rule (§3.4), which GS-3 delegates to the caller. Uses a tiny clock
+// (custom-80+0 = 80ms base, 0 increment) and a short flag interval so idle time
+// flags quickly. Both seats must receive GAME_END{FLAG}.
+func TestFlagForfeitOnIdle(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	h.srv.flagInterval = 20 * time.Millisecond
+	ctx := context.Background()
+
+	// Pair two conns on a tiny-clock pool so the first idle period flags.
+	ca := newFakeConn()
+	cb := newFakeConn()
+	h.handle(ctx, ca)
+	h.handle(ctx, cb)
+	seekTC(t, ca, "alice", "tiny")
+	time.Sleep(20 * time.Millisecond)
+	seekTC(t, cb, "bob", "tiny")
+	ca.waitForServer(t, codec.SMMatched, 2*time.Second)
+	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+
+	// Neither side moves. White's clock (80ms) runs out; the flag ticker ends it.
+	geA := ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	geB := cb.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	// Termination is FLAG(0x03) or TIMEOUT_VS_INSUFFICIENT(0x0A) — either is a
+	// valid clock-expiry ending from the start position (engine decides).
+	okTerm := func(x uint8) bool { return x == 0x03 || x == 0x0A }
+	if !okTerm(geA.GameEnd.Termination) || !okTerm(geB.GameEnd.Termination) {
+		t.Fatalf("termination = 0x%02x/0x%02x, want FLAG(0x03) or TIMEOUT_VS_INSUFFICIENT(0x0A)", geA.GameEnd.Termination, geB.GameEnd.Termination)
+	}
+	// The game is reclaimed (session dropped) — no leaked live session.
+	time.Sleep(30 * time.Millisecond)
+	if _, ok := h.srv.reg.Get(geA.GameEnd.GameID); ok {
+		t.Fatal("session not dropped after flag forfeit — leak")
+	}
+}
+
+// seekTC authenticates and seeks with an explicit time-control id (for the
+// tiny-clock flag test). The pool name doubles as the pool id.
+func seekTC(t *testing.T, c *fakeConn, userID, pool string) {
+	t.Helper()
+	c.feedClient(t, codec.ClientMsg{Type: codec.CMAuthenticate, Authenticate: &codec.AuthenticatePayload{Token: userID}})
+	c.feedClient(t, codec.ClientMsg{Type: codec.CMSeek, Seek: &codec.SeekPayload{PoolID: pool, TimeControl: "custom-80+0", Rated: false}})
+}

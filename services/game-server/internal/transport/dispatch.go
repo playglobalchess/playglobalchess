@@ -2,8 +2,6 @@ package transport
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"sync"
 	"time"
 
@@ -22,6 +20,10 @@ type Server struct {
 	reg     *Registry
 	now     func() time.Time
 	joinTTL time.Duration // join-timeout window (GS-5 ghost-claim close); 0 = default
+	// flagInterval is how often the per-game flag ticker calls TickFlagCheck (the
+	// idle/disconnect forfeit path §3.4 — GS-3 delegates the ticker to the caller,
+	// "the session does not own a ticker"). 0 = default.
+	flagInterval time.Duration
 
 	mu    sync.Mutex
 	conns map[gameSeAT]Conn // (gameID, seatIdx) → the connection seated there
@@ -312,6 +314,3 @@ func gameEndMsg(gameID string, rv []game.Result, term game.Termination) codec.Se
 		RatingDelta: nil,
 	}}
 }
-
-var _ = errors.Is // reserved for sentinel mapping in handleMove/handleEnding
-var _ = fmt.Sprintf
