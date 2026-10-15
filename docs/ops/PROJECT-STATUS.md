@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-10-13 |
+| Last updated | 2026-10-16 |
 | Phase | **P0 foundations** — G-A (engine) GREEN. The three G-D contract specs are all **RATIFIED**: SPEC-S2-PROTOCOL (WS + event store + entity shape) + SPEC-PE-API-CONTRACT (REST) + SPEC-S3-DATA-MODEL. ADR-14 (wire codec) DECIDED; PLAN-S2-CODEC **v1.1 RATIFIED**. The wire codec is **COMPLETE** across all five consumers (Rust/iOS/Android/web/Go), CI-gated. `services/game-server` (X-2, Go, ADR-12) is now being built chunk by chunk (see Game-server progress below). |
-| Next step | Continue `services/game-server` toward the F-01 vertical slice. GS-1 (lifecycle + clock) and GS-2 (engine-cgo legality seam) are done; the dependency-correct next chunks are the **live in-memory game session** (holds `CurFEN` + the folded Zobrist history — **owns Q-GS5 repetition wiring**), the **real event store** (ADR-10, replaces the GS-1 in-memory stub), then **matchmaking** (§3.4) + **reconnection** (§3.5) + the **WS transport** — after which the F-01 end-to-end slice (match→play→end→rating) can be proven on web. All implementation spec-first/approval-gated. G-D freeze still needs SPEC-S2-PROTOCOL + SPEC-PE-API-CONTRACT jointly (Q-P1). |
+| Next step | **Build the S4 web client (SPEC-S4-WEB-F01, RATIFIED #57) — the first human-playable browser client (F-01).** The whole server spine of F-01 is merged + green: GS-1/2/3 live session, GS-3b resign/abort/draw, GS-4 DynamoDB event store, GS-4a/GS-6a codec seams, GS-5 Redis matchmaking, GS-6 WS transport; §4A protocol is v1.1 (RESYNC 0x0A + DRAW_OFFERED 0x87, ADR-17); and **S4a (the typed wasm message seam) is MERGED (#58)**. The web client is now unblocked. Build order: `clients/web` Vite+React+TS-strict shell → GameSocket binary-WS client → board **from scratch** (Q-S4d) → server-authoritative optimistic-with-revert moves → STATE/RESYNC reconnection → a11y+i18n → fake-socket+reducer tests + the path-filtered CI job. All implementation spec-first/approval-gated + context-free adversarial review on load-bearing chunks. After S4: rating service (G-C) + anti-cheat (G-B) for the first RATED game. (G-D freeze still needs SPEC-S2-PROTOCOL + SPEC-PE-API-CONTRACT jointly per Q-P1.) |
 
 ## Codec progress (ADR-14 / PLAN-S2-CODEC) — toward G-D
 
