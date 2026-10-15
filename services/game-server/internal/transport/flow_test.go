@@ -361,3 +361,51 @@ func seekTC(t *testing.T, c *fakeConn, userID, pool string) {
 	c.feedClient(t, codec.ClientMsg{Type: codec.CMAuthenticate, Authenticate: &codec.AuthenticatePayload{Token: userID}})
 	c.feedClient(t, codec.ClientMsg{Type: codec.CMSeek, Seek: &codec.SeekPayload{PoolID: pool, TimeControl: "custom-80+0", Rated: false}})
 }
+
+// TestSingleGameEndNoDoubleFire is the regression for the broadcastGameEnd
+// double-fire: a game ending by a terminal move while the flag ticker is also
+// live must send EXACTLY ONE GAME_END to each seat (claimGameEnd latches the
+// broadcast). We use a short flag interval so the ticker is active during the
+// mating move, then assert each conn received exactly one GAME_END.
+func TestSingleGameEndNoDoubleFire(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	h.srv.flagInterval = 15 * time.Millisecond
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	// Scholar's mate.
+	moves := []struct {
+		c   *fakeConn
+		ply uint32
+		uci string
+	}{
+		{white, 1, "e2e4"}, {black, 2, "e7e5"},
+		{white, 3, "f1c4"}, {black, 4, "b8c6"},
+		{white, 5, "d1h5"}, {black, 6, "g8f6"},
+		{white, 7, "h5f7"},
+	}
+	for _, m := range moves {
+		move(t, m.c, gameID, m.ply, m.uci)
+		m.c.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	}
+	white.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	black.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	// Give any racing flag-tick broadcast a chance to (wrongly) fire a second one.
+	time.Sleep(60 * time.Millisecond)
+	countEnds := func(c *fakeConn) int {
+		n := 0
+		for _, m := range c.sent(t) {
+			if m.Type == codec.SMGameEnd {
+				n++
+			}
+		}
+		return n
+	}
+	if ne := countEnds(white); ne != 1 {
+		t.Fatalf("white received %d GAME_END frames, want exactly 1 (double-fire)", ne)
+	}
+	if ne := countEnds(black); ne != 1 {
+		t.Fatalf("black received %d GAME_END frames, want exactly 1 (double-fire)", ne)
+	}
+}

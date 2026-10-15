@@ -6,9 +6,9 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.70.3
+	github.com/coder/websocket v1.8.15
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.23.0
-	nhooyr.io/websocket v1.8.17
 )
 
 require (

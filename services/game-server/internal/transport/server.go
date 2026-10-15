@@ -5,16 +5,16 @@ import (
 	"net/http"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // server.go holds the ONLY code that touches the concrete WebSocket library
-// (nhooyr.io/websocket, Q-GS6a). Everything else in the package depends on the
+// (github.com/coder/websocket, Q-GS6a). Everything else in the package depends on the
 // Conn interface, so the library choice is isolated here and the whole dispatch
 // flow is tested without a socket (dispatch_test.go / flow_test.go / e2e_test.go).
 
-// wsConn adapts a nhooyr WebSocket to the Conn interface. Writes are serialized
-// by nhooyr internally per message; we additionally never issue concurrent
+// wsConn adapts a coder/websocket to the Conn interface. Writes are serialized
+// by coder/websocket internally per message; we additionally never issue concurrent
 // Writes from the same goroutine. Binary frames only (the §4A wire is binary).
 type wsConn struct {
 	ws   *websocket.Conn
@@ -36,7 +36,7 @@ func (c *wsConn) Read(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
-// Write sends one §4A frame as a binary message. nhooyr serializes writes, so
+// Write sends one §4A frame as a binary message. coder/websocket serializes writes, so
 // this is safe for the concurrent caller (the MATCHED fan-out to the other seat).
 func (c *wsConn) Write(ctx context.Context, frame []byte) error {
 	return c.ws.Write(ctx, websocket.MessageBinary, frame)

@@ -172,6 +172,22 @@ uses (it only receives client frames and sends server frames) but a CLIENT and
 the transport's own end-to-end test (which acts as a client) do. Additive C-ABI,
 §4A bytes unchanged.
 
+### 3.8 Observability (deferred to X-14) & dependency notes
+
+The transport is deliberately logger-free, like the GS-1 pipeline (GS-4 F2): the
+server-side failure points — `deliverMatched` session-build failure,
+`handleMove` persist failure, `send`'s write error, the flag ticker's
+`TickFlagCheck` error (now bounded-retry), and `dropGame` — each produce a client
+`ERROR` but NO operator signal today. These are the X-14 punch-list: wire a
+log/metric at each when the observability stack lands, rather than scattering
+ad-hoc logging now that X-14 would have to unify. Named here so the list is not
+lost.
+
+WS library: `github.com/coder/websocket` (the maintained successor to the
+archived `nhooyr.io/websocket` — same codebase, API-compatible; migrated in this
+slice while the import is isolated to one file behind the `Conn` interface,
+Q-GS6a).
+
 ### 3.7 Known v1 limitations (frozen-§4A consequences)
 
 Two gaps fall out of the frozen §4A message set, recorded honestly rather than

@@ -14,7 +14,7 @@
 // This file holds the socket-agnostic core: the Conn abstraction (so dispatch is
 // testable without a real WebSocket, Q-GS6a), the Authenticator and
 // TimeControlResolver seams (dev impls until X-3 / the REST pools endpoint land,
-// mirroring GS-5's RatingSource), and the live-session Registry. The nhooyr
+// mirroring GS-5's RatingSource), and the live-session Registry. The coder/websocket
 // WebSocket Conn implementation and the HTTP server live in a sibling file so
 // the choice of WS library stays behind the interface.
 package transport

@@ -117,6 +117,8 @@ func (s *Server) armFlagTicker(gameID string) {
 	go func() {
 		t := time.NewTicker(iv)
 		defer t.Stop()
+		consecutiveErrs := 0
+		const maxConsecutiveErrs = 10
 		for range t.C {
 			sess, ok := s.reg.Get(gameID)
 			if !ok {
@@ -124,8 +126,20 @@ func (s *Server) armFlagTicker(gameID string) {
 			}
 			ended, err := sess.TickFlagCheck(context.Background())
 			if err != nil {
-				continue // transient; try again next tick.
+				// A persistent store/engine outage makes this recur every tick.
+				// Count consecutive failures and give up after a bound rather than
+				// spinning invisibly forever (reviewer finding): the game is
+				// recovered on the next reconnect/rebuild (NewSession folds from the
+				// durable stream), so a stopped ticker is safe. The failure COUNT /
+				// a bare retry each belongs in an X-14 metric/log when observability
+				// is wired (same deferral as GS-4 F2) — tracked, not inlined here.
+				consecutiveErrs++
+				if consecutiveErrs >= maxConsecutiveErrs {
+					return
+				}
+				continue
 			}
+			consecutiveErrs = 0
 			if ended {
 				s.broadcastGameEnd(context.Background(), gameID)
 				return
@@ -370,8 +384,14 @@ func mapSessionErr(gameID string, err error) codec.ServerMsg {
 }
 
 // broadcastGameEnd loads the ended stream's result + termination and sends
-// GAME_END to both seats' connections.
+// GAME_END to both seats' connections. It CLAIMS the end-broadcast atomically
+// (claimGameEnd) so that when a terminal move and the flag tick (or two ending
+// paths) resolve near-simultaneously, exactly ONE goroutine broadcasts + drops —
+// a client never receives two GAME_END frames for one game (reviewer finding).
 func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
+	if !s.claimGameEnd(gameID) {
+		return // another goroutine already broadcast this game's end.
+	}
 	snap, ok := s.reg.Get(gameID)
 	if !ok {
 		return
@@ -390,6 +410,19 @@ func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
 	// The game is over; drop the live session so the node reclaims it (the stream
 	// persists in the store; a late reconnect rebuilds a read-only ended view).
 	s.dropGame(gameID)
+}
+
+// claimGameEnd returns true to exactly ONE caller per game — the one that should
+// broadcast GAME_END and drop. Subsequent callers (the racing end path) get
+// false and no-op. Guarded by s.mu.
+func (s *Server) claimGameEnd(gameID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.endBroadcast[gameID] {
+		return false
+	}
+	s.endBroadcast[gameID] = true
+	return true
 }
 
 // dropGame removes a finished game's live session and ALL its transport state:
@@ -411,6 +444,7 @@ func (s *Server) dropGame(gameID string) {
 		}
 	}
 	delete(s.joined, gameID)
+	delete(s.endBroadcast, gameID)
 	s.mu.Unlock()
 	s.reg.Drop(gameID)
 }

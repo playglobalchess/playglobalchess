@@ -44,6 +44,11 @@ type Server struct {
 	// Without this the timer wrongly aborts a LIVE game on a transient
 	// double-disconnect (reviewer C1). Removed by dropGame.
 	joined map[string]chan struct{} // gameID → closed-once-joined signal
+	// endBroadcast latches that a game's GAME_END has been claimed, so concurrent
+	// end paths (a terminal move + the flag tick, or two ending commands) do not
+	// each broadcast GAME_END to the clients. Set once by claimGameEnd; cleared by
+	// dropGame.
+	endBroadcast map[string]bool
 }
 
 type gameSeAT struct {
@@ -54,14 +59,15 @@ type gameSeAT struct {
 // NewServer builds the transport server.
 func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *Server {
 	return &Server{
-		auth:      auth,
-		mm:        mm,
-		reg:       reg,
-		now:       time.Now,
-		conns:     make(map[gameSeAT]Conn),
-		userConns: make(map[string]Conn),
-		userGames: make(map[string]map[string]uint8),
-		joined:    make(map[string]chan struct{}),
+		auth:         auth,
+		mm:           mm,
+		reg:          reg,
+		now:          time.Now,
+		conns:        make(map[gameSeAT]Conn),
+		userConns:    make(map[string]Conn),
+		userGames:    make(map[string]map[string]uint8),
+		joined:       make(map[string]chan struct{}),
+		endBroadcast: make(map[string]bool),
 	}
 }
 
