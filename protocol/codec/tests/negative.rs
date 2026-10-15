@@ -9,7 +9,7 @@
 
 use pgc_protocol::{
     decode_client, decode_event, decode_server, encode_client, encode_server, ClientMsg,
-    CodecError, GameId, ServerMsg, MAX_FRAME_BYTES,
+    CodecError, ErrorCode, GameId, Reason, ServerMsg, Termination, MAX_FRAME_BYTES,
 };
 
 // --- truncated / too-short --------------------------------------------------
@@ -175,6 +175,90 @@ fn oversize_frame_is_rejected_on_encode() {
         matches!(res, Err(CodecError::TooLarge(_))),
         "expected TooLarge on oversize encode, got {res:?}"
     );
+}
+
+// --- encode is write/read SYMMETRIC with decode (GS-6a) ---------------------
+//
+// decode_server rejects out-of-domain reason / termination / error-code
+// discriminants; encode_server MUST refuse to PRODUCE them, so the codec never
+// emits a server frame it would itself refuse to decode (a live-wire undecodable
+// frame to a real client). These assert each guard fires BEFORE a frame exists.
+
+#[test]
+fn encode_server_rejects_unknown_reason() {
+    let msg = ServerMsg::MoveRejected {
+        game_id: GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+        ply_expected: 18,
+        reason: Reason(0x99), // ∉ frozen §4A.4 set
+    };
+    assert!(
+        matches!(encode_server(&msg), Err(CodecError::MalformedPayload(_))),
+        "encode must refuse an unknown reason discriminant"
+    );
+}
+
+#[test]
+fn encode_server_rejects_unknown_termination() {
+    let msg = ServerMsg::GameEnd {
+        game_id: GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+        result_vector: vec![pgc_protocol::RESULT_WIN, pgc_protocol::RESULT_LOSS],
+        termination: Termination(0x99), // ∉ frozen §4A.5 set
+        rating_delta: vec![1, -1],
+    };
+    assert!(
+        matches!(encode_server(&msg), Err(CodecError::MalformedPayload(_))),
+        "encode must refuse an unknown termination discriminant"
+    );
+}
+
+#[test]
+fn encode_server_rejects_out_of_domain_result_vector() {
+    let msg = ServerMsg::GameEnd {
+        game_id: GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+        result_vector: vec![7, 0], // 7 ∉ {0,1,2}
+        termination: Termination::MATE,
+        rating_delta: vec![1, -1],
+    };
+    assert!(
+        matches!(encode_server(&msg), Err(CodecError::MalformedPayload(_))),
+        "encode must refuse an out-of-domain result_vector byte"
+    );
+}
+
+#[test]
+fn encode_server_rejects_unknown_error_code() {
+    let msg = ServerMsg::Error {
+        code: ErrorCode(0x99), // ∉ frozen §4A.7 set
+        msg: "x".to_string(),
+    };
+    assert!(
+        matches!(encode_server(&msg), Err(CodecError::MalformedPayload(_))),
+        "encode must refuse an unknown error code discriminant"
+    );
+}
+
+#[test]
+fn encode_server_accepts_every_frozen_discriminant() {
+    // Sanity: the guards do not reject VALID frozen values (no false positive).
+    let gid = || GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479");
+    assert!(encode_server(&ServerMsg::MoveRejected {
+        game_id: gid(),
+        ply_expected: 1,
+        reason: Reason::ILLEGAL,
+    })
+    .is_ok());
+    assert!(encode_server(&ServerMsg::GameEnd {
+        game_id: gid(),
+        result_vector: vec![pgc_protocol::RESULT_DRAW, pgc_protocol::RESULT_DRAW],
+        termination: Termination::REPETITION,
+        rating_delta: vec![0, 0],
+    })
+    .is_ok());
+    assert!(encode_server(&ServerMsg::Error {
+        code: ErrorCode::INTERNAL,
+        msg: "x".to_string(),
+    })
+    .is_ok());
 }
 
 // --- closed-domain u8 fields (result_vector, color) -------------------------

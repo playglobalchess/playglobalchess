@@ -54,8 +54,9 @@ pub mod types;
 // --- flat public API (mirrors the engine's flat re-export discipline) -------
 
 pub use codec::{
-    decode_client, decode_envelope_intermediate, decode_event, decode_server, encode_client,
-    encode_envelope_intermediate, encode_event, encode_server, VER_V1,
+    decode_client, decode_client_intermediate, decode_envelope_intermediate, decode_event,
+    decode_server, decode_server_intermediate, encode_client, encode_client_intermediate,
+    encode_envelope_intermediate, encode_event, encode_server, encode_server_intermediate, VER_V1,
 };
 pub use error::{CodecError, MAX_FRAME_BYTES};
 pub use event::{EventEnvelope, GameEvent};

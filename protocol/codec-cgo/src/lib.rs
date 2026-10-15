@@ -251,6 +251,50 @@ pub unsafe extern "C" fn pgc_decode_event(
     })
 }
 
+/// GS-6a: decode a client→server §4A frame to the postcard `ClientMsg`
+/// intermediate the Go transport reads (typed Seek/Move/… fields). IN = §4A
+/// client frame; OUT = postcard(ClientMsg). A bad §4A frame → the usual
+/// `code_of` discriminant. On `PGC_OK`, `*out`/`*out_len` hold a Rust-allocated
+/// buffer the caller must release with [`pgc_free`].
+///
+/// # Safety
+/// Same contract as [`pgc_reencode_client`].
+#[no_mangle]
+pub unsafe extern "C" fn pgc_decode_client(
+    buf: *const u8,
+    len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    boundary_impl(buf, len, out, out_len, |b| {
+        let msg = pgc_protocol::decode_client(b).map_err(|e| code_of(&e))?;
+        pgc_protocol::encode_client_intermediate(&msg).map_err(|e| code_of(&e))
+    })
+}
+
+/// GS-6a: encode a server→client §4A frame FROM the postcard `ServerMsg`
+/// intermediate the Go transport built. IN = postcard(ServerMsg); OUT = §4A
+/// server frame. A malformed intermediate → `PGC_ERR_BAD_INTERMEDIATE`; a §4A
+/// encode failure → the usual `code_of` discriminant. Keeps §4A encoding in Rust
+/// (NFR-5). On `PGC_OK`, `*out`/`*out_len` hold a buffer to release with
+/// [`pgc_free`].
+///
+/// # Safety
+/// Same contract as [`pgc_reencode_client`].
+#[no_mangle]
+pub unsafe extern "C" fn pgc_encode_server(
+    buf: *const u8,
+    len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    boundary_impl(buf, len, out, out_len, |b| {
+        let msg =
+            pgc_protocol::decode_server_intermediate(b).map_err(|_| PGC_ERR_BAD_INTERMEDIATE)?;
+        pgc_protocol::encode_server(&msg).map_err(|e| code_of(&e))
+    })
+}
+
 /// Free a buffer previously handed out by a `pgc_reencode_*` call. Must be
 /// called exactly once per successful call, with the SAME `ptr` and `len` that
 /// call wrote. A null `ptr` is a no-op.
