@@ -108,7 +108,12 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 			// ply, empty NewFEN, zero NewZobrist, nil Terminal. Advancing here
 			// would overwrite curFEN with "", append a bogus 0 key, and flip turn.
 			// So we return it as-is (transport re-emits MOVE_ACCEPTED) with NO
-			// projection change.
+			// projection change. NOTE (GS-3b): this returns BEFORE the
+			// drawOfferBy=nil clear below, deliberately — a re-ack appends no new
+			// MovePlayed, so the stream (the truth) gained no move, and a pending
+			// draw offer made AFTER the original move must NOT be killed by a mere
+			// transport duplicate of that already-counted move. A genuine new move
+			// (the case above) does clear it.
 			return
 		default:
 			// out.Ply > s.ply+1: the pipeline accepted a move that skips a ply.
@@ -135,6 +140,10 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		// remaining time (§3.5 resync + idle-flag correctness).
 		s.clocks = s.clocks.CloneWith(int(c.seat), int64(out.ClockAfterMs))
 		s.lastMoveAt = moveAt
+		// Any move clears a pending draw offer (GS-3b §3.3, Q-EG2): the offerer
+		// moving withdraws it; the opponent moving implicitly declines it. Both
+		// land here (c.seat is whoever moved), so one clear covers both.
+		s.drawOfferBy = nil
 		if out.Terminal != nil {
 			// Engine-detected terminal (mate / stalemate / insufficient /
 			// automatic draw). Append GameEnded; the game is over.
@@ -422,6 +431,12 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 	s.turn = eng.TurnIdx
 	s.phase = eng.Phase
 	s.lastMoveAt = s.now()
+	// A takeback rewinds game state; a pending draw offer (GS-3b) is part of that
+	// state and must not survive the rewind. Clearing it here prevents an
+	// offer-then-takeback-then-AcceptDraw from ending the game on an offer the
+	// takeback logically voided (the takebackPrefix cut may drop the DrawOffered
+	// event, so the ephemeral field would otherwise outlive the stream's offer).
+	s.drawOfferBy = nil
 }
 
 // winnerFromMover builds the result vector for a move-produced terminal. A mate

@@ -63,6 +63,15 @@ type Session struct {
 	ended      bool
 	terminal   game.Termination // the ending condition, set when ended=true
 	lastMoveAt time.Time
+	// drawOfferBy is the seat with a pending draw offer, or nil (GS-3b, §3.3). It
+	// is EPHEMERAL (owner-goroutine-only, like the other projection fields): it is
+	// cleared when EITHER seat moves (offerer withdraws / opponent declines) and
+	// is NOT reconstructed from the stream on rebuild — a reconnect does not
+	// resurrect a stale offer (Q-EG2).
+	drawOfferBy *uint8
+	// abortBeforePly is the exclusive ply ceiling under which Abort is allowed
+	// (GS-3b, Q-EG1); at or past it a quit is a resign, not an abort. Default 2.
+	abortBeforePly uint32
 }
 
 // Config bundles a Session's dependencies. now may be nil (defaults to
@@ -73,6 +82,9 @@ type Config struct {
 	Oracle game.LegalityOracle
 	Opts   game.FoldOptions
 	Now    func() time.Time
+	// AbortBeforePly is the exclusive ply ceiling under which Abort is allowed
+	// (GS-3b, Q-EG1/Q-EG3). Zero means use the default (2).
+	AbortBeforePly uint32
 }
 
 // NewSession builds a Session by loading the game's durable stream and folding
@@ -151,6 +163,10 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		terminal:   st.Termination, // meaningful when already ended at construction
 		lastMoveAt: lastMoveAt,
 	}
+	s.abortBeforePly = cfg.AbortBeforePly
+	if s.abortBeforePly == 0 {
+		s.abortBeforePly = 2 // Q-EG3 default: before both players have moved once.
+	}
 	return s, nil
 }
 
@@ -172,9 +188,32 @@ func (s *Session) Run(ctx context.Context) {
 		case <-s.quit:
 			return
 		case cmd := <-s.commands:
-			cmd.apply(s.runCtx(ctx), s)
+			s.applyRecovered(s.runCtx(ctx), cmd)
 		}
 	}
+}
+
+// applyRecovered runs one command's apply with a panic barrier. A command's
+// apply does `defer close(c.done)`, which still runs during panic unwinding, so
+// the blocked caller is released BEFORE this recover fires — the caller does not
+// hang. The recover then stops the panic from unwinding out of the actor
+// goroutine, which (with no recover) would crash the WHOLE process and every
+// other live game session on this server. A panic in one command thus fails
+// that command's turn and keeps the actor — and every other game — alive. This
+// is defense-in-depth: command handlers return typed errors rather than
+// panicking (e.g. the 2-seat guard is now ErrUnsupportedSeatCount, not a panic),
+// but a future handler bug must not take down the process.
+func (s *Session) applyRecovered(ctx context.Context, cmd command) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The command's own `defer close(c.done)` already ran during
+			// unwinding, so its caller is unblocked (it sees whatever c.err/c.out
+			// was set before the panic — typically the zero value). Swallow here
+			// to protect the actor loop and the process.
+			_ = r
+		}
+	}()
+	cmd.apply(ctx, s)
 }
 
 // runCtx returns the context the actor uses for a command's own I/O: the Run
