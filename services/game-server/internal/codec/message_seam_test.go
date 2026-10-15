@@ -117,7 +117,7 @@ func TestServerSeamFromSharedCorpus(t *testing.T) {
 			servers++
 		}
 	}
-	if servers < 7 { // 7 §4A.2 S codes
+	if servers < 8 { // 8 §4A.2 S codes (incl v1.1 DRAW_OFFERED)
 		t.Fatalf("expected >=7 server vectors, got %d", servers)
 	}
 
@@ -154,8 +154,8 @@ func TestServerSeamFromSharedCorpus(t *testing.T) {
 	}
 
 	// Every §4A server code must be exercised by a fixture (coverage guard).
-	if len(corpusServerMsgs()) < 7 {
-		t.Fatalf("corpusServerMsgs covers %d messages, expected >=7 (one per S code)", len(corpusServerMsgs()))
+	if len(corpusServerMsgs()) < 8 {
+		t.Fatalf("corpusServerMsgs covers %d messages, expected >=8 (one per S code incl v1.1)", len(corpusServerMsgs()))
 	}
 }
 
@@ -198,6 +198,9 @@ func corpusServerMsgs() map[string]ServerMsg {
 		}},
 		"server/pong": {Type: SMPong, Pong: &PongPayload{
 			T: 1728000000123, ServerT: 1728000000456,
+		}},
+		"server/draw_offered": {Type: SMDrawOffered, DrawOffered: &DrawOfferedPayload{
+			GameID: gid, By: 1, // §4A v1.1 (ADR-17)
 		}},
 		"server/error": {Type: SMError, Error: &ErrorPayload{
 			Code: 0x05, Msg: "slow down", // RATE_LIMITED

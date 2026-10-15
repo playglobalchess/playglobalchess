@@ -34,9 +34,9 @@ use crate::event::{
     PlayerJoinedBody, RatingAppliedBody, SeatIdxBody,
 };
 use crate::message::{
-    client_code, server_code, ClientMsg, ErrorPayload, GameEndPayload, MatchedPayload,
-    MoveAcceptedPayload, MovePayload, MoveRejectedPayload, PongPayload, SeekPayload, ServerMsg,
-    StatePayload,
+    client_code, server_code, ClientMsg, DrawOfferedPayload, ErrorPayload, GameEndPayload,
+    MatchedPayload, MoveAcceptedPayload, MovePayload, MoveRejectedPayload, PongPayload,
+    SeekPayload, ServerMsg, StatePayload,
 };
 use crate::types::EventType;
 
@@ -144,7 +144,8 @@ pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, CodecError> {
         | ClientMsg::Resign { game_id }
         | ClientMsg::Abort { game_id }
         | ClientMsg::Takeback { game_id }
-        | ClientMsg::Rematch { game_id } => ser(game_id)?,
+        | ClientMsg::Rematch { game_id }
+        | ClientMsg::Resync { game_id } => ser(game_id)?,
         ClientMsg::Ping { t } => ser(t)?,
     };
     frame(VER_V1, type_code, payload)
@@ -196,6 +197,9 @@ pub fn decode_client(frame: &[u8]) -> Result<ClientMsg, CodecError> {
         }),
         client_code::PING => Ok(ClientMsg::Ping {
             t: de_exact(payload)?,
+        }),
+        client_code::RESYNC => Ok(ClientMsg::Resync {
+            game_id: de_exact(payload)?,
         }),
         other => Err(CodecError::UnknownType(other)),
     }
@@ -294,6 +298,10 @@ pub fn encode_server(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
             t: *t,
             server_t: *server_t,
         })?,
+        ServerMsg::DrawOffered { game_id, by } => ser(&DrawOfferedPayload {
+            game_id: game_id.clone(),
+            by: *by,
+        })?,
         ServerMsg::Error { code, msg } => ser(&ErrorPayload {
             code: *code,
             msg: msg.clone(),
@@ -371,6 +379,13 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, CodecError> {
             Ok(ServerMsg::Pong {
                 t: p.t,
                 server_t: p.server_t,
+            })
+        }
+        server_code::DRAW_OFFERED => {
+            let p: DrawOfferedPayload = de_exact(payload)?;
+            Ok(ServerMsg::DrawOffered {
+                game_id: p.game_id,
+                by: p.by,
             })
         }
         server_code::ERROR => {

@@ -321,13 +321,17 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 		return true
 	}
 	var err error
+	// offeredNew is set only for a genuine first draw offer (not a no-op repeat),
+	// so the transport notifies the opponent exactly once per real offer —
+	// honoring the session's idempotency at the notification layer.
+	offeredNew := false
 	switch kind {
 	case endingResign:
 		err = sess.Resign(ctx, seat)
 	case endingAbort:
 		err = sess.Abort(ctx, seat)
 	case endingOfferDraw:
-		err = sess.OfferDraw(ctx, seat)
+		offeredNew, err = sess.OfferDrawResult(ctx, seat)
 	case endingTakeback:
 		err = sess.Takeback(ctx, seat, 1)
 	}
@@ -341,16 +345,54 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 			s.broadcastGameEnd(ctx, gameID)
 			return true
 		}
-		// A successful TAKEBACK rewinds the board but does not end the game, and
-		// §4A has no dedicated takeback frame — so push STATE to BOTH seats so
-		// neither client's board silently diverges from the server (S2 fix). A
-		// pending OFFER_DRAW likewise has no dedicated server frame; a STATE push
-		// surfaces the current position (the pending-offer NOTIFICATION itself is
-		// a documented v1 limitation, §3.7).
-		if kind == endingTakeback {
+		// Non-ending outcomes that the opponent must still learn about:
+		switch kind {
+		case endingTakeback:
+			// A takeback rewinds the board but §4A has no takeback frame — push
+			// STATE to both seats so neither client's board silently diverges (S2).
 			s.broadcastState(ctx, gameID, snap)
+		case endingOfferDraw:
+			// Push DRAW_OFFERED{game_id, by} to the OPPONENT only when a NEW offer
+			// was recorded (§4A v1.1, ADR-17). A no-op repeat by the same seat
+			// (offeredNew == false) sends nothing, so a double-click / resent
+			// OFFER_DRAW does not spam the opponent. The opponent accepts by
+			// sending their own OFFER_DRAW (the mutual path ends via GAME_END).
+			if !offeredNew {
+				break
+			}
+			other := uint8(1) - seat
+			if cc, present := s.connFor(gameID, other); present {
+				s.send(ctx, cc, codec.ServerMsg{Type: codec.SMDrawOffered, DrawOffered: &codec.DrawOfferedPayload{
+					GameID: gameID, By: seat,
+				}})
+			}
 		}
 	}
+	return true
+}
+
+// handleResync serves an on-demand STATE resync (§4A v1.1 RESYNC, ADR-17): if the
+// connection is seated in the game, reply with the authoritative STATE folded
+// from the durable stream (same path as the auth-time server push); else
+// ERROR{UNKNOWN_GAME}. The complement to the Option-A auto-push.
+func (s *Server) handleResync(ctx context.Context, c Conn, gameID string) bool {
+	if _, seated := s.seatOf(c, gameID); !seated {
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "not seated in this game"))
+		return true
+	}
+	sess, ok := s.reg.Get(gameID)
+	if !ok {
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "no such live game"))
+		return true
+	}
+	snap, err := sess.StateSnapshot(ctx)
+	if err != nil {
+		s.send(ctx, c, errorMsg(codec.ECInternal, "could not read game state"))
+		return true
+	}
+	s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
+		GameID: gameID, State: snapshotToStateBody(snap),
+	}})
 	return true
 }
 

@@ -112,7 +112,7 @@ real, visible state the opponent responds to.
 2. Record the pending offer: `s.drawOfferBy = &by` (ephemeral session state, see
    Q-EG2) and append `DrawOffered{by}` (a visible event in the stream, so a
    reconnecting client/analysis sees the offer was made).
-3. A second offer by the same seat while one is pending is a no-op (idempotent).
+3. A second offer by the same seat while one is pending is a no-op (idempotent). `OfferDrawResult` reports `offered=false` for this no-op so a transport (GS-6) does not re-notify the opponent on a repeat/double-click; `offered=true` only on a genuine first offer.
    An offer by the OTHER seat while one is pending is a mutual agreement — it
    appends `[DrawOffered{other}, DrawAccepted{other}, GameEnded{rv, DRAW_AGREE}]`
    atomically. The `DrawOffered{other}` is appended FIRST so every

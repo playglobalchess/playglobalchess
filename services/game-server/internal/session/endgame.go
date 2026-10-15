@@ -134,18 +134,39 @@ func (c *abortCmd) apply(ctx context.Context, s *Session) {
 // by the OTHER seat while one is pending is a mutual agreement that ends the game
 // (DRAW_AGREE), with DrawOffered{other} appended BEFORE DrawAccepted{other} so
 // every accept pairs to a preceding offer (Q-EG5). Idempotent after end.
+// OfferDraw records a pending draw offer (see OfferDrawResult). Returns only the
+// error; existing callers that do not care whether a NEW offer was recorded use
+// this. The transport uses OfferDrawResult to avoid re-notifying the opponent on
+// an idempotent repeat.
 func (s *Session) OfferDraw(ctx context.Context, by uint8) error {
+	_, err := s.OfferDrawResult(ctx, by)
+	return err
+}
+
+// OfferDrawResult records a pending draw offer from seat `by` and reports whether
+// a NEW offer was recorded (`offered`). It is true ONLY on a genuine first offer
+// that appended a `DrawOffered` event; it is FALSE on an idempotent repeat by the
+// same seat (no event, nothing new) AND on the mutual-agreement path (which ends
+// the game — the caller signals that via the ended snapshot, not a draw-offer
+// notification). This lets the transport push `DRAW_OFFERED` to the opponent
+// exactly once per real offer, honoring the session's idempotency at the
+// notification layer. A repeat offer by the same seat is a no-op; an offer by the
+// OTHER seat while one is pending is a mutual agreement that ends the game
+// (DRAW_AGREE), with DrawOffered{other} appended BEFORE DrawAccepted{other} so
+// every accept pairs to a preceding offer (Q-EG5). Idempotent after end.
+func (s *Session) OfferDrawResult(ctx context.Context, by uint8) (offered bool, err error) {
 	c := &offerDrawCmd{by: by, done: make(chan struct{})}
-	if err := s.dispatch(ctx, c, c.done); err != nil {
-		return err
+	if e := s.dispatch(ctx, c, c.done); e != nil {
+		return false, e
 	}
-	return c.err
+	return c.offered, c.err
 }
 
 type offerDrawCmd struct {
-	by   uint8
-	err  error
-	done chan struct{}
+	by      uint8
+	offered bool // true only when a NEW first offer was recorded (not a no-op repeat, not the ending mutual path)
+	err     error
+	done    chan struct{}
 }
 
 func (c *offerDrawCmd) apply(ctx context.Context, s *Session) {
@@ -189,6 +210,7 @@ func (c *offerDrawCmd) apply(ctx context.Context, s *Session) {
 	}
 	by := c.by
 	s.drawOfferBy = &by
+	c.offered = true // a NEW first offer was recorded — the transport notifies the opponent.
 }
 
 // AcceptDraw accepts a pending draw offer from the OTHER seat, ending the game as

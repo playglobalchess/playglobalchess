@@ -36,7 +36,7 @@ a pending offer.
   not the variant index, but keeping declaration order stable also keeps the
   GS-6a intermediate indices stable).
 - Frozen type codes: `client_code::RESYNC = 0x0A`, `server_code::DRAW_OFFERED =
-  0x87`. Payload structs `ResyncPayload { game_id }`, `DrawOfferedPayload {
+  0x87`. Payload: RESYNC reuses the shared bare-`game_id` encode/decode arm (like OFFER_DRAW — byte-identical to a one-field struct in postcard, so no `ResyncPayload` type is introduced); DRAW_OFFERED uses `DrawOfferedPayload {
   game_id, by }` in §4A.3 field order.
 - `encode_client`/`decode_client`/`encode_server`/`decode_server` gain the new
   arms (decode dispatches on the type byte; the direction check already covers
