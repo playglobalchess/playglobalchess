@@ -68,7 +68,11 @@ func (c *resignCmd) apply(ctx context.Context, s *Session) {
 		c.err = ErrGameNotLive // Resigned is a Live-only event (see ErrGameNotLive).
 		return
 	}
-	rv := loserResultVector(c.by, s.seatCount)
+	rv, err := loserResultVector(c.by, s.seatCount)
+	if err != nil {
+		c.err = err
+		return
+	}
 	if err := s.appendBatchAtHead(ctx, []game.Event{
 		{Type: game.EvResigned, SeatAction: &game.SeatAction{SeatIdx: c.by}},
 		{Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: game.TermResign}},
@@ -108,7 +112,11 @@ func (c *abortCmd) apply(ctx context.Context, s *Session) {
 		c.err = ErrAbortTooLate
 		return
 	}
-	rv := allDrawResultVector(s.seatCount)
+	rv, err := allDrawResultVector(s.seatCount)
+	if err != nil {
+		c.err = err
+		return
+	}
 	if err := s.appendBatchAtHead(ctx, []game.Event{
 		{Type: game.EvAborted, Aborted: &game.Aborted{By: c.by}},
 		{Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: game.TermAbort}},
@@ -151,7 +159,11 @@ func (c *offerDrawCmd) apply(ctx context.Context, s *Session) {
 	}
 	// A pending offer from the OTHER seat → mutual agreement (DRAW_AGREE).
 	if s.drawOfferBy != nil && *s.drawOfferBy != c.by {
-		rv := allDrawResultVector(s.seatCount)
+		rv, err := allDrawResultVector(s.seatCount)
+		if err != nil {
+			c.err = err
+			return
+		}
 		if err := s.appendBatchAtHead(ctx, []game.Event{
 			{Type: game.EvDrawOffered, SeatAction: &game.SeatAction{SeatIdx: c.by}},
 			{Type: game.EvDrawAccepted, SeatAction: &game.SeatAction{SeatIdx: c.by}},
@@ -210,7 +222,11 @@ func (c *acceptDrawCmd) apply(ctx context.Context, s *Session) {
 		c.err = ErrNoDrawToAccept
 		return
 	}
-	rv := allDrawResultVector(s.seatCount)
+	rv, err := allDrawResultVector(s.seatCount)
+	if err != nil {
+		c.err = err
+		return
+	}
 	if err := s.appendBatchAtHead(ctx, []game.Event{
 		{Type: game.EvDrawAccepted, SeatAction: &game.SeatAction{SeatIdx: c.by}},
 		{Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: game.TermDrawAgree}},
@@ -224,34 +240,36 @@ func (c *acceptDrawCmd) apply(ctx context.Context, s *Session) {
 
 // --- result-vector helpers (2-seat, Q-EG4) ----------------------------------
 
-// loserResultVector: seat `loser` loses, every other seat wins. v1 is 2-seat;
-// an N-seat resign rule is a variant concern (Q-EG4), so this asserts seatCount
-// == 2 to fail loudly rather than silently mis-score an N-seat game.
-func loserResultVector(loser uint8, seatCount int) []game.Result {
-	mustTwoSeat(seatCount)
+// ErrUnsupportedSeatCount is returned when an ending command runs on a game whose
+// seat count is not 2. v1 is 2-seat (Q-EG4); an N-seat resign/draw result rule is
+// a variant concern (ADR-3 / F-07). This fails the ONE command rather than
+// panicking the actor (which would crash the whole process and every other live
+// game on it) — a bad GameCreated must not take down unrelated sessions.
+var ErrUnsupportedSeatCount = errors.New("session: GS-3b endgame results are 2-seat only (Q-EG4)")
+
+// loserResultVector: seat `loser` loses, every other seat wins. v1 is 2-seat; an
+// N-seat resign rule is out of scope (Q-EG4), so a non-2-seat game returns
+// ErrUnsupportedSeatCount rather than mis-scoring.
+func loserResultVector(loser uint8, seatCount int) ([]game.Result, error) {
+	if seatCount != 2 {
+		return nil, ErrUnsupportedSeatCount
+	}
 	rv := make([]game.Result, seatCount)
 	for i := range rv {
 		rv[i] = game.ResultWin
 	}
 	rv[loser] = game.ResultLoss
-	return rv
+	return rv, nil
 }
 
 // allDrawResultVector: every seat draws (abort / draw-agreement).
-func allDrawResultVector(seatCount int) []game.Result {
-	mustTwoSeat(seatCount)
+func allDrawResultVector(seatCount int) ([]game.Result, error) {
+	if seatCount != 2 {
+		return nil, ErrUnsupportedSeatCount
+	}
 	rv := make([]game.Result, seatCount)
 	for i := range rv {
 		rv[i] = game.ResultDraw
 	}
-	return rv
-}
-
-// mustTwoSeat guards the v1 2-seat scope (Q-EG4): the resign/draw result rules
-// are defined for 2 seats only; an N-seat variant needs its own rule (ADR-3 /
-// F-07). A non-2-seat game reaching here is a programming error, not user input.
-func mustTwoSeat(seatCount int) {
-	if seatCount != 2 {
-		panic(fmt.Sprintf("session: GS-3b result vectors are 2-seat only (Q-EG4), got seatCount=%d", seatCount))
-	}
+	return rv, nil
 }

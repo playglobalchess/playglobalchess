@@ -405,6 +405,43 @@ func TestAbortAllowedFromMatched(t *testing.T) {
 	}
 }
 
+// --- Takeback voids a pending draw offer (reviewer finding 2) ---------------
+
+func TestTakebackVoidsPendingDrawOffer(t *testing.T) {
+	// offer-then-takeback-then-accept must NOT end the game: a takeback rewinds
+	// game state, so a pending offer is voided. Without the fix, the ephemeral
+	// drawOfferBy survived the rewind and AcceptDraw ended the game on a
+	// withdrawn offer.
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+	// Play two plies so there is something to take back.
+	fc.add(time.Second)
+	if out, err := s.SubmitMove(ctx, 0, 1, "e2e4", 1); err != nil || !out.Accepted {
+		t.Fatalf("e4: %v %+v", err, out)
+	}
+	fc.add(time.Second)
+	if out, err := s.SubmitMove(ctx, 1, 2, "e7e5", 2); err != nil || !out.Accepted {
+		t.Fatalf("e5: %v %+v", err, out)
+	}
+	// Seat 0 offers a draw (its turn), then a takeback rewinds a ply.
+	if err := s.OfferDraw(ctx, 0); err != nil {
+		t.Fatalf("OfferDraw: %v", err)
+	}
+	if err := s.Takeback(ctx, 1, 1); err != nil {
+		t.Fatalf("Takeback: %v", err)
+	}
+	// The offer is voided by the takeback — seat 1 cannot accept it.
+	if err := s.AcceptDraw(ctx, 1); !errors.Is(err, ErrNoDrawToAccept) {
+		t.Fatalf("accept after takeback = %v, want ErrNoDrawToAccept (offer voided by rewind)", err)
+	}
+	snap, _ := s.StateSnapshot(ctx)
+	if snap.Ended {
+		t.Fatal("game ended on a draw offer the takeback should have voided")
+	}
+}
+
 // --- Idempotency after end --------------------------------------------------
 
 func TestEndingCommandsNoopAfterEnd(t *testing.T) {

@@ -137,7 +137,10 @@ offer is ephemeral session state, NOT reconstructed on rebuild: a `DrawOffered`
 with no following `DrawAccepted`/move in the stream is treated as lapsed on
 `NewSession` fold (a reconnect does not resurrect a stale offer — the offerer
 must re-offer). This keeps the fold free of offer-tracking and matches how
-players expect a dropped connection to behave.
+players expect a dropped connection to behave. A **takeback** also voids a
+pending offer: `Takeback` rewinds game state (and its stream cut may drop the
+`DrawOffered` event), so it clears `s.drawOfferBy` — an offer made before a
+takeback does not survive the rewind.
 
 ### 3.4 Persist-before-ack & recovery
 
@@ -197,6 +200,8 @@ projection fields). New sentinels `ErrAbortTooLate`, `ErrNoDrawToAccept`,
 | Resign by the side not to move | valid (you may resign anytime while live). |
 | Append fails mid-ending | session NOT marked ended; error surfaced; rebuild recovery closes it (one atomic batch, so no half-terminal). |
 | Resign/OfferDraw/AcceptDraw on a non-LIVE (MATCHED) game | `ErrGameNotLive`, nothing appended (else a Live-only event would make the stream unfoldable, §3.6). Abort is exempt (valid from MATCHED). |
+| Offer, then a takeback, then accept | the takeback voids the pending offer (clears `drawOfferBy`); the accept returns `ErrNoDrawToAccept`. |
+| Ending command on a non-2-seat game | `ErrUnsupportedSeatCount` (Q-EG4) — fails the one command, never panics the actor/process. |
 | Reconnect with a stale `DrawOffered` and no accept | offer treated as lapsed; not resurrected. |
 
 ## 6. Test plan
@@ -255,8 +260,12 @@ projection fields). New sentinels `ErrAbortTooLate`, `ErrNoDrawToAccept`,
   loses, opponent wins. N-seat variants (later) need a resign-result rule (does
   one seat resigning end the whole game, or just remove that seat?). **Proposed:**
   scope GS-3b to 2-seat (`seatCount == 2`); an N-seat resign rule is a variant
-  concern (ADR-3 / F-07), out of scope here. The result-vector helper asserts
-  `seatCount == 2` for now.
+  concern (ADR-3 / F-07), out of scope here. A non-2-seat ending command returns
+  `ErrUnsupportedSeatCount` (NOT a panic — an unrecovered panic on the single
+  actor goroutine would crash the whole process and every other live game on it;
+  a bad game must fail only its own command). As defense-in-depth the actor loop
+  (`Run`) also wraps each command's apply in a `recover()`, so any future handler
+  panic fails that one session's turn rather than the process.
 - **Q-EG5 — mutual-offer stream shape.** When both seats offer, should the stream
   carry a `DrawOffered` for each seat, or fold the second offer straight into the
   accept? **Proposed:** append `DrawOffered{other}` BEFORE `DrawAccepted{other}`

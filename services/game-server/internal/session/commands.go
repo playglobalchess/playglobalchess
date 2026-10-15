@@ -431,6 +431,12 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 	s.turn = eng.TurnIdx
 	s.phase = eng.Phase
 	s.lastMoveAt = s.now()
+	// A takeback rewinds game state; a pending draw offer (GS-3b) is part of that
+	// state and must not survive the rewind. Clearing it here prevents an
+	// offer-then-takeback-then-AcceptDraw from ending the game on an offer the
+	// takeback logically voided (the takebackPrefix cut may drop the DrawOffered
+	// event, so the ephemeral field would otherwise outlive the stream's offer).
+	s.drawOfferBy = nil
 }
 
 // winnerFromMover builds the result vector for a move-produced terminal. A mate
