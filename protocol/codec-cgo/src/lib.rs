@@ -289,8 +289,8 @@ pub unsafe extern "C" fn pgc_encode_server(
     out_len: *mut usize,
 ) -> i32 {
     boundary_impl(buf, len, out, out_len, |b| {
-        let msg = pgc_protocol::decode_server_intermediate(b)
-            .map_err(|_| PGC_ERR_BAD_INTERMEDIATE)?;
+        let msg =
+            pgc_protocol::decode_server_intermediate(b).map_err(|_| PGC_ERR_BAD_INTERMEDIATE)?;
         pgc_protocol::encode_server(&msg).map_err(|e| code_of(&e))
     })
 }

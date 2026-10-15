@@ -450,7 +450,8 @@ pub fn encode_client_intermediate(msg: &ClientMsg) -> Result<Vec<u8>, CodecError
 }
 
 pub fn decode_client_intermediate(bytes: &[u8]) -> Result<ClientMsg, CodecError> {
-    postcard::from_bytes::<ClientMsg>(bytes).map_err(|e| CodecError::MalformedPayload(e.to_string()))
+    postcard::from_bytes::<ClientMsg>(bytes)
+        .map_err(|e| CodecError::MalformedPayload(e.to_string()))
 }
 
 pub fn encode_server_intermediate(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
@@ -458,7 +459,8 @@ pub fn encode_server_intermediate(msg: &ServerMsg) -> Result<Vec<u8>, CodecError
 }
 
 pub fn decode_server_intermediate(bytes: &[u8]) -> Result<ServerMsg, CodecError> {
-    postcard::from_bytes::<ServerMsg>(bytes).map_err(|e| CodecError::MalformedPayload(e.to_string()))
+    postcard::from_bytes::<ServerMsg>(bytes)
+        .map_err(|e| CodecError::MalformedPayload(e.to_string()))
 }
 
 fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {
