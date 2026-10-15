@@ -155,6 +155,20 @@ the game ended. A `DrawAccepted` resend after the draw already applied is a
 no-op. This matches the §5 lost-ack-and-resend path the move pipeline already
 handles.
 
+### 3.6 Phase guard (Live-only events)
+
+`Resigned`, `DrawOffered`, and `DrawAccepted` are events the fold's state machine
+permits ONLY in `PhaseLive`. So `Resign`/`OfferDraw`/`AcceptDraw` guard
+`s.phase == PhaseLive` (after the `s.ended` check) and return `ErrGameNotLive`
+otherwise. Without this, a command on a `PhaseMatched` game (created, not all
+players joined) would APPEND a Live-only event — the write succeeds and the
+caller is told success, but the stream then becomes permanently UNFOLDABLE: the
+next `NewSession` rebuild (§3.5 reconnect/failover) fails forever. The session
+owns stream foldability; it does not delegate this gate to the caller (GS-6).
+`Abort` is deliberately EXEMPT: `Aborted` is valid from `PhaseMatched` (the fold
+allows it there) and is the correct pre-start exit, so `Abort` keeps only its
+ply-based eligibility check (§3.2), not the Live guard.
+
 ## 4. Interfaces & contracts
 
 New `Session` methods (mirroring `Takeback`'s signature shape):
@@ -165,9 +179,9 @@ func (s *Session) OfferDraw(ctx context.Context, by uint8) error
 func (s *Session) AcceptDraw(ctx context.Context, by uint8) error // ErrNoDrawToAccept
 ```
 New ephemeral field `drawOfferBy *uint8` (owner-goroutine-only, like the other
-projection fields). New sentinels `ErrAbortTooLate`, `ErrNoDrawToAccept`. New
-config `AbortBeforePly uint32` (default 2) on `Config`/`FoldOptions` as
-appropriate. No wire-byte change; no new event types (all four already exist).
+projection fields). New sentinels `ErrAbortTooLate`, `ErrNoDrawToAccept`,
+`ErrGameNotLive` (§3.6). New config `AbortBeforePly uint32` (default 2) on
+`Config`. No wire-byte change; no new event types (all four already exist).
 
 ## 5. Edge cases & failure modes
 
@@ -182,6 +196,7 @@ appropriate. No wire-byte change; no new event types (all four already exist).
 | Both seats offer (mutual) | the second offer is an agreement → stream `DrawOffered{a}, DrawOffered{b}, DrawAccepted{b}, GameEnded{DRAW_AGREE}` (every accept pairs to a preceding offer). |
 | Resign by the side not to move | valid (you may resign anytime while live). |
 | Append fails mid-ending | session NOT marked ended; error surfaced; rebuild recovery closes it (one atomic batch, so no half-terminal). |
+| Resign/OfferDraw/AcceptDraw on a non-LIVE (MATCHED) game | `ErrGameNotLive`, nothing appended (else a Live-only event would make the stream unfoldable, §3.6). Abort is exempt (valid from MATCHED). |
 | Reconnect with a stale `DrawOffered` and no accept | offer treated as lapsed; not resurrected. |
 
 ## 6. Test plan
