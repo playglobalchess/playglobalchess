@@ -113,8 +113,12 @@ real, visible state the opponent responds to.
    Q-EG2) and append `DrawOffered{by}` (a visible event in the stream, so a
    reconnecting client/analysis sees the offer was made).
 3. A second offer by the same seat while one is pending is a no-op (idempotent).
-   An offer by the OTHER seat while one is pending is treated as an accept
-   (mutual offer = agreement) — it appends `DrawAccepted{other}` + `GameEnded`.
+   An offer by the OTHER seat while one is pending is a mutual agreement — it
+   appends `[DrawOffered{other}, DrawAccepted{other}, GameEnded{rv, DRAW_AGREE}]`
+   atomically. The `DrawOffered{other}` is appended FIRST so every
+   `DrawAccepted{X}` in the stream pairs to a preceding `DrawOffered{X}` — a
+   stream consumer (GS-6 replay, analysis, reconnection) can pair offers to
+   accepts by seat with no special case for the mutual path (see Q-EG5).
 
 `AcceptDraw(ctx, by)`:
 1. If `s.ended` → no-op success.
@@ -123,14 +127,17 @@ real, visible state the opponent responds to.
 3. Append `[DrawAccepted{by}, GameEnded{rv, DRAW_AGREE}]` atomically, `rv` = all
    draw. `endGame(TermDrawAgree)`.
 
-**Offer invalidation (Q-EG2):** a pending draw offer is cleared when the
-OFFERER makes a move (`SubmitMove` success clears `s.drawOfferBy` — offering then
-moving withdraws the offer, the standard rule). The offer is ephemeral session
-state, NOT reconstructed on rebuild: a `DrawOffered` with no following
-`DrawAccepted`/move in the stream is treated as lapsed on `NewSession` fold
-(a reconnect does not resurrect a stale offer — the offerer must re-offer). This
-keeps the fold free of offer-tracking and matches how players expect a dropped
-connection to behave.
+**Offer invalidation (Q-EG2):** a pending draw offer is cleared when EITHER seat
+makes a move. A move by the OFFERER withdraws the offer (offering then moving);
+a move by the OPPONENT implicitly DECLINES it (the standard chess rule — a draw
+offer stands only until the opponent's next move). So `SubmitMove` success on
+any seat clears `s.drawOfferBy`, and after `OfferDraw(0)` then `SubmitMove(1,…)`
+a later `AcceptDraw(1)` returns `ErrNoDrawToAccept` — the offer is gone. The
+offer is ephemeral session state, NOT reconstructed on rebuild: a `DrawOffered`
+with no following `DrawAccepted`/move in the stream is treated as lapsed on
+`NewSession` fold (a reconnect does not resurrect a stale offer — the offerer
+must re-offer). This keeps the fold free of offer-tracking and matches how
+players expect a dropped connection to behave.
 
 ### 3.4 Persist-before-ack & recovery
 
@@ -170,8 +177,9 @@ appropriate. No wire-byte change; no new event types (all four already exist).
 | Abort after move 2 (`ply >= AbortBeforePly`) | `ErrAbortTooLate`; not auto-converted to resign. |
 | Accept a draw with no pending offer | `ErrNoDrawToAccept`. |
 | Accept your OWN offer | `ErrNoDrawToAccept` (an offer is for the opponent). |
-| Offerer moves after offering | the move succeeds AND clears the pending offer (withdrawn). |
-| Both seats offer (mutual) | the second offer is an accept → `DRAW_AGREE`. |
+| Offerer moves after offering | the move succeeds AND clears the pending offer (offer withdrawn). |
+| OPPONENT moves instead of accepting | the move succeeds AND clears the pending offer (offer implicitly DECLINED — standard rule); a later `AcceptDraw` → `ErrNoDrawToAccept`. |
+| Both seats offer (mutual) | the second offer is an agreement → stream `DrawOffered{a}, DrawOffered{b}, DrawAccepted{b}, GameEnded{DRAW_AGREE}` (every accept pairs to a preceding offer). |
 | Resign by the side not to move | valid (you may resign anytime while live). |
 | Append fails mid-ending | session NOT marked ended; error surfaced; rebuild recovery closes it (one atomic batch, so no half-terminal). |
 | Reconnect with a stale `DrawOffered` and no accept | offer treated as lapsed; not resurrected. |
@@ -181,8 +189,10 @@ appropriate. No wire-byte change; no new event types (all four already exist).
 - **Resign:** live game → `Resign(0)` → stream has `Resigned{0}`+`GameEnded{RESIGN, rv=[loss,win]}`; `StateSnapshot` shows ended+RESIGN; a resend is a no-op.
 - **Abort eligibility:** `Abort` at ply 0/1 succeeds (ABORT, all-draw); at ply ≥ `AbortBeforePly` returns `ErrAbortTooLate` and the stream is untouched.
 - **Draw happy path:** `OfferDraw(0)` appends `DrawOffered{0}`; `AcceptDraw(1)` → `DrawAccepted{1}`+`GameEnded{DRAW_AGREE, all-draw}`.
-- **Draw rejections:** `AcceptDraw(1)` with no offer → `ErrNoDrawToAccept`; `AcceptDraw(0)` of seat 0's own offer → error; mutual offer → agreement.
-- **Offer withdrawn by move:** `OfferDraw(0)` then `SubmitMove(0,…)` → offer cleared; a later `AcceptDraw(1)` → `ErrNoDrawToAccept`.
+- **Draw rejections:** `AcceptDraw(1)` with no offer → `ErrNoDrawToAccept`; `AcceptDraw(0)` of seat 0's own offer → error.
+- **Offer withdrawn by offerer's move:** `OfferDraw(0)` then `SubmitMove(0,…)` → offer cleared; a later `AcceptDraw(1)` → `ErrNoDrawToAccept`.
+- **Offer declined by opponent's move (the edge the review caught):** `OfferDraw(0)` then `SubmitMove(1,…)` → offer cleared; a later `AcceptDraw(1)` → `ErrNoDrawToAccept` (NOT a forced draw on a declined offer).
+- **Mutual offer stream shape (Q-EG5):** `OfferDraw(0)` then `OfferDraw(1)` → stream is `DrawOffered{0}, DrawOffered{1}, DrawAccepted{1}, GameEnded{DRAW_AGREE}`; assert every `DrawAccepted{X}` has a preceding `DrawOffered{X}` (no unpaired accept).
 - **Persist-before-ack:** a store that fails the ending append → the command errors and the session is NOT ended (assert `StateSnapshot` still live).
 - **Idempotency / -race:** concurrent `Resign` + `SubmitMove` on the actor is serialized; a double `Resign` is one ending. Run the suite under `-race`.
 - **Recovery:** a stream ending in `Resigned`+`GameEnded` rebuilds as ended (no half-terminal special case).
@@ -194,15 +204,18 @@ appropriate. No wire-byte change; no new event types (all four already exist).
       §4A event(s) via `appendBatchAtHead`, ending the game atomically (NFR-7).
 - [ ] Abort eligibility rule (`ply < AbortBeforePly`, config default 2) with
       `ErrAbortTooLate`; resign always-legal-while-live; draw offer/accept with
-      offer-invalidation-on-move and the mutual-offer and self-accept rules.
+      offer-invalidation on EITHER seat's move (offerer withdraws, opponent
+      declines), the mutual-offer paired-stream shape (Q-EG5), and the
+      self-accept / no-offer rejections.
 - [ ] Idempotent against resend; `-race` clean; persist-before-ack honored.
 - [ ] No chess logic added (NFR-5, reviewer greps); no wire-byte / event-type
       change (no codec or parity impact).
-- [ ] Tests above green incl the edge-first rejection cases; `make test` green.
+- [ ] Tests above green incl the edge-first rejection cases (opponent-declines,
+      mutual-offer pairing); `make test` green.
 - [ ] Context-free independent review (state-machine + actor concurrency =
       load-bearing) before merge.
 
-## 10. Open questions
+## 8. Open questions
 
 - **Q-EG1 — abort eligibility window.** When is a quit an *abort* vs a
   *resign*? **Proposed:** abort allowed only while `ply < AbortBeforePly` (default
@@ -212,14 +225,15 @@ appropriate. No wire-byte change; no new event types (all four already exist).
   resign). Alternative: unilateral abort any time before move 1 only (`ply < 1`)
   — stricter, but ply<2 is the common "first moves not yet exchanged" bar.
 - **Q-EG2 — draw offer state: ephemeral vs folded.** A pending draw offer is
-  ephemeral session state (`drawOfferBy`), cleared on the offerer's move, and NOT
-  reconstructed from the stream on rebuild (a lapsed `DrawOffered` is treated as
-  withdrawn after a reconnect). **Proposed: ephemeral**, because resurrecting a
-  stale offer across a reconnect is surprising and would force the fold to track
-  offer/withdraw pairing. The `DrawOffered` event is still appended (visible in
-  history/analysis); only the *live pending* state is ephemeral. Alternative: fold
-  the offer so a reconnect sees it still pending — rejected as more fold
-  complexity for a worse UX.
+  ephemeral session state (`drawOfferBy`), cleared on EITHER seat's move (offerer
+  withdraws / opponent declines), and NOT reconstructed from the stream on
+  rebuild (a lapsed `DrawOffered` is treated as withdrawn after a reconnect).
+  **Proposed: ephemeral**, because resurrecting a stale offer across a reconnect
+  is surprising and would force the fold to track offer/withdraw/decline pairing.
+  The `DrawOffered` event is still appended (visible in history/analysis); only
+  the *live pending* state is ephemeral. Alternative: fold the offer so a
+  reconnect sees it still pending — rejected as more fold complexity for a worse
+  UX.
 - **Q-EG3 — AbortBeforePly config.** Default 2, tunable in `Config`. Trivial;
   flagged only so the default is a deliberate choice, not a magic literal.
 - **Q-EG4 — resign result vector for N-seat (ADR-3).** v1 is 2-seat: resigner
@@ -228,3 +242,11 @@ appropriate. No wire-byte change; no new event types (all four already exist).
   scope GS-3b to 2-seat (`seatCount == 2`); an N-seat resign rule is a variant
   concern (ADR-3 / F-07), out of scope here. The result-vector helper asserts
   `seatCount == 2` for now.
+- **Q-EG5 — mutual-offer stream shape.** When both seats offer, should the stream
+  carry a `DrawOffered` for each seat, or fold the second offer straight into the
+  accept? **Proposed:** append `DrawOffered{other}` BEFORE `DrawAccepted{other}`
+  so every `DrawAccepted{X}` pairs to a preceding `DrawOffered{X}` — a stream
+  consumer (GS-6 replay, analysis, reconnection) pairs offers to accepts by seat
+  with no special case. Alternative: emit a bare `DrawAccepted{other}` after
+  `DrawOffered{one}` — rejected because it leaves an accept with no matching
+  offer event, a leaky contract every consumer must special-case.
