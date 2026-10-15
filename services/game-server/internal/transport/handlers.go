@@ -321,13 +321,17 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 		return true
 	}
 	var err error
+	// offeredNew is set only for a genuine first draw offer (not a no-op repeat),
+	// so the transport notifies the opponent exactly once per real offer —
+	// honoring the session's idempotency at the notification layer.
+	offeredNew := false
 	switch kind {
 	case endingResign:
 		err = sess.Resign(ctx, seat)
 	case endingAbort:
 		err = sess.Abort(ctx, seat)
 	case endingOfferDraw:
-		err = sess.OfferDraw(ctx, seat)
+		offeredNew, err = sess.OfferDrawResult(ctx, seat)
 	case endingTakeback:
 		err = sess.Takeback(ctx, seat, 1)
 	}
@@ -348,11 +352,14 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 			// STATE to both seats so neither client's board silently diverges (S2).
 			s.broadcastState(ctx, gameID, snap)
 		case endingOfferDraw:
-			// A first (non-ending) draw offer: push DRAW_OFFERED{game_id, by} to
-			// the OPPONENT so a pending offer is a first-class notification (§4A
-			// v1.1, ADR-17 — this closes the former "pending offer not notified"
-			// limitation). The opponent accepts by sending their own OFFER_DRAW
-			// (the mutual-offer path ends the game via GAME_END).
+			// Push DRAW_OFFERED{game_id, by} to the OPPONENT only when a NEW offer
+			// was recorded (§4A v1.1, ADR-17). A no-op repeat by the same seat
+			// (offeredNew == false) sends nothing, so a double-click / resent
+			// OFFER_DRAW does not spam the opponent. The opponent accepts by
+			// sending their own OFFER_DRAW (the mutual path ends via GAME_END).
+			if !offeredNew {
+				break
+			}
 			other := uint8(1) - seat
 			if cc, present := s.connFor(gameID, other); present {
 				s.send(ctx, cc, codec.ServerMsg{Type: codec.SMDrawOffered, DrawOffered: &codec.DrawOfferedPayload{

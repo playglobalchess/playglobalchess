@@ -472,3 +472,31 @@ func TestOfferDrawPushesDrawOfferedToOpponent(t *testing.T) {
 		}
 	}
 }
+
+// TestRepeatOfferDrawNoDuplicateNotify is the regression for the no-op-repeat
+// double-notify: the session treats a second OFFER_DRAW by the already-pending
+// seat as a no-op, so the transport must NOT push a second DRAW_OFFERED to the
+// opponent (a double-click must not spam them).
+func TestRepeatOfferDrawNoDuplicateNotify(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	// White offers once → black gets exactly one DRAW_OFFERED.
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
+	black.waitForServer(t, codec.SMDrawOffered, 2*time.Second)
+	// White re-sends the SAME offer (no-op in the session) — black must NOT get
+	// a second notification.
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
+	time.Sleep(60 * time.Millisecond) // let any (wrong) second push arrive
+	n := 0
+	for _, m := range black.sent(t) {
+		if m.Type == codec.SMDrawOffered {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("opponent received %d DRAW_OFFERED, want exactly 1 (repeat offer must not re-notify)", n)
+	}
+}
