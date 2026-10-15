@@ -18,7 +18,18 @@ crate-type = ["cdylib", "rlib"]
 # consumers). This crate only re-exposes it to JS/wasm; it adds no codec logic.
 pgc-protocol = { path = "../codec" }
 wasm-bindgen = "0.2.95"
+# S4a typed message seam (SPEC-S4-WEB-F01 §3.0): converts the typed ClientMsg/
+# ServerMsg (which already derive serde for the Go postcard intermediate) to/from
+# plain JS objects at the boundary. The §4A FRAME bytes are still produced only
+# by pgc-protocol in Rust (NFR-5) — serde-wasm-bindgen only shapes the typed
+# convenience view, never the wire encoding.
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
 
 [dev-dependencies]
 # wasm-bindgen-test drives the parity test in a headless/node wasm runner.
 wasm-bindgen-test = "0.3.45"
+# js-sys lets the parity test build a HAND-CRAFTED JS object (via JSON.parse) —
+# the shape the TS client actually constructs — and prove it encodes to the
+# golden bytes, not only objects round-tripped from decode (self-bias guard).
+js-sys = "0.3"

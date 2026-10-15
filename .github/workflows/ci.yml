@@ -164,6 +164,42 @@ jobs:
             cargo clippy --manifest-path protocol/codec-cgo/Cargo.toml --all-targets -- -D warnings
             cargo test --manifest-path protocol/codec-cgo/Cargo.toml
           fi
+      - name: Node setup for the wasm parity runner
+        uses: actions/setup-node@v4
+        with:
+          # Node 26 — the Active LTS line (LTS from 2026-10-28; pinned now to
+          # avoid a second bump in two weeks). The project's Latest-LTS standard.
+          node-version: "26"
+      - name: Web codec wasm gate (SPEC-S4-WEB-F01 §3.0 — S4a seam + node parity)
+        run: |
+          # pgc-protocol-wasm (ADR-14 web consumer): fmt + clippy on the wasm
+          # target, then the node parity test (`wasm-pack test --node`) that
+          # replays the SHARED golden corpus through the compiled wasm codec and
+          # the S4a typed message seam — the NFR-10 proof on the actually-shipped
+          # web artifact. Was previously UNGATED (the protocol job built codec/
+          # codec-ffi/codec-cgo but not codec-wasm); S4a wires it.
+          # codec-wasm is a REAL crate (not a stub), so a missing manifest is a
+          # restructure that must FAIL the gate rather than silently skip the
+          # §4A parity proof — a gate that passes by finding nothing is not a
+          # gate (context-free review S1).
+          if [ ! -f protocol/codec-wasm/Cargo.toml ]; then
+            echo "::error::protocol/codec-wasm/Cargo.toml missing — the wasm codec gate cannot run; restructure must keep it discoverable."
+            exit 1
+          fi
+          rustup target add wasm32-unknown-unknown
+          # wasm-pack drives the headless node wasm runner. Install a PINNED
+          # version from crates.io (built from source, --locked) rather than a
+          # curl|sh of the latest installer — reproducible + no unverified remote
+          # shell in a release-gating job (context-free review S4).
+          cargo install wasm-pack --version 0.13.1 --locked
+          cargo fmt --manifest-path protocol/codec-wasm/Cargo.toml --all -- --check
+          cargo clippy --manifest-path protocol/codec-wasm/Cargo.toml --all-targets \
+            --target wasm32-unknown-unknown -- -D warnings
+          # NOTE (local dev only): on the sandboxed macOS dev box, TMPDIR points
+          # into $KIROCREW_SCRATCH and the node wasm runner's realpathSync EPERMs
+          # there — run with TMPDIR set to a project-local dir. CI (ubuntu) is
+          # unaffected, so no override is needed here.
+          ( cd protocol/codec-wasm && wasm-pack test --node )
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
