@@ -37,7 +37,8 @@ sole authority — clients send intents, never truth (§3.1 of the parent spec).
   → frame) across the `codec-cgo` C-ABI, mirroring the GS-4a event seam, with its
   own golden-vector parity + ABI-fuzz tests. §4A stays in Rust (NFR-5).
 - A `services/game-server/internal/transport` (or `cmd/`) package: a WS server
-  (gorilla/nhooyr-style — Q-GS6a) with one goroutine per connection (ADR-12),
+  (proposed `nhooyr.io/websocket` — Q-GS6a, behind a `Conn` interface so the
+  choice is reversible) with one goroutine per connection (ADR-12),
   `AUTHENTICATE` handshake, and a connection↔(game, seat) registry.
 - **Message dispatch:** decode each inbound frame via the seam, route by type to
   the matchmaker (`SEEK`) or the seat's live session (`MOVE`, `RESIGN`, `ABORT`,
@@ -49,7 +50,7 @@ sole authority — clients send intents, never truth (§3.1 of the parent spec).
   its last `ply`; the server replies `STATE{fen,turn,clocks}` folded from the
   durable stream (any node can serve it — GS-3 rebuilds from GS-4). The
   disconnected seat's clock keeps running; `TickFlagCheck` ends the game `FLAG`
-  if it flags before reconnats.
+  if it flags before the seat reconnects.
 - **The ghost-claim / join-timeout (GS-5 follow-up):** a seat that is `MATCHED`
   but whose connection never joins within a window is aborted — this is where the
   GS-5 "a game created from a just-expired seeker" residual is resolved.
