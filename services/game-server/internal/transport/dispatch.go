@@ -196,6 +196,8 @@ func (s *Server) route(ctx context.Context, c Conn, st *connState, msg codec.Cli
 			T: msg.Ping.T, ServerT: uint64(s.now().UnixMilli()),
 		}})
 		return true
+	case codec.CMResync:
+		return s.handleResync(ctx, c, msg.GameID)
 	default:
 		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "unknown message type"))
 		return true

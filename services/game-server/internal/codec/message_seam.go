@@ -56,6 +56,7 @@ const (
 	CMTakeback                          // 6
 	CMRematch                           // 7
 	CMPing                              // 8
+	CMResync                            // 9 (§4A v1.1, ADR-17)
 )
 
 // ClientMsg is a decoded client->server message. Exactly one payload pointer is
@@ -65,7 +66,7 @@ type ClientMsg struct {
 	Authenticate *AuthenticatePayload
 	Seek         *SeekPayload
 	Move         *MovePayload
-	// OfferDraw/Resign/Abort/Takeback/Rematch all carry only a game id.
+	// OfferDraw/Resign/Abort/Takeback/Rematch/Resync all carry only a game id.
 	GameID string
 	Ping   *PingPayload
 }
@@ -127,7 +128,8 @@ const (
 	SMState                             // 3
 	SMGameEnd                           // 4
 	SMPong                              // 5
-	SMError                             // 6
+	SMDrawOffered                       // 6 (§4A v1.1, ADR-17 — before Error, matching the Rust enum order)
+	SMError                             // 7
 )
 
 // StateBody — §4A.6 shared state format: fen:str, turn:u8, clocks:[u32].
@@ -148,7 +150,14 @@ type ServerMsg struct {
 	State        *StatePayload
 	GameEnd      *GameEndPayload
 	Pong         *PongPayload
+	DrawOffered  *DrawOfferedPayload
 	Error        *ErrorPayload
+}
+
+// DrawOfferedPayload — §4A v1.1 (ADR-17) DRAW_OFFERED: game_id, by:u8.
+type DrawOfferedPayload struct {
+	GameID string
+	By     uint8
 }
 
 // MatchedPayload — §4A.3 MATCHED: game_id, seat_idx:u8, opponent:str, start_state.
@@ -294,7 +303,7 @@ func marshalClientIntermediate(m ClientMsg) ([]byte, error) {
 		w.str(m.Move.GameID)
 		w.uvarint(uint64(m.Move.PlyExpected))
 		w.str(m.Move.UCI)
-	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch:
+	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch, CMResync:
 		w.str(m.GameID)
 	case CMPing:
 		if m.Ping == nil {
@@ -350,7 +359,7 @@ func unmarshalClientIntermediate(b []byte) (ClientMsg, error) {
 			return ClientMsg{}, err
 		}
 		m = ClientMsg{Type: CMMove, Move: &MovePayload{GameID: gid, PlyExpected: uint32(ply), UCI: uci}}
-	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch:
+	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch, CMResync:
 		gid, err := r.str()
 		if err != nil {
 			return ClientMsg{}, err
@@ -428,6 +437,12 @@ func marshalServerIntermediate(m ServerMsg) ([]byte, error) {
 		}
 		w.uvarint(m.Pong.T)
 		w.uvarint(m.Pong.ServerT)
+	case SMDrawOffered:
+		if m.DrawOffered == nil {
+			return nil, errNilPayload("DrawOffered")
+		}
+		w.str(m.DrawOffered.GameID)
+		w.u8(m.DrawOffered.By)
 	case SMError:
 		if m.Error == nil {
 			return nil, errNilPayload("Error")
@@ -550,6 +565,16 @@ func unmarshalServerIntermediate(b []byte) (ServerMsg, error) {
 			return ServerMsg{}, err
 		}
 		m = ServerMsg{Type: SMPong, Pong: &PongPayload{T: t, ServerT: st}}
+	case SMDrawOffered:
+		gid, err := r.str()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		by, err := r.u8()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		m = ServerMsg{Type: SMDrawOffered, DrawOffered: &DrawOfferedPayload{GameID: gid, By: by}}
 	case SMError:
 		code, err := r.u8()
 		if err != nil {

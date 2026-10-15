@@ -113,6 +113,11 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
                 t: 1_728_000_000_123,
             }),
         ),
+        (
+            // §4A v1.1 (ADR-17).
+            "client/resync",
+            Item::Client(ClientMsg::Resync { game_id: gid() }),
+        ),
         // --- server → client messages (every §4A.2 S code) ---
         (
             "server/matched",
@@ -178,6 +183,14 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
             Item::Server(ServerMsg::Pong {
                 t: 1_728_000_000_123,
                 server_t: 1_728_000_000_456,
+            }),
+        ),
+        (
+            // §4A v1.1 (ADR-17).
+            "server/draw_offered",
+            Item::Server(ServerMsg::DrawOffered {
+                game_id: gid(),
+                by: 1,
             }),
         ),
         (

@@ -282,6 +282,10 @@ pub enum ClientMsg {
     Ping {
         t: u64,
     },
+    /// §4A v1.1 (ADR-17).
+    Resync {
+        game_id: String,
+    },
 }
 
 /// Server → client messages (§4A.2).
@@ -316,6 +320,11 @@ pub enum ServerMsg {
     Pong {
         t: u64,
         server_t: u64,
+    },
+    /// §4A v1.1 (ADR-17).
+    DrawOffered {
+        game_id: String,
+        by: u8,
     },
     Error {
         code: ErrorCode,
@@ -428,6 +437,9 @@ impl ClientMsg {
                 game_id: GameId::from(game_id.as_str()),
             },
             ClientMsg::Ping { t } => CoreClient::Ping { t: *t },
+            ClientMsg::Resync { game_id } => CoreClient::Resync {
+                game_id: GameId::from(game_id.as_str()),
+            },
         }
     }
 
@@ -470,6 +482,9 @@ impl ClientMsg {
                 game_id: game_id.as_str().to_string(),
             },
             CoreClient::Ping { t } => ClientMsg::Ping { t: *t },
+            CoreClient::Resync { game_id } => ClientMsg::Resync {
+                game_id: game_id.as_str().to_string(),
+            },
         }
     }
 }
@@ -530,6 +545,10 @@ impl ServerMsg {
                 code: code.to_core(),
                 msg: msg.clone(),
             },
+            ServerMsg::DrawOffered { game_id, by } => CoreServer::DrawOffered {
+                game_id: pgc_protocol::GameId::from(game_id.as_str()),
+                by: *by,
+            },
         })
     }
 
@@ -586,6 +605,10 @@ impl ServerMsg {
             CoreServer::Error { code, msg } => ServerMsg::Error {
                 code: ErrorCode::from_core(*code)?,
                 msg: msg.clone(),
+            },
+            CoreServer::DrawOffered { game_id, by } => ServerMsg::DrawOffered {
+                game_id: game_id.as_str().to_string(),
+                by: *by,
             },
         })
     }

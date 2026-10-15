@@ -110,6 +110,35 @@ fn client_type_on_server_path_is_wrong_direction() {
     );
 }
 
+// §4A v1.1 (ADR-17): the two new codes obey the same direction rule as the rest
+// of the set — RESYNC (0x0A) is client-only, DRAW_OFFERED (0x87) is server-only.
+#[test]
+fn v11_resync_on_server_path_is_wrong_direction() {
+    let resync = encode_client(&ClientMsg::Resync {
+        game_id: GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+    })
+    .unwrap();
+    let res = decode_server(&resync);
+    assert!(
+        matches!(res, Err(CodecError::WrongDirection(0x0A, "server"))),
+        "expected WrongDirection(0x0A, server), got {res:?}"
+    );
+}
+
+#[test]
+fn v11_draw_offered_on_client_path_is_wrong_direction() {
+    let msg = encode_server(&ServerMsg::DrawOffered {
+        game_id: GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+        by: 1,
+    })
+    .unwrap();
+    let res = decode_client(&msg);
+    assert!(
+        matches!(res, Err(CodecError::WrongDirection(0x87, "client"))),
+        "expected WrongDirection(0x87, client), got {res:?}"
+    );
+}
+
 // --- bad enum discriminant --------------------------------------------------
 
 #[test]

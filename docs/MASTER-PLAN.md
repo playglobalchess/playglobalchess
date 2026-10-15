@@ -684,13 +684,13 @@ portable, but heavier ops than serverless DynamoDB for a greenfield team.
 
 **Unblocks.** SPEC-S2-GAME-SERVER-GS4 (Q-GS4A resolved) and the GS-4 build.
 
-## ADR-17 (new) · §4A protocol v1.1 — additive `RESYNC` + `DRAW_OFFERED` messages · **PROPOSED (awaiting owner approval)**
+## ADR-17 (new) · §4A protocol v1.1 — additive `RESYNC` + `DRAW_OFFERED` messages · **DECIDED (owner-approved 2026-10-16)**
 
 > Amends the frozen SPEC-S2-PROTOCOL §4A wire contract (G-D) with two ADDITIVE
 > message codes. Surfaced by SPEC-S2-GAME-SERVER-GS6, whose transport exposed two
 > gaps the frozen v1.0 message set cannot express. Per PROTOCOL §4.2, a post-G-D
 > wire change is a new protocol version and requires both-affected-streams +
-> architecture-group review — recorded here as that decision. **NOT yet owner-approved.**
+> architecture-group review — recorded here as that decision. Owner-approved 2026-10-16 (both Q-V11 readings accepted).
 
 **Context.** The GS-6 WS transport (merged) is complete for the F-01 move loop,
 but surfaced two things the frozen §4A v1.0 message set has no frame for:
@@ -761,7 +761,7 @@ on a pending offer) and the mobile parity re-run.
 | ADR-14 | new | One schema-defined binary wire codec in the shared Rust core | **DECIDED** | S2/S4/S5 |
 | ADR-15 | new | Go↔Rust via one uniform in-process cgo/staticlib C-ABI (a `<crate>-cgo` sibling per consumed crate) | **DECIDED** | S2/S1 + Architecture |
 | ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
-| ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **PROPOSED** (awaiting owner approval) | S2 + Architecture |
+| ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **DECIDED** | S2 + Architecture |
 
 ---
 

@@ -341,16 +341,51 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 			s.broadcastGameEnd(ctx, gameID)
 			return true
 		}
-		// A successful TAKEBACK rewinds the board but does not end the game, and
-		// §4A has no dedicated takeback frame — so push STATE to BOTH seats so
-		// neither client's board silently diverges from the server (S2 fix). A
-		// pending OFFER_DRAW likewise has no dedicated server frame; a STATE push
-		// surfaces the current position (the pending-offer NOTIFICATION itself is
-		// a documented v1 limitation, §3.7).
-		if kind == endingTakeback {
+		// Non-ending outcomes that the opponent must still learn about:
+		switch kind {
+		case endingTakeback:
+			// A takeback rewinds the board but §4A has no takeback frame — push
+			// STATE to both seats so neither client's board silently diverges (S2).
 			s.broadcastState(ctx, gameID, snap)
+		case endingOfferDraw:
+			// A first (non-ending) draw offer: push DRAW_OFFERED{game_id, by} to
+			// the OPPONENT so a pending offer is a first-class notification (§4A
+			// v1.1, ADR-17 — this closes the former "pending offer not notified"
+			// limitation). The opponent accepts by sending their own OFFER_DRAW
+			// (the mutual-offer path ends the game via GAME_END).
+			other := uint8(1) - seat
+			if cc, present := s.connFor(gameID, other); present {
+				s.send(ctx, cc, codec.ServerMsg{Type: codec.SMDrawOffered, DrawOffered: &codec.DrawOfferedPayload{
+					GameID: gameID, By: seat,
+				}})
+			}
 		}
 	}
+	return true
+}
+
+// handleResync serves an on-demand STATE resync (§4A v1.1 RESYNC, ADR-17): if the
+// connection is seated in the game, reply with the authoritative STATE folded
+// from the durable stream (same path as the auth-time server push); else
+// ERROR{UNKNOWN_GAME}. The complement to the Option-A auto-push.
+func (s *Server) handleResync(ctx context.Context, c Conn, gameID string) bool {
+	if _, seated := s.seatOf(c, gameID); !seated {
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "not seated in this game"))
+		return true
+	}
+	sess, ok := s.reg.Get(gameID)
+	if !ok {
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "no such live game"))
+		return true
+	}
+	snap, err := sess.StateSnapshot(ctx)
+	if err != nil {
+		s.send(ctx, c, errorMsg(codec.ECInternal, "could not read game state"))
+		return true
+	}
+	s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
+		GameID: gameID, State: snapshotToStateBody(snap),
+	}})
 	return true
 }
 

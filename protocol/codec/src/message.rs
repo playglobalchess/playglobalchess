@@ -51,6 +51,10 @@ pub enum ClientMsg {
     Rematch { game_id: GameId },
     /// `0x09` — `t:u64` (client monotonic ms).
     Ping { t: u64 },
+    /// `0x0A` (§4A v1.1, ADR-17) — `game_id:str36`. Client asks for a fresh STATE
+    /// for a game it is seated in (on-demand resync; complements the auth-time
+    /// server push).
+    Resync { game_id: GameId },
 }
 
 /// Server → client messages (§4A.2, codes `0x80–0xFF`).
@@ -93,6 +97,10 @@ pub enum ServerMsg {
     },
     /// `0x86` — `t:u64, server_t:u64`.
     Pong { t: u64, server_t: u64 },
+    /// `0x87` (§4A v1.1, ADR-17) — `game_id:str36, by:u8`. Pushed to the opponent
+    /// when a first (non-ending) draw OFFER is recorded, so a pending offer is a
+    /// first-class notification rather than a UI inference.
+    DrawOffered { game_id: GameId, by: u8 },
     /// `0x8F` — `code:enum8, msg:str`.
     Error { code: ErrorCode, msg: String },
 }
@@ -110,6 +118,8 @@ pub mod client_code {
     pub const TAKEBACK: u8 = 0x07;
     pub const REMATCH: u8 = 0x08;
     pub const PING: u8 = 0x09;
+    /// §4A v1.1 (ADR-17).
+    pub const RESYNC: u8 = 0x0A;
 }
 
 /// Server → client frozen type codes (§4A.2).
@@ -120,6 +130,8 @@ pub mod server_code {
     pub const STATE: u8 = 0x84;
     pub const GAME_END: u8 = 0x85;
     pub const PONG: u8 = 0x86;
+    /// §4A v1.1 (ADR-17).
+    pub const DRAW_OFFERED: u8 = 0x87;
     pub const ERROR: u8 = 0x8F;
 }
 
@@ -136,6 +148,7 @@ impl ClientMsg {
             ClientMsg::Takeback { .. } => client_code::TAKEBACK,
             ClientMsg::Rematch { .. } => client_code::REMATCH,
             ClientMsg::Ping { .. } => client_code::PING,
+            ClientMsg::Resync { .. } => client_code::RESYNC,
         }
     }
 }
@@ -150,6 +163,7 @@ impl ServerMsg {
             ServerMsg::State { .. } => server_code::STATE,
             ServerMsg::GameEnd { .. } => server_code::GAME_END,
             ServerMsg::Pong { .. } => server_code::PONG,
+            ServerMsg::DrawOffered { .. } => server_code::DRAW_OFFERED,
             ServerMsg::Error { .. } => server_code::ERROR,
         }
     }
@@ -239,4 +253,11 @@ pub(crate) struct PongPayload {
 pub(crate) struct ErrorPayload {
     pub code: ErrorCode,
     pub msg: String,
+}
+
+/// `DRAW_OFFERED` payload (§4A v1.1, ADR-17): `game_id, by`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DrawOfferedPayload {
+    pub game_id: GameId,
+    pub by: u8,
 }

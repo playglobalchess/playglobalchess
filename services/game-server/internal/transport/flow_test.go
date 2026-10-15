@@ -409,3 +409,66 @@ func TestSingleGameEndNoDoubleFire(t *testing.T) {
 		t.Fatalf("black received %d GAME_END frames, want exactly 1 (double-fire)", ne)
 	}
 }
+
+// TestResyncPushesState (§4A v1.1): a seated conn sending RESYNC gets a fresh
+// STATE for its game (on-demand resync, the RESYNC complement to the auth-time
+// auto-push).
+func TestResyncPushesState(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, _ := whiteBlack(ca, cb, seatA, seatB)
+	move(t, white, gameID, 1, "e2e4")
+	white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	// Any seated conn asks for a resync.
+	ca.feedClient(t, codec.ClientMsg{Type: codec.CMResync, GameID: gameID})
+	st := ca.waitForServer(t, codec.SMState, 2*time.Second)
+	if st.State.GameID != gameID || st.State.State.FEN == "" {
+		t.Fatalf("RESYNC STATE = %+v, want non-empty for %s", st.State, gameID)
+	}
+}
+
+// TestResyncNotSeatedRejected: RESYNC for a game the conn is not seated in →
+// ERROR{UNKNOWN_GAME}.
+func TestResyncNotSeatedRejected(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	_, _, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
+	cx := newFakeConn()
+	h.handle(ctx, cx)
+	cx.feedClient(t, codec.ClientMsg{Type: codec.CMAuthenticate, Authenticate: &codec.AuthenticatePayload{Token: "mallory"}})
+	time.Sleep(20 * time.Millisecond)
+	cx.feedClient(t, codec.ClientMsg{Type: codec.CMResync, GameID: gameID})
+	er := cx.waitForServer(t, codec.SMError, 2*time.Second)
+	if er.Error.Code != codec.ECUnknownGame {
+		t.Fatalf("RESYNC not-seated code = 0x%02x, want UNKNOWN_GAME(0x03)", er.Error.Code)
+	}
+}
+
+// TestOfferDrawPushesDrawOfferedToOpponent (§4A v1.1): a first (non-ending)
+// OFFER_DRAW pushes DRAW_OFFERED{game_id, by} to the OPPONENT.
+func TestOfferDrawPushesDrawOfferedToOpponent(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	whiteSeat := seatA
+	if seatA != 0 {
+		whiteSeat = seatB
+	}
+	// White offers a draw; black (opponent) must receive DRAW_OFFERED{by: whiteSeat}.
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
+	dob := black.waitForServer(t, codec.SMDrawOffered, 2*time.Second)
+	if dob.DrawOffered.GameID != gameID || dob.DrawOffered.By != whiteSeat {
+		t.Fatalf("DRAW_OFFERED = %+v, want {game:%s by:%d}", dob.DrawOffered, gameID, whiteSeat)
+	}
+	// The game is NOT ended (it was just an offer).
+	if sess, ok := h.srv.reg.Get(gameID); ok {
+		if snap, _ := sess.StateSnapshot(ctx); snap.Ended {
+			t.Fatal("game ended on a mere draw OFFER")
+		}
+	}
+}

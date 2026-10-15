@@ -188,21 +188,26 @@ archived `nhooyr.io/websocket` — same codebase, API-compatible; migrated in th
 slice while the import is isolated to one file behind the `Conn` interface,
 Q-GS6a).
 
-### 3.7 Known v1 limitations (frozen-§4A consequences)
+### 3.7 Known v1 limitations — RESOLVED by §4A v1.1 (ADR-17)
 
-Two gaps fall out of the frozen §4A message set, recorded honestly rather than
-worked around with an invented frame; both are slated for a deliberate §4A v1.1
-amendment slice (see §10):
+> **Update (§4A v1.1, ADR-17, SPEC-S2-PROTOCOL-V1.1):** both gaps below were
+> closed by the owner-approved additive amendment — `RESYNC` (client 0x0A) makes
+> reconnection client-requestable, and `DRAW_OFFERED` (server 0x87) push-notifies
+> a pending offer. The transport now routes `RESYNC`→`STATE` and pushes
+> `DRAW_OFFERED` to the opponent on a first offer. The text below is retained as
+> the original v1.0 record of why the amendment was made.
 
-- **Reconnection is server-push-on-auth, not client-requestable** (§3.4): §4A has
-  no `RESYNC` client code, so a client cannot ask for STATE on demand.
-- **A pending (non-ending) draw OFFER is not push-notified**: §4A has no
-  `DRAW_OFFERED` server code, so when a first `OFFER_DRAW` does not immediately
-  end the game, the opponent is not proactively told. The offer IS recorded
-  (GS-3b `drawOfferBy` + the `DrawOffered` event) and IS acceptable (the
-  opponent's own `OFFER_DRAW` triggers the agreement) — it is only the
-  notification that has no v1 frame. Agreed draws, resign, and abort all notify
-  both seats via `GAME_END`.
+Two gaps fell out of the frozen §4A v1.0 message set, recorded honestly rather
+than worked around with an invented frame; both were slated for (and are now
+closed by) the §4A v1.1 amendment:
+
+- **Reconnection was server-push-on-auth, not client-requestable** (§3.4): §4A
+  v1.0 had no `RESYNC` client code. (Closed: RESYNC 0x0A.)
+- **A pending (non-ending) draw OFFER was not push-notified**: §4A v1.0 had no
+  `DRAW_OFFERED` server code, so when a first `OFFER_DRAW` did not immediately
+  end the game, the opponent was not proactively told. The offer WAS recorded
+  (GS-3b `drawOfferBy` + the `DrawOffered` event) and acceptable — only the
+  notification lacked a v1.0 frame. (Closed: DRAW_OFFERED 0x87.)
 
 ## 4. Interfaces & contracts
 
