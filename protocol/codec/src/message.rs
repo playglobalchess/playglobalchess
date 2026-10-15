@@ -17,7 +17,13 @@ use crate::types::{
 };
 
 /// Client → server messages (§4A.2, codes `0x01–0x7F`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Serialize`/`Deserialize` are derived ONLY for the GS-6a cgo message boundary
+// (the postcard-of-ClientMsg intermediate the Go transport decodes). As with
+// GameEvent, this encodes by serde VARIANT INDEX and is NEVER the §4A wire form
+// — the frozen §4A frame is produced only by `crate::codec::encode_client`
+// (selected by the §4A.2 type byte). The golden-vector freeze test proves the
+// §4A encoding is unchanged by this derive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// `0x01` — `token:str`.
     Authenticate { token: AuthToken },
@@ -48,7 +54,12 @@ pub enum ClientMsg {
 }
 
 /// Server → client messages (§4A.2, codes `0x80–0xFF`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are for the GS-6a cgo message boundary only (see
+/// [`ClientMsg`]): the postcard of a `ServerMsg` is the intermediate the Go
+/// transport hands to `pgc_encode_server`. NOT the §4A frame — that is produced
+/// by [`crate::codec::encode_server`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMsg {
     /// `0x81` — `game_id:str36, seat_idx:u8, opponent:str, start_state:STATE-body`.
     Matched {

@@ -204,7 +204,46 @@ pub fn decode_client(frame: &[u8]) -> Result<ClientMsg, CodecError> {
 // --- server → client messages ----------------------------------------------
 
 /// Encode an `S→C` message to a wire frame (§4A.1).
+///
+/// Encode mirrors every closed-domain check `decode_server` enforces
+/// (`reason`/`termination`/`error code` `is_known`, `result_vector` range), so
+/// the codec is write/read SYMMETRIC: it cannot produce a server frame it would
+/// later refuse to decode. Without this, a caller (the GS-6a Go `EncodeServer`
+/// path) could emit a `MOVE_REJECTED`/`GAME_END`/`ERROR` carrying an
+/// out-of-contract discriminant that every conformant client — and the parity
+/// reencode — rejects (same write/read-asymmetry class as the GS-4a event S1
+/// fix, but on the live wire path, where an undecodable frame reaches a real
+/// client).
 pub fn encode_server(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
+    // Closed-domain guards, symmetric with decode_server (§8).
+    match msg {
+        ServerMsg::MoveRejected { reason, .. } if !reason.is_known() => {
+            return Err(CodecError::MalformedPayload(format!(
+                "refusing to encode unknown reason discriminant 0x{:02x}",
+                reason.value()
+            )));
+        }
+        ServerMsg::GameEnd {
+            termination,
+            result_vector,
+            ..
+        } => {
+            if !termination.is_known() {
+                return Err(CodecError::MalformedPayload(format!(
+                    "refusing to encode unknown termination discriminant 0x{:02x}",
+                    termination.value()
+                )));
+            }
+            check_result_vector(result_vector)?;
+        }
+        ServerMsg::Error { code, .. } if !code.is_known() => {
+            return Err(CodecError::MalformedPayload(format!(
+                "refusing to encode unknown error code discriminant 0x{:02x}",
+                code.value()
+            )));
+        }
+        _ => {}
+    }
     let type_code = msg.type_code();
     let payload = match msg {
         ServerMsg::Matched {
@@ -397,6 +436,29 @@ pub fn encode_envelope_intermediate(env: &EventEnvelope) -> Result<Vec<u8>, Code
 pub fn decode_envelope_intermediate(bytes: &[u8]) -> Result<EventEnvelope, CodecError> {
     postcard::from_bytes::<EventEnvelope>(bytes)
         .map_err(|e| CodecError::MalformedPayload(e.to_string()))
+}
+
+/// GS-6a cgo message-boundary intermediates. `decode_client_intermediate` turns
+/// a decoded [`ClientMsg`] into the postcard the Go transport reads (typed Seek/
+/// Move/… fields); `encode_server_intermediate` turns the Go-built [`ServerMsg`]
+/// postcard back into a value Rust re-encodes to the §4A frame. Symmetric,
+/// postcard-of-enum (serde variant index + fields), proven by the GS-6a golden
+/// parity test. NOT the §4A frame — that is `encode_client`/`encode_server`.
+/// Lives here so `codec-cgo` stays delegate-only.
+pub fn encode_client_intermediate(msg: &ClientMsg) -> Result<Vec<u8>, CodecError> {
+    ser(msg)
+}
+
+pub fn decode_client_intermediate(bytes: &[u8]) -> Result<ClientMsg, CodecError> {
+    postcard::from_bytes::<ClientMsg>(bytes).map_err(|e| CodecError::MalformedPayload(e.to_string()))
+}
+
+pub fn encode_server_intermediate(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
+    ser(msg)
+}
+
+pub fn decode_server_intermediate(bytes: &[u8]) -> Result<ServerMsg, CodecError> {
+    postcard::from_bytes::<ServerMsg>(bytes).map_err(|e| CodecError::MalformedPayload(e.to_string()))
 }
 
 fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {

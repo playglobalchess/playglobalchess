@@ -61,6 +61,19 @@ int32_t pgc_encode_event(const uint8_t *buf, size_t len,
 int32_t pgc_decode_event(const uint8_t *buf, size_t len,
                          uint8_t **out, size_t *out_len);
 
+/* GS-6a message seam. pgc_decode_client: IN = a client->server 4A frame, OUT =
+ * the postcard ClientMsg intermediate the Go transport reads. See
+ * pgc_reencode_client for out-params and ownership. */
+int32_t pgc_decode_client(const uint8_t *buf, size_t len,
+                          uint8_t **out, size_t *out_len);
+
+/* GS-6a message seam. pgc_encode_server: IN = the postcard ServerMsg
+ * intermediate the Go transport built, OUT = the canonical server->client 4A
+ * frame. A bad intermediate returns PGC_ERR_BAD_INTERMEDIATE. Keeps 4A encoding
+ * in Rust (NFR-5). Out-params/ownership as pgc_reencode_client. */
+int32_t pgc_encode_server(const uint8_t *buf, size_t len,
+                          uint8_t **out, size_t *out_len);
+
 /* Free a buffer handed out by a reencode_* success (same ptr+len). NULL = no-op. */
 void pgc_free(uint8_t *ptr, size_t len);
 
