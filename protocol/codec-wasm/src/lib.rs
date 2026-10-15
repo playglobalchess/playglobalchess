@@ -92,10 +92,16 @@ fn serde_err(e: serde_wasm_bindgen::Error) -> JsError {
     JsError::new(&e.to_string())
 }
 
-/// The serializer used by both `decode*` directions. `json_compatible()` makes
-/// Rust structs become plain JS objects (not `Map`s) — the ergonomic shape the
-/// TS client expects. **`serialize_large_number_types_as_bigints(true)` is
-/// load-bearing, not cosmetic:** without it `json_compatible()` emits `u64`
+/// The JS serializer shared by BOTH decode directions — `decode_server`
+/// (ServerMsg) AND `decode_client` (ClientMsg). It is deliberately
+/// direction-AGNOSTIC: both directions carry `u64` wire fields (`ClientMsg`'s
+/// `Ping.t`; `ServerMsg`'s `Pong.t`/`server_t`), so both need the same BigInt
+/// treatment — do NOT split this into a "client" vs "server" serializer or drop
+/// the BigInt option on either path (that reintroduces the B1 u64 lossiness).
+///
+/// `json_compatible()` makes Rust structs become plain JS objects (not `Map`s)
+/// — the ergonomic shape the TS client expects. **`serialize_large_number_types_as_bigints(true)`
+/// is load-bearing, not cosmetic:** without it `json_compatible()` emits `u64`
 /// (and `i64`) as a plain JS `number`, which only holds integers up to 2^53−1,
 /// so a `Ping.t`/`Pong.t`/`server_t` value above `Number.MAX_SAFE_INTEGER`
 /// would SILENTLY lose its low bits on decode and fail to re-encode. Those
@@ -105,7 +111,7 @@ fn serde_err(e: serde_wasm_bindgen::Error) -> JsError {
 /// `u64` wire field is therefore `bigint`. (A caller that hands a plain JS
 /// number for a u64 field still works while it is ≤ 2^53−1, since the
 /// deserializer accepts a number OR a BigInt within u64 bounds.)
-fn server_serializer() -> serde_wasm_bindgen::Serializer {
+fn typed_serializer() -> serde_wasm_bindgen::Serializer {
     serde_wasm_bindgen::Serializer::json_compatible().serialize_large_number_types_as_bigints(true)
 }
 
@@ -125,7 +131,7 @@ pub fn encode_client(msg: JsValue) -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen(js_name = decodeServer)]
 pub fn decode_server(frame: &[u8]) -> Result<JsValue, JsError> {
     let msg = pgc_protocol::decode_server(frame).map_err(js_err)?;
-    msg.serialize(&server_serializer()).map_err(serde_err)
+    msg.serialize(&typed_serializer()).map_err(serde_err)
 }
 
 /// **S4a (test mirror).** Build a §4A server→client FRAME from a typed JS
@@ -144,5 +150,5 @@ pub fn encode_server(msg: JsValue) -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen(js_name = decodeClient)]
 pub fn decode_client(frame: &[u8]) -> Result<JsValue, JsError> {
     let msg = pgc_protocol::decode_client(frame).map_err(js_err)?;
-    msg.serialize(&server_serializer()).map_err(serde_err)
+    msg.serialize(&typed_serializer()).map_err(serde_err)
 }
