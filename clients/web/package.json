@@ -1,0 +1,40 @@
+{
+  "name": "@playglobalchess/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "S4 web client (F-01 first-playable). Vite + React + TypeScript strict. Binds the one shared §4A codec via pgc-protocol-wasm (NFR-5); never re-implements chess rules or the wire format.",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "codec:build": "wasm-pack build ../../protocol/codec-wasm --target bundler --out-dir pkg",
+    "dev": "npm run codec:build && vite",
+    "build": "npm run codec:build && tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "i18n:check": "node scripts/i18n-check.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "pgc-protocol-wasm": "file:../../protocol/codec-wasm/pkg",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.37.0",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.1",
+    "@typescript-eslint/eslint-plugin": "8.46.0",
+    "@typescript-eslint/parser": "8.46.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "eslint": "9.37.0",
+    "eslint-plugin-react-hooks": "7.0.0",
+    "jsdom": "28.0.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.4",
+    "vite-plugin-wasm": "3.6.0",
+    "vitest": "5.0.5"
+  }
+}

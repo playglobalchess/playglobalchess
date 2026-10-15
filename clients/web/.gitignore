@@ -1,0 +1,6 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+# the wasm seam is built on demand (codec:build) from protocol/codec-wasm — the
+# local file dependency resolves to its (gitignored) pkg/ artifact, not committed here.
