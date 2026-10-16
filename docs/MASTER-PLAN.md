@@ -740,7 +740,7 @@ to see an offer; a dedicated push is cleaner.
 GS-6a/GS-6 seam extension + the transport wiring: RESYNC→STATE, push DRAW_OFFERED
 on a pending offer) and the mobile parity re-run.
 
-## ADR-18 (new) · §4A protocol v1.2 — `MOVE_ACCEPTED` carries `uci` + is broadcast to BOTH seats · **PROPOSED (owner-directed 2026-10-16; awaiting ratification)**
+## ADR-18 (new) · §4A protocol v1.2 — `MOVE_ACCEPTED` carries `uci` + is broadcast to BOTH seats · **DECIDED (owner-approved 2026-10-16; Q-V12a uci-after-ply + Q-V12b one-frame-both-seats accepted)**
 
 > Amends the frozen SPEC-S2-PROTOCOL §4A move hot path. Surfaced building the S4
 > web client (SPEC-S4-WEB-F01): the GS-6 transport sends `MOVE_ACCEPTED` to the
@@ -831,7 +831,7 @@ reducer/move path (SPEC-S4-WEB-F01 §3.3), currently blocked on it.
 | ADR-15 | new | Go↔Rust via one uniform in-process cgo/staticlib C-ABI (a `<crate>-cgo` sibling per consumed crate) | **DECIDED** | S2/S1 + Architecture |
 | ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
 | ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **DECIDED** | S2 + Architecture |
-| ADR-18 | new | §4A protocol v1.2 — MOVE_ACCEPTED carries `uci` + broadcast to BOTH seats; mutates a frozen frame (safe pre-first-client) | **PROPOSED** | S2 + S4 + Architecture |
+| ADR-18 | new | §4A protocol v1.2 — MOVE_ACCEPTED carries `uci` + broadcast to BOTH seats; mutates a frozen frame (safe pre-first-client) | **DECIDED** | S2 + S4 + Architecture |
 
 ---
 
