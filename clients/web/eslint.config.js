@@ -59,4 +59,13 @@ export default [
       globals: nodeGlobals,
     },
   },
+  {
+    // Tests control their own invariants: a non-null assertion on an array
+    // index the test just populated is clearer than a redundant guard. The ban
+    // stays a hard error in production src (above).
+    files: ["src/**/*.test.ts"],
+    rules: {
+      "@typescript-eslint/no-non-null-assertion": "off",
+    },
+  },
 ];
