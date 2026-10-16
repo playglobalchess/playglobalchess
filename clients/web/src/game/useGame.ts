@@ -132,9 +132,24 @@ export function useGame(opts: UseGameOptions): UseGameResult {
 
   const move = useCallback((uci: string) => {
     const s = stateRef.current;
-    if (s.phase !== "playing" || s.gameId == null) return;
-    // Optimistic local apply first (reducer guards turn/pending), then the send
-    // with ply+1 read from the CURRENT reducer ply (not a stale closure).
+    if (s.phase !== "playing" || s.gameId == null || s.position == null) return;
+    // Enforce the reducer's OWN preconditions here, not just in the view: a MOVE
+    // frame must never go to the wire without a corresponding optimistic apply.
+    //  - a move is already pending (awaiting accept/reject) → the reducer would
+    //    drop the localMove, so sending another frame risks two frames with the
+    //    same ply_expected. Refuse.
+    //  - it is not our turn → the reducer drops the localMove; a send would only
+    //    earn a NOT_YOUR_TURN reject. Refuse.
+    // This closes the double-send/off-turn window the view's board gate also
+    // guards, so a direct commands.move() cannot bypass the contract.
+    if (s.pendingMove != null) return;
+    const myTurn =
+      (s.mySeat === 0 && s.position.turn === "w") ||
+      (s.mySeat === 1 && s.position.turn === "b");
+    if (!myTurn) return;
+    // Optimistic local apply, then the send with ply+1 from the CURRENT reducer
+    // ply (read at call time — move() runs in a click handler, after the mirror
+    // effect has committed the latest state).
     dispatch({ kind: "localMove", uci });
     sockRef.current?.move(s.gameId, s.ply + 1, uci);
   }, []);

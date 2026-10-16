@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseFen, applyUci, squareToIndex } from "./position";
+import { parseFen, applyUci, squareToIndex, plyFromFen } from "./position";
 
 function at(fen: string, uci: string, sq: string): string | null {
   const pos = applyUci(parseFen(fen), uci);
@@ -71,5 +71,24 @@ describe("board position (mechanical apply — render only, NOT a rules engine)"
 
   it("rejects a malformed FEN that does not fill the board", () => {
     expect(() => parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP w KQkq - 0 1")).toThrow();
+  });
+});
+
+describe("plyFromFen (resync ply recovery — STATE carries no ply)", () => {
+  it("startpos is ply 0", () => {
+    expect(plyFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")).toBe(0);
+  });
+  it("after 1.e4 (black to move, fullmove 1) is ply 1", () => {
+    expect(plyFromFen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")).toBe(1);
+  });
+  it("after 1.e4 e5 (white to move, fullmove 2) is ply 2", () => {
+    expect(plyFromFen("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2")).toBe(2);
+  });
+  it("a resumed mid-game FEN derives the right ply (fullmove 5, black) → ply 9", () => {
+    expect(plyFromFen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 2 5")).toBe(9);
+  });
+  it("a missing/garbled move-number field falls back to fullmove 1 (ply from side only)", () => {
+    expect(plyFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b")).toBe(1);
+    expect(plyFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w")).toBe(0);
   });
 });

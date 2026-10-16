@@ -9,7 +9,7 @@ import { t } from "./i18n";
 import { codecProtocolVersion } from "./codec/seam";
 import { useGame } from "./game/useGame";
 import { Board } from "./game/Board";
-import { Reason, Termination, type ReasonCode } from "./codec/messages";
+import { Reason, ErrorCode, type ReasonCode } from "./codec/messages";
 
 // The dev matchmaking pool + time control for first-playable. These are fixed
 // dev constants in this slice (a pool/time-control picker is a later slice).
@@ -85,6 +85,14 @@ function GameView({ token }: { token: string }): React.JSX.Element {
     <main>
       <h1>{t("app.title")}</h1>
       <p role="status">{statusText}</p>
+
+      {state.error != null ? (
+        <p role="alert">
+          {state.error === ErrorCode.UnsupportedVersion
+            ? t("error.unsupported_version")
+            : t("error.generic")}
+        </p>
+      ) : null}
 
       {state.phase === "idle" || state.phase === "seeking" ? (
         <button
@@ -188,8 +196,6 @@ function resultText(state: {
   if (mine === 2) return t("game.result.win");
   if (mine === 0) return t("game.result.loss");
   if (mine === 1) return t("game.result.draw");
-  // Fallback by termination (e.g. an abort with no seat result).
-  return state.result?.termination === Termination.Abort
-    ? t("game.result.over")
-    : t("game.result.over");
+  // No seat result (e.g. an abort) — a neutral game-over message.
+  return t("game.result.over");
 }

@@ -193,6 +193,19 @@ describe("useGame", () => {
     expect(countMsgs(h.fake(), "Resync")).toBe(2);
   });
 
+  it("move() refuses to send a second MOVE while one is pending (S1 guard)", () => {
+    const h = mountHook();
+    act(() => h.fake().open());
+    act(() => h.fake().push(matched)); // ply 0, white to move
+    act(() => h.get().commands.move("e2e4")); // first move → pending
+    expect(h.get().state.pendingMove?.uci).toBe("e2e4");
+    act(() => h.get().commands.move("d2d4")); // second, while pending
+    // Exactly ONE Move frame was sent — the guard blocked the second (which
+    // would otherwise ship a frame with the same ply_expected and no optimistic
+    // state behind it).
+    expect(countMsgs(h.fake(), "Move")).toBe(1);
+  });
+
   it("closes the socket on unmount", () => {
     const h = mountHook();
     const f = h.fake();

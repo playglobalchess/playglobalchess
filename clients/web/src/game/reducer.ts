@@ -10,11 +10,13 @@
 // resync). The one exception is the OPTIMISTIC local move, which is immediately
 // REVERTED if the server rejects it (§3.3).
 
-import { type Position, parseFen, applyUci } from "../board/position";
+import { type Position, parseFen, applyUci, plyFromFen } from "../board/position";
 import {
   type ServerMsg,
   type ReasonCode,
   type TerminationCode,
+  type ErrorCodeValue,
+  Reason,
   serverTag,
 } from "../codec/messages";
 
@@ -50,6 +52,9 @@ export interface GameState {
   /** Set when the reducer detects a ply gap (a MOVE_ACCEPTED skipped ahead): the
    * GameSocket reads this and sends RESYNC to pull a fresh STATE. Cleared by STATE. */
   needsResync: boolean;
+  /** A protocol/transport Error the UI must surface (e.g. UNSUPPORTED_VERSION →
+   * "please refresh"). null when there is no active error. */
+  error: ErrorCodeValue | null;
 }
 
 export const initialState: GameState = {
@@ -65,6 +70,7 @@ export const initialState: GameState = {
   result: null,
   lastReject: null,
   needsResync: false,
+  error: null,
 };
 
 export type Action =
@@ -129,7 +135,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         mySeat: m.seat_idx,
         opponent: m.opponent,
         position: parseFen(m.start_state.fen),
-        ply: 0,
+        ply: plyFromFen(m.start_state.fen),
         clocks: m.start_state.clocks.slice(),
       };
     }
@@ -192,6 +198,11 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
 
     case "MoveRejected": {
       const r = (msg as { MoveRejected: { game_id: string; ply_expected: number; reason: ReasonCode } }).MoveRejected;
+      // A StalePly reject is precisely the signal that our ply is behind the
+      // server — raise needsResync so the hook pulls a fresh STATE (which
+      // restores ply). Without this, a reject with no pending move leaves us
+      // wedged at a stale ply with no recovery trigger.
+      const stale = r.reason === Reason.StalePly;
       // Revert the optimistic move if one is pending.
       if (state.pendingMove != null) {
         return {
@@ -200,9 +211,10 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
           ply: state.pendingMove.prevPly,
           pendingMove: null,
           lastReject: r.reason,
+          needsResync: stale ? true : state.needsResync,
         };
       }
-      return { ...state, lastReject: r.reason };
+      return { ...state, lastReject: r.reason, needsResync: stale ? true : state.needsResync };
     }
 
     case "State": {
@@ -214,9 +226,16 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         phase: state.phase === "game_over" ? "game_over" : "playing",
         gameId: s.game_id,
         position: parseFen(s.state.fen),
+        // CRITICAL: restore ply from the FEN. StateBody carries no ply, but ply
+        // is exactly what a gap desynchronized — if we leave it stale, the next
+        // MOVE sends ply_expected = stale+1 and the server rejects it StalePly
+        // forever (the resync would "succeed" visually yet wedge the player).
+        ply: plyFromFen(s.state.fen),
         clocks: s.state.clocks.slice(),
         pendingMove: null,
         needsResync: false,
+        // A fresh authoritative STATE means the connection is healthy again.
+        lastReject: null,
       };
     }
 
@@ -232,6 +251,8 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         phase: "game_over",
         pendingMove: null,
         drawOffer: null,
+        needsResync: false,
+        lastReject: null,
         result: { termination: g.termination, resultVector: g.result_vector.slice() },
       };
     }
@@ -240,10 +261,14 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       // Clock-sync pong; no game-state change in this slice (latency display later).
       return state;
 
-    case "Error":
-      // Protocol/transport error; surfaced by the socket layer, no reducer state
-      // change here (UNSUPPORTED_VERSION closes the socket in the GameSocket).
-      return state;
+    case "Error": {
+      // Surface the error to the UI (e.g. UNSUPPORTED_VERSION → "please
+      // refresh"). The GameSocket also closes the socket on UNSUPPORTED_VERSION;
+      // here we record the code so GameView can render the right message rather
+      // than only a generic "disconnected" status.
+      const e = (msg as { Error: { code: ErrorCodeValue; msg: string } }).Error;
+      return { ...state, error: e.code };
+    }
 
     default:
       // Exhaustiveness: a new ServerMsg variant must be handled explicitly.
