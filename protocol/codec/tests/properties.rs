@@ -109,10 +109,11 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
                 start_state: st,
             }
         }),
-        (arb_game_id(), any::<u32>(), any::<u32>()).prop_map(|(g, p, c)| {
+        (arb_game_id(), any::<u32>(), arb_uci(), any::<u32>()).prop_map(|(g, p, u, c)| {
             ServerMsg::MoveAccepted {
                 game_id: g,
                 ply: p,
+                uci: u,
                 clock_after_ms: c,
             }
         }),

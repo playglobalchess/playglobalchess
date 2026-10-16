@@ -264,10 +264,12 @@ pub fn encode_server(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
         ServerMsg::MoveAccepted {
             game_id,
             ply,
+            uci,
             clock_after_ms,
         } => ser(&MoveAcceptedPayload {
             game_id: game_id.clone(),
             ply: *ply,
+            uci: uci.clone(),
             clock_after_ms: *clock_after_ms,
         })?,
         ServerMsg::MoveRejected {
@@ -334,6 +336,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, CodecError> {
             Ok(ServerMsg::MoveAccepted {
                 game_id: p.game_id,
                 ply: p.ply,
+                uci: p.uci,
                 clock_after_ms: p.clock_after_ms,
             })
         }

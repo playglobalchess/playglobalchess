@@ -283,9 +283,19 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 		// ClockFlagged+GameEnded ending. Broadcast GAME_END to both seats.
 		s.broadcastGameEnd(ctx, p.GameID)
 	case out.Accepted:
-		s.send(ctx, c, codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
-			GameID: p.GameID, Ply: out.Ply, ClockAfterMs: out.ClockAfterMs,
-		}})
+		// §4A v1.2 (ADR-18): broadcast MOVE_ACCEPTED (carrying the authoritative
+		// uci) to BOTH seats, not just the mover — the mover confirms its
+		// optimistic move, the opponent learns and applies it. uci comes from
+		// out.UCI (the pipeline's authoritative value: the fresh move or, on a
+		// re-ack, the PERSISTED move), never the request's p.UCI.
+		acc := codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
+			GameID: p.GameID, Ply: out.Ply, UCI: out.UCI, ClockAfterMs: out.ClockAfterMs,
+		}}
+		for seat := uint8(0); seat < 2; seat++ {
+			if cc, present := s.connFor(p.GameID, seat); present {
+				s.send(ctx, cc, acc)
+			}
+		}
 		// An engine-detected terminal (mate/stalemate/draw) ended the game.
 		if out.Terminal != nil {
 			s.broadcastGameEnd(ctx, p.GameID)

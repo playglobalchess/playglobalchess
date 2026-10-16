@@ -300,6 +300,7 @@ pub enum ServerMsg {
     MoveAccepted {
         game_id: String,
         ply: u32,
+        uci: String,
         clock_after_ms: u32,
     },
     MoveRejected {
@@ -507,10 +508,12 @@ impl ServerMsg {
             ServerMsg::MoveAccepted {
                 game_id,
                 ply,
+                uci,
                 clock_after_ms,
             } => CoreServer::MoveAccepted {
                 game_id: GameId::from(game_id.as_str()),
                 ply: *ply,
+                uci: uci.clone(),
                 clock_after_ms: *clock_after_ms,
             },
             ServerMsg::MoveRejected {
@@ -568,10 +571,12 @@ impl ServerMsg {
             CoreServer::MoveAccepted {
                 game_id,
                 ply,
+                uci,
                 clock_after_ms,
             } => ServerMsg::MoveAccepted {
                 game_id: game_id.as_str().to_string(),
                 ply: *ply,
+                uci: uci.clone(),
                 clock_after_ms: *clock_after_ms,
             },
             CoreServer::MoveRejected {

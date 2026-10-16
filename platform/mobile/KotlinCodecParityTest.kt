@@ -19,6 +19,8 @@ private const val CLIENT_MOVE_PROMO_HEX =
     "01032466343761633130622d353863632d343337322d613536372d30653032623263336434373967056537653871"
 private const val SERVER_GAME_END_HEX =
     "01852466343761633130622d353863632d343337322d613536372d3065303262326333643437390202000a021817"
+private const val SERVER_MOVE_ACCEPTED_HEX =
+    "01822466343761633130622d353863632d343337322d613536372d3065303262326333643437391204653265349c9412"
 private const val EVENT_RATING_APPLIED_HEX =
     "2967616d652f66343761633130622d353863632d343337322d613536372d3065303262326333643437390c0c008080cea6a5320e626c69747a2d7374616e646172640200b817d0173c8fc2753d01b817a0173c8fc2753d"
 
@@ -36,6 +38,9 @@ fun main() {
 
     val s = fromHex(SERVER_GAME_END_HEX)
     check(encodeServer(decodeServer(s)).contentEquals(s), "server game_end decode→re-encode identical")
+
+    val ma = fromHex(SERVER_MOVE_ACCEPTED_HEX)
+    check(encodeServer(decodeServer(ma)).contentEquals(ma), "server move_accepted (§4A v1.2, carries uci) decode→re-encode identical")
 
     val e = fromHex(EVENT_RATING_APPLIED_HEX)
     check(encodeEvent(decodeEvent(e)).contentEquals(e), "event rating_applied decode→re-encode identical")

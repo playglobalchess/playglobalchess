@@ -4,11 +4,11 @@
 |---|---|
 | Spec ID | SPEC-S2-PROTOCOL-V1.2 (amends SPEC-S2-PROTOCOL §4A; implements ADR-18) |
 | Owner | S2 Real-time + S4 Web + Architecture |
-| Status | REVIEW |
-| Version | 0.1 |
+| Status | RATIFIED (owner-approved 2026-10-16; Q-V12a + Q-V12b decided) — IMPLEMENTED by this PR |
+| Version | 1.0 |
 | Last updated | 2026-10-16 |
 | Implements (master IDs) | X-2, X-13, ADR-14, ADR-18, NFR-1, NFR-5, NFR-10 |
-| Depends on | ADR-18 (PROPOSED — this slice does not implement until ADR-18 is owner-approved); the merged codec + GS-6a/GS-6 seams + GS-6 transport + §4A v1.1 (ADR-17) |
+| Depends on | ADR-18 (DECIDED, owner-approved 2026-10-16); the merged codec + GS-6a/GS-6 seams + GS-6 transport + §4A v1.1 (ADR-17) |
 | Gates it feeds | None directly. Unblocks the S4 web client's reducer/move path (SPEC-S4-WEB-F01 §3.3), which is currently blocked: a two-human game cannot show the opponent's moves. Re-runs the G-D freeze corpus with the changed MOVE_ACCEPTED frame. |
 
 > **Why this slice exists.** Building the S4 web client surfaced that the §4A
@@ -125,31 +125,37 @@ not the request's `p.UCI`. This is a Go-side addition (no wire effect beyond the
 
 ## 7. Acceptance criteria (Definition of Done)
 
-- [ ] `ServerMsg::MoveAccepted` carries `uci`; round-trips through the real
+- [x] `ServerMsg::MoveAccepted` carries `uci`; round-trips through the real
       Rust/cgo/wasm seam; golden corpus regenerated with exactly one changed
       vector (`server/move_accepted`), freeze test green.
-- [ ] GS-6 broadcasts MOVE_ACCEPTED (with `uci`) to both seats on an accepted
+- [x] GS-6 broadcasts MOVE_ACCEPTED (with `uci`) to both seats on an accepted
       non-terminal move; terminal + re-ack + disconnected-opponent paths correct.
-- [ ] `game.MoveOutcome` carries `UCI`, set from the authoritative source on BOTH
+- [x] `game.MoveOutcome` carries `UCI`, set from the authoritative source on BOTH
       paths (fresh = `in.UCI`, re-ack = persisted `mv.UCI`); the transport reads
       `out.UCI`, never `p.UCI`. A retry with a different uci for a persisted ply
       re-acks the PERSISTED move.
-- [ ] `TestMoveBroadcastToBothSeats` proves the opponent receives the move; the
+- [x] `TestMoveBroadcastToBothSeats` proves the opponent receives the move; the
       e2e consumes the opponent's move.
-- [ ] cgo + wasm node-parity + mobile parity green against the regenerated corpus.
-- [ ] `cargo fmt --check` on every touched Rust crate; go.mod ↔ CI setup-go
+- [x] cgo + wasm node-parity + mobile parity green against the regenerated corpus
+      (mobile host-parity harness run locally: Swift byte-identical, Kotlin compiles).
+- [x] `cargo fmt --check` on every touched Rust crate; go.mod ↔ CI setup-go
       unchanged (no new dep); the mobile parity harness re-run (protocol/** changed).
-- [ ] A context-free independent reviewer has reviewed the diff (load-bearing:
-      frozen-frame mutation + hot-path broadcast) BEFORE merge.
+- [x] A context-free independent reviewer reviewed the diff (load-bearing:
+      frozen-frame mutation + hot-path broadcast) — APPROVE, no blocker; its
+      SHOULD-FIX/NICE items applied.
 
-## 8. Open questions
+> **Status:** IMPLEMENTED by the §4A v1.2 PR (feat/protocol-v1.2-moveaccepted-uci).
+> One cross-branch item remains OUTSIDE this slice: the S4 web client's TS
+> `ServerMsg.MoveAccepted` type + its `seam.test` fixture gain `uci` when
+> `feat/s4-web-f01-client` resumes (that type lives in `clients/web`, not here).
 
-- **Q-V12a — field position of `uci`.** `{game_id, ply, uci, clock_after_ms}`
-  (uci after ply, matching the `MovePlayed` event body) vs appended at the end
-  `{…, clock_after_ms, uci}`. **Proposed: after `ply`** — reads 1:1 against the
-  event body and groups the move identity (`ply`+`uci`) before the clock. Either
-  is a one-time frozen-frame change; pick the one that matches the event body.
-- **Q-V12b — does the mover's ack and the opponent's notification need to
-  differ?** **Proposed: no** — one identical `MOVE_ACCEPTED{uci}` to both seats.
-  The mover uses it to confirm/replace its optimistic move; the opponent uses it
-  to apply the move. One frame, one code path, no divergence.
+## 8. Open questions — DECIDED (owner-approved 2026-10-16)
+
+- **Q-V12a — field position of `uci`.** **DECIDED: after `ply`** —
+  `{game_id, ply, uci, clock_after_ms}`, matching the `MovePlayed` event body so
+  the frame reads 1:1 against the event and groups the move identity
+  (`ply`+`uci`) before the clock.
+- **Q-V12b — mover ack vs opponent notification.** **DECIDED: one identical
+  `MOVE_ACCEPTED{uci}` to both seats** — the mover confirms/replaces its
+  optimistic move, the opponent applies it; one frame, one code path, no
+  divergence.

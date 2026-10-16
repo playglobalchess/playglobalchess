@@ -96,6 +96,14 @@ type MoveOutcome struct {
 	AppliedSeq   uint32
 	Ply          uint32
 	ClockAfterMs uint32
+	// UCI is the move just applied (§4A v1.2, ADR-18). Set on BOTH accept paths
+	// from the authoritative source: the fresh-accept path copies the request's
+	// in.UCI (the move just validated+persisted); the idempotent re-ack path
+	// copies the PERSISTED event's uci (mv.UCI from findMove), NEVER the retry's
+	// request — so a retry carrying a different uci for an already-persisted ply
+	// re-acks the persisted move. Empty unless Accepted. The transport sends this
+	// in MOVE_ACCEPTED to both seats; it must read out.UCI, not the request.
+	UCI string
 	// NewFEN is the position AFTER the accepted move (the engine's verdict). The
 	// live-session caches it as the next move's CurFEN, which is what keeps the
 	// move path at one engine round-trip (no stream replay). Empty unless
@@ -179,6 +187,7 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 				Accepted:     true,
 				AppliedSeq:   mvSeq, // the move's REAL seq, not 0
 				Ply:          mv.Ply,
+				UCI:          mv.UCI, // the PERSISTED move's uci, not the retry's (§4A v1.2)
 				ClockAfterMs: mv.ClockAfterMs,
 			}, nil
 		}
@@ -265,6 +274,7 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 				Accepted:     true,
 				AppliedSeq:   mvSeq,
 				Ply:          mv.Ply,
+				UCI:          mv.UCI, // persisted move's uci (§4A v1.2)
 				ClockAfterMs: mv.ClockAfterMs,
 			}, nil
 		}
@@ -289,6 +299,7 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		Accepted:     true,
 		AppliedSeq:   seq,
 		Ply:          ply,
+		UCI:          in.UCI, // the move just validated + persisted (§4A v1.2)
 		ClockAfterMs: clockAfter,
 		NewFEN:       verdict.NewFEN,
 		NewZobrist:   verdict.NewZobrist,
