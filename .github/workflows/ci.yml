@@ -306,13 +306,72 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Lint + test + i18n-guard (NFR-11)
+      - name: Rust (wasm target) for the shared §4A codec
         run: |
-          if [ -f clients/web/package.json ]; then
-            echo "TODO: npm ci && npm test && npm run i18n:check (no hard-coded strings)"
-          else
-            echo "::notice::clients/web/ has no package.json yet — stub, no build."
-          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+          # PINNED wasm-pack from source (--locked), not a curl|sh installer —
+          # reproducible, no unverified remote shell in a gating job.
+          cargo install wasm-pack --version 0.13.1 --locked
+      - uses: actions/setup-node@v4
+        with:
+          # Node 26 — the project's Latest-LTS standard (web/CI).
+          node-version: "26"
+      - name: Build the shared codec wasm pkg (NFR-5 — client binds, never re-impls)
+        run: |
+          # The client imports pgc-protocol-wasm from this built pkg. Build it the
+          # same way `npm run codec:build` does, so typecheck/test see the real
+          # codec surface rather than a stale/absent artifact.
+          wasm-pack build protocol/codec-wasm --target bundler --out-dir pkg
+      - name: Install, typecheck, lint, test, i18n (NFR-8 axe + NFR-11)
+        working-directory: clients/web
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          # `npm test` runs the vitest unit suite INCLUDING the automated
+          # axe-core accessibility check on the Board (NFR-8) and the reducer /
+          # GameSocket / hook unit tests. The real-server e2e is a SEPARATE job
+          # (web-e2e) because it needs the Go server built.
+          npm test
+          npm run i18n:check
+
+  web-e2e:
+    needs: changes
+    # The real-server e2e drives the web client against the actual Go
+    # game-server, so it must run when EITHER the web client, the server, or the
+    # shared codec changes — a server/codec change can break the live contract
+    # the e2e proves even with no web diff.
+    if: ${{ needs.changes.outputs.web == 'true' || needs.changes.outputs.services == 'true' || needs.changes.outputs.protocol == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (for cgo staticlibs + wasm codec)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-pack --version 0.13.1 --locked
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+      - name: Build the shared codec wasm pkg
+        run: wasm-pack build protocol/codec-wasm --target bundler --out-dir pkg
+      - name: Real-server end-to-end (web client ↔ Go game-server)
+        working-directory: clients/web
+        run: |
+          # `npm run e2e` builds the Go e2e-server (make lib stages the cgo
+          # staticlibs, then `go build ./cmd/e2e-server`) and runs the e2e vitest
+          # config: two real GameSocket clients over Node's native WebSocket play
+          # a matched game against the real server, asserting the move reaches
+          # BOTH seats with the right uci (ADR-18). This is the full-stack proof
+          # the fake-socket unit tests cannot give.
+          npm ci
+          npm run e2e
 
   mobile:
     needs: changes

@@ -54,11 +54,23 @@ func (c *wsConn) RemoteAddr() string { return c.addr }
 // path (e.g. "/ws") behind TLS/origin checks (config/infra, §7). One goroutine
 // per connection (ADR-12) — net/http already gives us that per request.
 func (s *Server) HTTPHandler() http.Handler {
+	return s.HTTPHandlerWithOrigins(nil)
+}
+
+// HTTPHandlerWithOrigins is HTTPHandler with explicit allowed Origin patterns
+// (coder/websocket AcceptOptions.OriginPatterns, e.g. "127.0.0.1:*",
+// "localhost:*"). Empty/nil = strict same-origin (identical to HTTPHandler).
+// Needed when the browser's Origin differs from the WS host — notably a local
+// dev run behind the Vite dev-server proxy, where the browser Origin is the
+// Vite host (127.0.0.1:5173) but the proxied upstream Host is the server
+// (127.0.0.1:7733); without allowing it, coder/websocket rejects with 403 and
+// the proxy's upstream write dies with EPIPE. NOT a wide-open "*" in prod.
+func (s *Server) HTTPHandlerWithOrigins(originPatterns []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			// Subprotocol/compression left default; origin checks are config/infra
-			// (the server binds per ADR-12; a production deploy sets OriginPatterns
-			// or terminates at a trusted proxy).
+			// Empty OriginPatterns = strict same-origin (the default). A dev/proxy
+			// deploy passes loopback patterns here via HTTPHandlerWithOrigins.
+			OriginPatterns: originPatterns,
 		})
 		if err != nil {
 			return // Accept already wrote the HTTP error.
