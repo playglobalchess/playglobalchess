@@ -241,6 +241,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         needsResync: false,
         // A fresh authoritative STATE means the connection is healthy again.
         lastReject: null,
+        // A fold has no meaningful "most recent move" — clear it so the
+        // screen-reader announcement does not re-read a stale pre-resync move.
+        lastMove: null,
       };
     }
 

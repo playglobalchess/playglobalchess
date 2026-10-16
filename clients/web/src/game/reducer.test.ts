@@ -283,4 +283,30 @@ describe("game reducer", () => {
     expect(s.needsResync).toBe(false);
     expect(s.lastReject).toBeNull();
   });
+
+  it("F2: lastMove is set on accept and cleared by a STATE resync", () => {
+    let s = playingAsWhite();
+    s = reduce(s, { kind: "localMove", uci: "e2e4" });
+    s = reduce(s, {
+      kind: "server",
+      msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } },
+    });
+    expect(s.lastMove).toEqual({ uci: "e2e4", moverSeat: 0 });
+    // A resync STATE is a fold — the "most recent move" is no longer meaningful
+    // and must be cleared so the SR announcement does not re-read a stale move.
+    s = reduce(s, {
+      kind: "server",
+      msg: {
+        State: {
+          game_id: GID,
+          state: {
+            fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+            turn: 1,
+            clocks: [299000, 300000],
+          },
+        },
+      },
+    });
+    expect(s.lastMove).toBeNull();
+  });
 });

@@ -4,7 +4,7 @@
 // clocks, controls, and status. All display text comes from t() (NFR-11); the
 // board/engine rules stay server-side (NFR-5).
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
 import { codecProtocolVersion } from "./codec/seam";
 import { useGame } from "./game/useGame";
@@ -82,8 +82,11 @@ function GameView({ token }: { token: string }): React.JSX.Element {
       (state.mySeat === 1 && state.position.turn === "b"));
 
   // Screen-reader announcement (NFR-8): the latest move / offer / result,
-  // rendered into an aria-live region so assistive tech reads it aloud.
-  const announcement = buildAnnouncement(state, Boolean(myTurn));
+  // rendered into an aria-live region so assistive tech reads it aloud. Gated
+  // on a change key (ply / draw offer / result / error) so an UNRELATED
+  // re-render (a clock tick, a status change) does not re-emit the same text
+  // and make the screen reader read a move or result twice.
+  const announcement = useGatedAnnouncement(state, Boolean(myTurn));
 
   return (
     <main>
@@ -189,6 +192,37 @@ function buildAnnouncement(
   }
   if (myTurn) return t("announce.your_move");
   return "";
+}
+
+/** Gate buildAnnouncement so the aria-live region only changes when a NEW event
+ * occurs (a new ply, a draw offer, a result, or an error) — not on every
+ * re-render. On an unrelated render it keeps the region empty so assistive tech
+ * is not made to re-read the previous move/result. */
+function useGatedAnnouncement(
+  state: {
+    phase: string;
+    ply: number;
+    mySeat: number | null;
+    lastMove: { uci: string; moverSeat: number } | null;
+    drawOffer: { by: number } | null;
+    result: unknown;
+    error: number | null;
+  },
+  myTurn: boolean,
+): string {
+  // Key the announcement to the discrete events worth reading aloud.
+  const key = `${state.phase}|${state.ply}|${state.drawOffer != null ? state.drawOffer.by : "-"}|${state.result != null ? "end" : "-"}|${state.error ?? "-"}`;
+  const [text, setText] = useState("");
+  const lastKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (key === lastKey.current) return; // nothing new → leave the region as-is
+    lastKey.current = key;
+    setText(buildAnnouncement(state, myTurn));
+    // We intentionally key only on the change-key; the message is derived from
+    // the state at the moment the key advanced.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return text;
 }
 
 function ClockBar({ clocks, mySeat }: { clocks: number[]; mySeat: number | null }): React.JSX.Element {

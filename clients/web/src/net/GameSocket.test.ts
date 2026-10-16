@@ -264,14 +264,21 @@ describe("GameSocket (fake socket, real codec)", () => {
     expect("Authenticate" in sent[0]!).toBe(true); // AUTH is still first
   });
 
-  it("move() BEFORE open buffers and flushes after open (no throw)", () => {
+  it("F1: a game frame (move) sent while NOT open is dropped, not replayed on reconnect", () => {
     sock.connect();
-    const f = fakes[0]!;
-    // Pretend we are mid-game but the socket just reconnected and isn't open.
-    expect(() => sock.move(GID, 1, "e2e4")).not.toThrow();
-    f.open();
-    const sent = f.sent.map((_, i) => f.decodeSent(i));
-    const moves = sent.filter((m) => "Move" in m);
-    expect(moves.length).toBe(1);
+    const f1 = fakes[0]!;
+    f1.open();
+    sock.seek("blitz", "blitz-5+3", false);
+    f1.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+    // Socket drops; the UI issues a move while down. A game-mutating frame must
+    // NOT be buffered — on reconnect the server auto-pushes STATE (restoring
+    // ply), so a replayed stale MOVE at an old ply would wedge the player.
+    f1.onclose?.(); // disconnect → schedules reconnect, opens a new socket
+    sock.move(GID, 1, "e2e4"); // issued while not open
+    const f2 = fakes[fakes.length - 1]!;
+    f2.open(); // reconnect opens
+    const sent = f2.sent.map((_, i) => f2.decodeSent(i));
+    expect(sent.some((m) => "Authenticate" in m)).toBe(true); // AUTH re-sent
+    expect(sent.some((m) => "Move" in m)).toBe(false); // stale MOVE dropped
   });
 });

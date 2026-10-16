@@ -212,8 +212,15 @@ export class GameSocket {
     const msg: ClientMsg = { Seek: { pool_id: poolId, time_control: timeControl, rated } };
     this.pendingSeek = msg;
     this.matched = false;
-    const open = this.sock?.readyState != null ? this.sock.readyState === 1 : this.isOpen;
-    if (open) this.sendMsg(msg);
+    // Send now ONLY if open; otherwise onopen re-sends pendingSeek. We do NOT
+    // route SEEK through the outbox — that plus the onopen pendingSeek re-send
+    // would send it twice (the double-SEEK the e2e caught). pendingSeek is the
+    // single source of truth for "we want to seek".
+    const open = this.isOpen && (this.sock?.readyState == null || this.sock.readyState === 1);
+    if (open) {
+      const bytes = encode(msg);
+      this.sock?.send(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    }
   }
 
   /** Propose a move. ply_expected is the server ply + 1 (the caller supplies it). */
@@ -248,12 +255,21 @@ export class GameSocket {
    * sending (a real WebSocket throws on send() before OPEN). */
   private sendMsg(msg: ClientMsg): void {
     if (this.sock == null) return;
-    // Not open yet (connect() returns before the async open) → queue in order.
-    // readyState, when the socket exposes it, is authoritative; otherwise fall
-    // back to our own isOpen flag (a fake socket in tests may omit readyState).
-    const open = this.sock.readyState != null ? this.sock.readyState === 1 : this.isOpen;
+    // The socket is sendable only when OUR lifecycle flag says we have a live,
+    // not-torn-down socket AND (when the socket exposes it) its readyState is
+    // OPEN. Requiring both means a socket we have already seen close — even if a
+    // fake's readyState lags — is never treated as open.
+    const open = this.isOpen && (this.sock.readyState == null || this.sock.readyState === 1);
     if (!open) {
-      this.outbox.push(msg);
+      // Only RECONNECT-SAFE frames may wait for the open flush: AUTHENTICATE and
+      // SEEK are idempotent-by-design and are re-sent on every (re)open anyway.
+      // A game-mutating frame (MOVE/RESIGN/OFFER_DRAW/RESYNC) buffered across a
+      // disconnect would flush AFTER the server auto-pushes STATE on reconnect
+      // (which restores ply) — a stale MOVE at an old ply_expected the server
+      // rejects StalePly, or worse applies against a board that moved on. Drop
+      // it: the UI re-drives from the resynced STATE. (The outbox exists for the
+      // pre-FIRST-open eager seek/auth, not reconnect replay of game moves.)
+      if (isReconnectSafe(msg)) this.outbox.push(msg);
       return;
     }
     const bytes = encode(msg); // §4A bytes produced in Rust (NFR-5)
@@ -274,6 +290,13 @@ export class GameSocket {
  * structural shape (a numeric byteLength + a slice/ArrayBuffer.isView view).
  * A real browser has one realm so instanceof would also work there; this just
  * never misclassifies a genuine binary frame as "non-binary" and drops it. */
+/** Only AUTHENTICATE and SEEK may sit in the pre-open outbox: both are re-sent
+ * on every (re)open by design, so buffering them is safe and idempotent. Every
+ * other frame is game-mutating and must not be replayed across a reconnect. */
+function isReconnectSafe(msg: ClientMsg): boolean {
+  return "Authenticate" in msg || "Seek" in msg;
+}
+
 function toBytes(data: unknown): Uint8Array | null {
   if (data == null || typeof data !== "object") return null;
   if (ArrayBuffer.isView(data)) {

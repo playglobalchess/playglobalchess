@@ -119,15 +119,18 @@ d("real-server e2e (web client <-> Go game-server)", () => {
 
     // Whichever of our two clients drew seat 0 is White and moves first.
     const mover = wm.Matched.seat_idx === 0 ? white : black;
+    const opponent = mover === white ? black : white;
     mover.move(gameId, 1, "e2e4");
 
     // §4A v1.2 / ADR-18: MOVE_ACCEPTED carries the uci and goes to BOTH seats.
-    const wa = await white.waitFor(isMoveAccepted);
-    const ba = await black.waitFor(isMoveAccepted);
-    expect(wa.MoveAccepted.ply).toBe(1);
-    expect(wa.MoveAccepted.uci).toBe("e2e4");
-    expect(ba.MoveAccepted.uci).toBe("e2e4"); // the opponent sees the move — the whole point
-    expect(ba.MoveAccepted.ply).toBe(1);
+    // The CONTRACT this slice exists for is that the OPPONENT (not just the
+    // mover's own echo) sees the move — so assert the opponent specifically.
+    const moverAck = await mover.waitFor(isMoveAccepted);
+    const oppAck = await opponent.waitFor(isMoveAccepted);
+    expect(moverAck.MoveAccepted.ply).toBe(1);
+    expect(moverAck.MoveAccepted.uci).toBe("e2e4"); // the mover's own echo
+    expect(oppAck.MoveAccepted.ply).toBe(1);
+    expect(oppAck.MoveAccepted.uci).toBe("e2e4"); // the OPPONENT saw the move — the whole point
 
     white.close();
     black.close();
