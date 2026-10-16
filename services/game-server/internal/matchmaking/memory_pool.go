@@ -34,9 +34,15 @@ func (p *MemoryPool) Enqueue(_ context.Context, s Seeker) error {
 	return nil
 }
 
-// TryClaim atomically reserves the first compatible waiting partner in the same
-// pool (flipping both to claimed) without removing either, mirroring the Redis
-// claim semantics. Returns the partner and true, or false if none qualifies.
+// TryClaim atomically reserves the first same-pool waiting partner (flipping
+// both to claimed) without removing either. It mirrors RedisPool's atomic CLAIM
+// PROTOCOL (reserve-both-then-remove-later, so a concurrent node cannot double-
+// claim) but NOT its pairing POLICY: it deliberately IGNORES the Window and
+// time args and pairs on PoolID alone — the rating/compatibility window that
+// RedisPool.bestMatch enforces is NOT applied here. So a test using this pool
+// exercises the claim protocol and the §4A flow, but canNOT prove window-based
+// pairing; that remains RedisPool's own test surface. Returns the partner and
+// true, or false if none qualifies.
 func (p *MemoryPool) TryClaim(_ context.Context, newSeeker Seeker, _ Window, _ time.Time) (Seeker, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

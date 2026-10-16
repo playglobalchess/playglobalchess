@@ -20,7 +20,11 @@ export interface Position {
   board: Board;
   /** 'w' | 'b' — side to move, from the FEN. */
   turn: "w" | "b";
-  /** The raw FEN this position was parsed from (kept for resync/debug). */
+  /** The source FEN, populated ONLY by parseFen (i.e. MATCHED.start_state and
+   * STATE resync). applyUci does NOT recompute it — a mechanically-applied move
+   * returns fen: "" — so after any move this is empty and MUST NOT be read as
+   * the current position's FEN. Resync does not need it (it folds from the
+   * server's STATE fen); kept only as the parse provenance of a server frame. */
   fen: string;
 }
 
@@ -137,5 +141,5 @@ export function applyUci(pos: Position, uci: string): Position {
     }
   }
 
-  return { board, turn: pos.turn === "w" ? "b" : "w", fen: "" }; // fen recomputed only on STATE
+  return { board, turn: pos.turn === "w" ? "b" : "w", fen: "" }; // see Position.fen: empty after a move, never read as current FEN
 }
