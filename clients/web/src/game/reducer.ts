@@ -47,6 +47,9 @@ export interface GameState {
   result: { termination: TerminationCode; resultVector: number[] } | null;
   /** Last MOVE_REJECTED reason, for the UI to surface; cleared on the next accepted move. */
   lastReject: ReasonCode | null;
+  /** Set when the reducer detects a ply gap (a MOVE_ACCEPTED skipped ahead): the
+   * GameSocket reads this and sends RESYNC to pull a fresh STATE. Cleared by STATE. */
+  needsResync: boolean;
 }
 
 export const initialState: GameState = {
@@ -61,6 +64,7 @@ export const initialState: GameState = {
   drawOffer: null,
   result: null,
   lastReject: null,
+  needsResync: false,
 };
 
 export type Action =
@@ -78,6 +82,16 @@ export function reduce(state: GameState, action: Action): GameState {
       // Optimistic: show the move now, remember how to revert. Only legal while
       // playing, it's our turn, and no move is already pending.
       if (state.phase !== "playing" || state.position == null || state.pendingMove != null) {
+        return state;
+      }
+      // Defense in depth: only apply optimistically on OUR turn. seat 0 = white,
+      // seat 1 = black; position.turn is the side to move. The board UI should
+      // not offer a move off-turn, but a stray action must not optimistically
+      // apply (it would only earn a NOT_YOUR_TURN reject).
+      const myTurn =
+        (state.mySeat === 0 && state.position.turn === "w") ||
+        (state.mySeat === 1 && state.position.turn === "b");
+      if (!myTurn) {
         return state;
       }
       const prevPosition = state.position;
@@ -124,30 +138,45 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       const a = (msg as { MoveAccepted: { game_id: string; ply: number; uci: string; clock_after_ms: number } }).MoveAccepted;
       // §4A v1.2: carries the authoritative uci and is sent to BOTH seats.
       if (state.position == null) return state;
-      // If this confirms our own pending optimistic move, just clear it; the
-      // board already shows the move. Otherwise (opponent's move, or our move
-      // when we did not pre-apply) apply the authoritative uci now.
-      const confirmsPending =
-        state.pendingMove != null && state.pendingMove.uci === a.uci;
-      let position = state.position;
-      if (!confirmsPending) {
-        try {
-          position = applyUci(state.position, a.uci);
-        } catch {
-          // Should not happen for a server-accepted move; keep prior board.
-          position = state.position;
-        }
+
+      // BASE = the board BEFORE any optimistic move. We always reconcile against
+      // the server from this base, never on top of an un-confirmed optimistic
+      // move — so an accept whose uci differs from our pending move (a race, a
+      // stale frame, the opponent's move arriving while ours is pending) can
+      // never leave the optimistic move AND the server move both on the board.
+      const base = state.pendingMove != null ? state.pendingMove.prevPosition : state.position;
+      const basePly = state.pendingMove != null ? state.pendingMove.prevPly : state.ply;
+
+      // Ply-contiguity / idempotency guard. a.ply is the ply AFTER the move, so
+      // a fresh move advances basePly by exactly one. Anything else is a
+      // duplicate (replay / at-least-once delivery) or an out-of-order/gap frame
+      // — do NOT apply it a second time (that corrupts the board) and do NOT
+      // jump the ply. A gap flips needsResync so the socket can request STATE.
+      if (a.ply !== basePly + 1) {
+        // Clear a now-moot pending move (it was superseded or already applied),
+        // and ask for a resync when we are behind (a gap), not on a stale replay.
+        return {
+          ...state,
+          pendingMove: null,
+          needsResync: a.ply > basePly + 1 ? true : state.needsResync,
+        };
       }
-      // The server echoes the ply AFTER the move and the MOVER's remaining
-      // clock. The mover is the side that just moved = the opposite of the new
-      // side-to-move. We derive the mover seat from the (now-advanced) position
-      // turn and write clock_after_ms to that seat. STATE remains the exact
-      // full-vector authority on resync; per move we update only the mover's.
-      const clocks = state.clocks.slice();
-      // position.turn is the side to move AFTER the move; the mover is the other.
-      const moverIsWhite = position.turn === "b"; // if it's black's turn now, white just moved
+
+      // Apply exactly ONE authoritative move onto the base position.
+      let position: Position;
+      try {
+        position = applyUci(base, a.uci);
+      } catch {
+        // A server-accepted move that we cannot apply mechanically should never
+        // happen; ask for a resync rather than show a wrong board.
+        return { ...state, pendingMove: null, needsResync: true };
+      }
+
+      // Mover seat from PLY PARITY (race-proof, independent of board state):
+      // ply 1 = white's first move, so odd ply ⇒ white (seat 0) just moved.
       // Seat↔color: seat 0 = white, seat 1 = black (§4A.8 v1 2-seat).
-      const moverSeat = moverIsWhite ? 0 : 1;
+      const clocks = state.clocks.slice();
+      const moverSeat = a.ply % 2 === 1 ? 0 : 1;
       if (moverSeat < clocks.length) {
         clocks[moverSeat] = a.clock_after_ms;
       }
@@ -187,6 +216,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         position: parseFen(s.state.fen),
         clocks: s.state.clocks.slice(),
         pendingMove: null,
+        needsResync: false,
       };
     }
 

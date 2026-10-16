@@ -134,4 +134,70 @@ describe("game reducer", () => {
       expect(indexToSquare(squareToIndex(sq))).toBe(sq);
     }
   });
+
+  // --- adversarial paths (found by context-free review) ---------------------
+
+  it("MOVE_ACCEPTED with a DIFFERENT uci than pending rebases, does not stack moves", () => {
+    // We optimistically play e2e4 (pending). The server's accept at ply 1 carries
+    // a DIFFERENT move d2d4 (a race / stale frame). The board must show ONLY d2d4
+    // from the start position — never e2e4 AND d2d4 both.
+    const s0 = playingAsWhite();
+    const s1 = reduce(s0, { kind: "localMove", uci: "e2e4" });
+    const s2 = reduce(s1, {
+      kind: "server",
+      msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "d2d4", clock_after_ms: 299000 } },
+    });
+    expect(pieceAt(s2, "d4")).toBe("P"); // the authoritative move applied
+    expect(pieceAt(s2, "e4")).toBeNull(); // the optimistic move reverted
+    expect(pieceAt(s2, "e2")).toBe("P"); // e-pawn back home
+    expect(pieceAt(s2, "d2")).toBeNull();
+    expect(s2.pendingMove).toBeNull();
+    expect(s2.ply).toBe(1);
+    expect(s2.clocks[0]).toBe(299000); // mover = white (odd ply) by parity
+  });
+
+  it("a duplicate MOVE_ACCEPTED for the same ply is idempotent (no double-apply)", () => {
+    let s = playingAsWhite();
+    s = reduce(s, { kind: "localMove", uci: "e2e4" });
+    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
+    const afterFirst = s;
+    // Replay the SAME accept (at-least-once delivery / reconnect replay).
+    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
+    // Board + ply unchanged — the second frame did not re-apply e2e4.
+    expect(s.position?.board).toEqual(afterFirst.position?.board);
+    expect(s.ply).toBe(1);
+    expect(pieceAt(s, "e4")).toBe("P");
+  });
+
+  it("a MOVE_ACCEPTED that skips a ply flags needsResync and does not jump the board", () => {
+    const s0 = playingAsWhite(); // ply 0
+    const s1 = reduce(s0, {
+      kind: "server",
+      msg: { MoveAccepted: { game_id: GID, ply: 3, uci: "e2e4", clock_after_ms: 299000 } }, // gap: expected 1
+    });
+    expect(s1.needsResync).toBe(true);
+    expect(s1.ply).toBe(0); // did not jump
+    expect(pieceAt(s1, "e4")).toBeNull(); // did not apply out-of-order
+  });
+
+  it("STATE clears needsResync (resync fulfilled)", () => {
+    let s = playingAsWhite();
+    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 3, uci: "e2e4", clock_after_ms: 1 } } });
+    expect(s.needsResync).toBe(true);
+    s = reduce(s, { kind: "server", msg: { State: { game_id: GID, state: { fen: START_FEN, turn: 0, clocks: [300000, 300000] } } } });
+    expect(s.needsResync).toBe(false);
+  });
+
+  it("localMove off our turn is ignored (defense in depth)", () => {
+    // As white (seat 0), it is white's turn at the start. A move string that
+    // belongs to black's turn is still gated by the pending/turn guard once a
+    // move is pending; here we assert the turn guard directly by playing as
+    // white when the position says black to move.
+    const blackToMove = reduce(initialState, {
+      kind: "server",
+      msg: { Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1", turn: 1, clocks: [300000, 300000] } } },
+    });
+    const s = reduce(blackToMove, { kind: "localMove", uci: "e2e4" });
+    expect(s).toBe(blackToMove); // ignored — not white's turn
+  });
 });

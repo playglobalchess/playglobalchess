@@ -53,6 +53,22 @@ describe("board position (mechanical apply — render only, NOT a rules engine)"
     expect(pos.board[squareToIndex("a1")]).toBeNull();
   });
 
+  it("black castling king-side shifts the black rook h8→f8", () => {
+    const fen = "rnbqk2r/pppppppp/8/8/8/8/PPPPPPPP/RNBQK2R b KQkq - 0 1";
+    const pos = applyUci(parseFen(fen), "e8g8");
+    expect(pos.board[squareToIndex("g8")]).toBe("k");
+    expect(pos.board[squareToIndex("f8")]).toBe("r");
+    expect(pos.board[squareToIndex("h8")]).toBeNull();
+  });
+
+  it("a normal capture overwrites the captured piece", () => {
+    // White knight on e4 captures a black pawn on d6 (contrived placement).
+    const fen = "k6K/8/3p4/8/4N3/8/8/8 w - - 0 1";
+    const pos = applyUci(parseFen(fen), "e4d6");
+    expect(pos.board[squareToIndex("d6")]).toBe("N"); // knight replaced the pawn
+    expect(pos.board[squareToIndex("e4")]).toBeNull();
+  });
+
   it("rejects a malformed FEN that does not fill the board", () => {
     expect(() => parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP w KQkq - 0 1")).toThrow();
   });
