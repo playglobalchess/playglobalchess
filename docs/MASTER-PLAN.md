@@ -740,6 +740,75 @@ to see an offer; a dedicated push is cleaner.
 GS-6a/GS-6 seam extension + the transport wiring: RESYNC→STATE, push DRAW_OFFERED
 on a pending offer) and the mobile parity re-run.
 
+## ADR-18 (new) · §4A protocol v1.2 — `MOVE_ACCEPTED` carries `uci` + is broadcast to BOTH seats · **PROPOSED (owner-directed 2026-10-16; awaiting ratification)**
+
+> Amends the frozen SPEC-S2-PROTOCOL §4A move hot path. Surfaced building the S4
+> web client (SPEC-S4-WEB-F01): the GS-6 transport sends `MOVE_ACCEPTED` to the
+> MOVER ONLY and the ack carries no move, so an opponent's board can never
+> advance. Per PROTOCOL §4.2 a post-G-D wire change is a new protocol version and
+> requires both-affected-streams (S2 + S4) + architecture-group + S6 (fair-play
+> veto) review. **PROPOSED — not implemented until owner-ratified.**
+
+**Context.** The §4A v1.0/v1.1 move hot path is `C MOVE {game_id, ply_expected,
+uci}` → `S MOVE_ACCEPTED {game_id, ply, clock_after_ms}`. Two gaps block a real
+two-human game, both found tracing GS-6 for the web client:
+1. **The opponent is never told a move happened.** GS-6's move handler sends
+   `MOVE_ACCEPTED` only to the mover (`s.send(ctx, c, …)` in `handlers.go`
+   `handleMove`); there is no broadcast to the other seat and no STATE push on
+   the normal (non-terminal) move path. The opponent's board freezes at the
+   start position. (The server's own `TestE2E_GameEndsByResign` masks this: only
+   the mover waits for its ack, then the game resigns before the opponent would
+   have needed to see a move.)
+2. **The ack carries no move.** `MOVE_ACCEPTED` has `ply` + `clock_after_ms` but
+   no `uci` and no `fen`. Even once broadcast, a receiving client cannot render
+   the resulting position from it. The server-authoritative design (§VIII.1)
+   says clients apply the authoritative move to their own board — but the web
+   client has NO engine binding to do so (the engine ships cgo + UniFFI seams,
+   not a wasm one, unlike the codec), and reconstructing the position from `ply`
+   alone is impossible.
+
+**Decision (proposed).** Amend `MOVE_ACCEPTED` (code `0x82`) to
+`{game_id: str36, ply: u32, uci: str5, clock_after_ms: u32}` — the `uci` of the
+move just applied (field order: `uci` after `ply`, matching the `MovePlayed`
+event body) — and change the GS-6 transport so an accepted non-terminal move
+**broadcasts `MOVE_ACCEPTED` to BOTH seats**, not just the mover. Each client
+then applies that one authoritative UCI to its own board (the mover confirms its
+optimistic move; the opponent learns and applies the move), so no client needs a
+local legality engine and no FEN rides the hot path (NFR-1 — `uci` is ≤ 5 bytes,
+`fen` stays STATE-only). The move's authority still comes entirely from the
+server (it only broadcasts what it persisted); clients never compute truth.
+
+Framed **§4A v1.2** (major `ver` stays `0x01`; minor). Unlike ADR-17 (which added
+new codes in RESERVED slots, leaving every v1.0 byte untouched), **this MUTATES a
+frozen message's byte layout** — the `server/move_accepted` golden vector
+changes. That is a heavier change, safe ONLY because (a) all three clients bind
+the ONE shared Rust codec (ADR-9/NFR-10) and upgrade with it — there is no "old
+client with the v1.0 MOVE_ACCEPTED" in v1, and (b) **no client is deployed yet**
+(the S4 web client is being built now, mobile later), so the frozen frame is
+changed in the one window where nothing speaks it. This is the cheapest and only
+clean moment; after the web client ships against a shape, this would be a
+breaking change.
+
+**Scope / boundary.** Pins ONLY the `uci` addition to `MOVE_ACCEPTED` + the
+both-seats broadcast. Does NOT change `C MOVE`, the event-store `MovePlayed`
+body (which already carries `uci`), the value tables, or any other frame. Not a
+`ver` major bump.
+
+**Alternatives rejected.** *Push a full `STATE` (with FEN) to both seats after
+every move* — works with NO §4A change, but puts the whole FEN on the move hot
+path every ply, against the §IX.1/NFR-1 "tiny move frames, fen never on the move
+path" budget; a `uci` of ≤5 bytes is the minimal thing a client needs.
+*Add a wasm engine binding so the web client derives the position from `ply`* —
+`ply` does not determine a move; the client would still need the UCI. *Leave
+MOVE_ACCEPTED frozen and invent a new SR→C "opponent moved" frame* — two frames
+for one event (the mover's ack and the opponent's notification would diverge),
+when one broadcast MOVE_ACCEPTED carrying `uci` serves both identically.
+
+**Unblocks.** The §4A v1.2 implementation slice (codec `MoveAccepted` gains
+`uci` + regenerated golden vectors + the GS-6a/GS-6 seam + the GS-6 transport
+broadcasting to both seats + the mobile parity re-run) and the S4 web client's
+reducer/move path (SPEC-S4-WEB-F01 §3.3), currently blocked on it.
+
 ### ADR summary
 
 
@@ -762,6 +831,7 @@ on a pending offer) and the mobile parity re-run.
 | ADR-15 | new | Go↔Rust via one uniform in-process cgo/staticlib C-ABI (a `<crate>-cgo` sibling per consumed crate) | **DECIDED** | S2/S1 + Architecture |
 | ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
 | ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **DECIDED** | S2 + Architecture |
+| ADR-18 | new | §4A protocol v1.2 — MOVE_ACCEPTED carries `uci` + broadcast to BOTH seats; mutates a frozen frame (safe pre-first-client) | **PROPOSED** | S2 + S4 + Architecture |
 
 ---
 
