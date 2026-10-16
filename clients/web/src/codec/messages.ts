@@ -94,7 +94,7 @@ export type ServerMsg =
         start_state: StateBody;
       };
     }
-  | { MoveAccepted: { game_id: GameId; ply: number; clock_after_ms: number } }
+  | { MoveAccepted: { game_id: GameId; ply: number; uci: string; clock_after_ms: number } }
   | { MoveRejected: { game_id: GameId; ply_expected: number; reason: ReasonCode } }
   | { State: { game_id: GameId; state: StateBody } }
   | {

@@ -55,7 +55,7 @@ describe("typed codec seam", () => {
     const state = { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", turn: 0, clocks: [300000, 300000] };
     const msgs: ServerMsg[] = [
       { Matched: { game_id: gid, seat_idx: 0, opponent: "grandmaster_jane", start_state: state } },
-      { MoveAccepted: { game_id: gid, ply: 18, clock_after_ms: 299100 } },
+      { MoveAccepted: { game_id: gid, ply: 18, uci: "e2e4", clock_after_ms: 299100 } },
       { MoveRejected: { game_id: gid, ply_expected: 18, reason: 2 } }, // StalePly, bare u8
       { State: { game_id: gid, state } },
       { GameEnd: { game_id: gid, result_vector: [2, 0], termination: Termination.TimeoutVsInsufficient, rating_delta: [12, -12] } },
