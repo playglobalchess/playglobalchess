@@ -8,6 +8,7 @@ import type { ClientMsg, ServerMsg } from "../codec/messages";
 // end to end with no browser and no network (SPEC-S4-WEB-F01 §6 fake-socket tier).
 class FakeSocket implements SocketLike {
   binaryType = "";
+  readyState = 0; // CONNECTING until open()
   sent: Uint8Array[] = [];
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
@@ -16,14 +17,19 @@ class FakeSocket implements SocketLike {
   closed = false;
 
   send(data: ArrayBufferLike): void {
+    // Mirror the real WebSocket contract: send() before OPEN throws. This is
+    // what the e2e surfaced — a fake that accepts an early send hides the bug.
+    if (this.readyState !== 1) throw new Error("Sent before connected.");
     this.sent.push(new Uint8Array(data as ArrayBuffer));
   }
   close(): void {
     this.closed = true;
+    this.readyState = 3; // CLOSED
     this.onclose?.();
   }
   // --- test helpers ---
   open(): void {
+    this.readyState = 1; // OPEN
     this.onopen?.();
   }
   /** Feed a typed ServerMsg to the client (encoded via the real seam). */
@@ -239,5 +245,33 @@ describe("GameSocket (fake socket, real codec)", () => {
         resolve();
       }, 80);
     });
+  });
+
+  // --- regressions for bugs the real-server e2e surfaced (fake-socket masked) ---
+
+  it("seek() BEFORE open does not throw and sends exactly ONE Seek after open", () => {
+    // The real WebSocket throws on send() before OPEN, and connect() returns
+    // before the async open. A seek issued immediately must queue, not throw,
+    // and must reach the wire exactly once (a double SEEK enqueues the user
+    // twice and corrupts pairing — the e2e symptom).
+    sock.connect();
+    const f = fakes[0]!;
+    expect(() => sock.seek("blitz", "blitz-5+3", false)).not.toThrow();
+    f.open(); // now OPEN → AUTHENTICATE + the queued SEEK flush
+    const sent = f.sent.map((_, i) => f.decodeSent(i));
+    const seeks = sent.filter((m) => "Seek" in m);
+    expect(seeks.length).toBe(1);
+    expect("Authenticate" in sent[0]!).toBe(true); // AUTH is still first
+  });
+
+  it("move() BEFORE open buffers and flushes after open (no throw)", () => {
+    sock.connect();
+    const f = fakes[0]!;
+    // Pretend we are mid-game but the socket just reconnected and isn't open.
+    expect(() => sock.move(GID, 1, "e2e4")).not.toThrow();
+    f.open();
+    const sent = f.sent.map((_, i) => f.decodeSent(i));
+    const moves = sent.filter((m) => "Move" in m);
+    expect(moves.length).toBe(1);
   });
 });

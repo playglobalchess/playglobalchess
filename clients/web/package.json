@@ -15,7 +15,8 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint . --max-warnings 0",
     "i18n:check": "node scripts/i18n-check.mjs",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e": "bash scripts/e2e.sh"
   },
   "dependencies": {
     "pgc-protocol-wasm": "file:../../protocol/codec-wasm/pkg",

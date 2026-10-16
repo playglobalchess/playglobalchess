@@ -23,6 +23,10 @@ import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
 /** The minimal WebSocket surface GameSocket needs — real `WebSocket` satisfies it. */
 export interface SocketLike {
   binaryType: string;
+  /** WebSocket.readyState (0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED). Optional
+   * so a test fake may omit it; when absent GameSocket treats the socket as
+   * send-ready once onopen has fired (it tracks open state itself). */
+  readyState?: number;
   send(data: ArrayBufferLike): void;
   close(): void;
   onopen: (() => void) | null;
@@ -63,6 +67,12 @@ export class GameSocket {
   private matched = false;
   private closedByUs = false;
   private attempt = 0;
+  /** True between onopen and the next (re)open/close — gates direct sends. */
+  private isOpen = false;
+  /** Frames requested before the socket was OPEN; flushed in order on open. A
+   * real WebSocket throws on send() before OPEN, and connect() returns before
+   * the async open completes, so an eager seek()/move() must queue, not throw. */
+  private outbox: ClientMsg[] = [];
 
   constructor(opts: GameSocketOptions) {
     this.opts = opts;
@@ -94,6 +104,7 @@ export class GameSocket {
     // onclose/onmessage closures keep firing after the new socket opens, which
     // spawns concurrent reconnect chains and lets stale frames through (B1).
     if (this.sock != null) this.detach(this.sock);
+    this.isOpen = false; // the new socket is CONNECTING until its onopen fires
 
     this.status("connecting");
     const sock = this.factory(this.opts.url);
@@ -103,6 +114,7 @@ export class GameSocket {
     sock.onopen = () => {
       // Ignore if this socket was superseded or we closed deliberately (S1/B1).
       if (sock !== this.sock || this.closedByUs) return;
+      this.isOpen = true;
       this.status("connected");
       // First frame MUST be AUTHENTICATE (§3.1). The server auto-pushes STATE
       // for any live game this user is seated in (reconnect resync, Option A).
@@ -111,6 +123,11 @@ export class GameSocket {
       if (this.pendingSeek != null && !this.matched) {
         this.sendMsg(this.pendingSeek);
       }
+      // Flush anything requested before the socket was open (an eager
+      // seek()/move() right after connect()), in order.
+      const queued = this.outbox;
+      this.outbox = [];
+      for (const m of queued) this.sendMsg(m);
       // NOTE: `attempt` (backoff) is reset on the FIRST decoded message, not
       // here — a raw socket open that the server immediately rejects must not
       // reset backoff into a tight reconnect loop (S3).
@@ -153,6 +170,7 @@ export class GameSocket {
 
     sock.onclose = () => {
       if (sock !== this.sock) return; // a superseded socket closing — ignore (B1)
+      this.isOpen = false;
       if (this.closedByUs) {
         this.status("closed");
         return;
@@ -185,12 +203,17 @@ export class GameSocket {
 
   private timer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Enter matchmaking. Remembers the seek so a reconnect before MATCHED re-sends it. */
+  /** Enter matchmaking. The seek is remembered as pendingSeek and (re)sent by
+   * onopen — on first connect AND after a reconnect before MATCHED. If the
+   * socket is ALREADY open we send it now; otherwise onopen will. We do NOT
+   * route it through the outbox, so it can never be sent twice (a double SEEK
+   * enqueues the user twice and corrupts pairing). */
   seek(poolId: string, timeControl: string, rated: boolean): void {
     const msg: ClientMsg = { Seek: { pool_id: poolId, time_control: timeControl, rated } };
     this.pendingSeek = msg;
     this.matched = false;
-    this.sendMsg(msg);
+    const open = this.sock?.readyState != null ? this.sock.readyState === 1 : this.isOpen;
+    if (open) this.sendMsg(msg);
   }
 
   /** Propose a move. ply_expected is the server ply + 1 (the caller supplies it). */
@@ -220,9 +243,19 @@ export class GameSocket {
     this.sock?.close();
   }
 
-  /** Encode a ClientMsg via the shared seam and send it as a binary frame. */
+  /** Encode a ClientMsg via the shared seam and send it as a binary frame. If
+   * the socket is not OPEN yet, queue it for the onopen flush instead of
+   * sending (a real WebSocket throws on send() before OPEN). */
   private sendMsg(msg: ClientMsg): void {
     if (this.sock == null) return;
+    // Not open yet (connect() returns before the async open) → queue in order.
+    // readyState, when the socket exposes it, is authoritative; otherwise fall
+    // back to our own isOpen flag (a fake socket in tests may omit readyState).
+    const open = this.sock.readyState != null ? this.sock.readyState === 1 : this.isOpen;
+    if (!open) {
+      this.outbox.push(msg);
+      return;
+    }
     const bytes = encode(msg); // §4A bytes produced in Rust (NFR-5)
     // Send the exact byte view (copy to a fresh ArrayBuffer to avoid shipping a
     // larger backing buffer than the frame).
