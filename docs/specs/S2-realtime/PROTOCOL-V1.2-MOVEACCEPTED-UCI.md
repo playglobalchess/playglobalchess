@@ -45,6 +45,13 @@ accepted non-terminal move is delivered to BOTH seats. Done =
   payload struct change flows through. `de_exact` still rejects trailing bytes.
 - No change to `C MOVE`, `MovePlayed`, or any other message.
 
+**Pipeline/session surface (so the transport has an authoritative `uci` to
+send on BOTH paths):** `game.MoveOutcome` gains a `UCI string` field, set on the
+fresh-accept path (`in.UCI`) and the idempotent re-ack path (the persisted
+`mv.UCI` found by `findMove`). See §5 for why the transport must read `out.UCI`,
+not the request's `p.UCI`. This is a Go-side addition (no wire effect beyond the
+`MOVE_ACCEPTED` field already specified above).
+
 ## 3. Golden corpus (the freeze — this is the delicate part)
 
 - `server/move_accepted` in `protocol/vectors/vectors.json` **changes** (the
@@ -71,15 +78,30 @@ accepted non-terminal move is delivered to BOTH seats. Done =
 
 ## 5. Transport (GS-6, `services/game-server/internal/transport`)
 
-- `handleMove`, on `out.Accepted` and NOT terminal: build the `MOVE_ACCEPTED`
-  with `uci = p.UCI` (the move just persisted) and send it to **both seats**
-  (the mover and the opponent via `connFor(gameID, otherSeat)`), replacing the
-  mover-only `s.send(ctx, c, …)`. The terminal path still broadcasts GAME_END.
+- **The authoritative `uci` source — pinned.** The transport MUST read the move
+  from the pipeline outcome, NOT from the request. Today `game.MoveOutcome`
+  (pipeline.go) has `Ply`/`ClockAfterMs`/`AppliedSeq` but **no `UCI`** — add a
+  `UCI string` field, set on BOTH accept paths from the authoritative source:
+  - **fresh accept:** `UCI = in.UCI` (the move just validated + persisted).
+  - **idempotent re-ack:** `UCI = mv.UCI` — the pipeline already locates the
+    persisted event via `findMove(events, in.PlyExpected)` on the re-ack path
+    (pipeline.go), whose `MovePlayed.UCI` is the real move; carry it onto the
+    outcome instead of dropping it. The live-session wrapper (commands.go) passes
+    it through (it has `c.uci` on the fresh path; the re-ack value comes from the
+    pipeline outcome).
+  This mirrors the GS-3 `AppliedSeq` lesson exactly (all paths report the REAL
+  value from the authoritative source, not a request field or a blank).
+- `handleMove`, on `out.Accepted` and NOT terminal: build `MOVE_ACCEPTED` with
+  `uci = out.UCI` (NOT `p.UCI`) and send it to **both seats** (the mover and the
+  opponent via `connFor(gameID, otherSeat)`), replacing the mover-only
+  `s.send(ctx, c, …)`. The terminal path still broadcasts GAME_END. Reading
+  `out.UCI` (not `p.UCI`) is what makes the fresh and re-ack paths identical: a
+  retry that carries a different/garbled `uci` for an already-persisted ply gets
+  the PERSISTED move echoed back (server-authoritative), never the retry's.
 - The idempotent re-ack path (duplicate MOVE on the same `ply_expected`,
-  PROTOCOL §4A duplicate-MOVE rule) must also carry the real `uci` for that ply
-  (the re-ack echoes the SAME move), not an empty string — so a client that
-  missed the first ack still learns the move. (This is the GS-3 "re-ack with the
-  real seq/fields, not a blank" lesson applied to `uci`.)
+  PROTOCOL §4A duplicate-MOVE rule) thus re-acks the SAME move with the real
+  `uci` — a client that missed the first ack learns the move, never a blank
+  (the GS-3 "re-ack real fields, not a blank" lesson applied to `uci`).
 - The opponent connection may be absent (disconnected mid-game); send is
   best-effort to a present seat exactly as DRAW_OFFERED/GAME_END already are —
   the absent seat resyncs via STATE on reconnect (Option A), which already
@@ -96,7 +118,10 @@ accepted non-terminal move is delivered to BOTH seats. Done =
   `TestMoveBroadcastToBothSeats` (A moves → both A and B see MOVE_ACCEPTED{uci});
   and extend the e2e so black actually consumes white's move before proceeding.
 - **Idempotent re-ack:** a duplicate MOVE on the same ply re-acks with the SAME
-  `uci` (regression against the blank-field class of bug).
+  `uci` taken from the PERSISTED move — assert it specifically with a retry that
+  sends a DIFFERENT `uci` for the already-persisted ply and prove the re-ack
+  still echoes the originally-persisted move (server-authoritative; the regression
+  against the blank/stale-field class of bug, and against trusting `p.UCI`).
 
 ## 7. Acceptance criteria (Definition of Done)
 
@@ -105,6 +130,10 @@ accepted non-terminal move is delivered to BOTH seats. Done =
       vector (`server/move_accepted`), freeze test green.
 - [ ] GS-6 broadcasts MOVE_ACCEPTED (with `uci`) to both seats on an accepted
       non-terminal move; terminal + re-ack + disconnected-opponent paths correct.
+- [ ] `game.MoveOutcome` carries `UCI`, set from the authoritative source on BOTH
+      paths (fresh = `in.UCI`, re-ack = persisted `mv.UCI`); the transport reads
+      `out.UCI`, never `p.UCI`. A retry with a different uci for a persisted ply
+      re-acks the PERSISTED move.
 - [ ] `TestMoveBroadcastToBothSeats` proves the opponent receives the move; the
       e2e consumes the opponent's move.
 - [ ] cgo + wasm node-parity + mobile parity green against the regenerated corpus.
