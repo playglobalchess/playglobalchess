@@ -55,6 +55,9 @@ export interface GameState {
   /** A protocol/transport Error the UI must surface (e.g. UNSUPPORTED_VERSION →
    * "please refresh"). null when there is no active error. */
   error: ErrorCodeValue | null;
+  /** The most recent applied move (for screen-reader announcements). uci is the
+   * move, moverSeat the seat that made it. null before any move / after a fold. */
+  lastMove: { uci: string; moverSeat: number } | null;
 }
 
 export const initialState: GameState = {
@@ -71,6 +74,7 @@ export const initialState: GameState = {
   lastReject: null,
   needsResync: false,
   error: null,
+  lastMove: null,
 };
 
 export type Action =
@@ -193,6 +197,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         clocks,
         pendingMove: null,
         lastReject: null,
+        lastMove: { uci: a.uci, moverSeat },
       };
     }
 

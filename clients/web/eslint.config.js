@@ -72,6 +72,7 @@ export default [
         ...browserGlobals,
         document: "readonly",
         MouseEvent: "readonly",
+        KeyboardEvent: "readonly",
         TextEncoder: "readonly",
         TextDecoder: "readonly",
         HTMLDivElement: "readonly",

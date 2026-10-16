@@ -29,10 +29,10 @@ afterEach(() => {
   container = null;
 });
 
-/** Click the gridcell whose aria-label ends with the given square name. */
+/** Click the gridcell whose aria-label starts with the given square name. */
 function clickSquare(sq: string): void {
   const cells = Array.from(container!.querySelectorAll('[role="gridcell"]'));
-  const cell = cells.find((c) => (c.getAttribute("aria-label") ?? "").split(" ")[1] === sq);
+  const cell = cells.find((c) => (c.getAttribute("aria-label") ?? "").startsWith(`${sq},`));
   if (cell == null) throw new Error(`no cell for ${sq}`);
   act(() => {
     cell.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -98,5 +98,55 @@ describe("Board", () => {
     clickSquare("e7");
     clickSquare("e5");
     expect(moves).toEqual(["e7e5"]);
+  });
+
+  // --- NFR-8 accessibility ---
+
+  it("exposes ARIA grid semantics: 8 rows of 8 gridcells", () => {
+    const moves: string[] = [];
+    mount(<Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    expect(container!.querySelectorAll('[role="row"]').length).toBe(8);
+    expect(container!.querySelectorAll('[role="gridcell"]').length).toBe(64);
+  });
+
+  it("sets aria-selected on the chosen from-square", () => {
+    const moves: string[] = [];
+    mount(<Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("e2");
+    const sel = Array.from(container!.querySelectorAll('[aria-selected="true"]'));
+    expect(sel.length).toBe(1);
+    expect((sel[0]!.getAttribute("aria-label") ?? "").startsWith("e2,")).toBe(true);
+  });
+
+  it("completes a move by keyboard (focus a1, arrow to the pawn, Enter, arrow, Enter)", () => {
+    const moves: string[] = [];
+    // Start with the cursor on a1 (white default home). Navigate to e2, select,
+    // then to e4 and play — all via keydown on the grid.
+    mount(<Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    const grid = container!.querySelector('[role="grid"]')!;
+    const key = (k: string): void => {
+      act(() => grid.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true })));
+    };
+    // a1 → e2: right 4 files, up 1 rank.
+    key("ArrowRight"); key("ArrowRight"); key("ArrowRight"); key("ArrowRight");
+    key("ArrowUp");
+    key("Enter"); // select e2 pawn
+    key("ArrowUp"); key("ArrowUp"); // e2 → e4
+    key("Enter"); // play
+    expect(moves).toEqual(["e2e4"]);
+  });
+
+  it("Escape cancels a keyboard selection", () => {
+    const moves: string[] = [];
+    mount(<Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    const grid = container!.querySelector('[role="grid"]')!;
+    const key = (k: string): void => {
+      act(() => grid.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true })));
+    };
+    key("ArrowRight"); key("ArrowRight"); key("ArrowRight"); key("ArrowRight"); key("ArrowUp");
+    key("Enter"); // select e2
+    expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(1);
+    key("Escape");
+    expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(0);
   });
 });

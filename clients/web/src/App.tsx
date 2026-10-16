@@ -81,10 +81,29 @@ function GameView({ token }: { token: string }): React.JSX.Element {
     ((state.mySeat === 0 && state.position.turn === "w") ||
       (state.mySeat === 1 && state.position.turn === "b"));
 
+  // Screen-reader announcement (NFR-8): the latest move / offer / result,
+  // rendered into an aria-live region so assistive tech reads it aloud.
+  const announcement = buildAnnouncement(state, Boolean(myTurn));
+
   return (
     <main>
       <h1>{t("app.title")}</h1>
       <p role="status">{statusText}</p>
+
+      {/* Polite live region — visually hidden, read aloud by assistive tech. */}
+      <p
+        aria-live="polite"
+        style={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+          clip: "rect(0 0 0 0)",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {announcement}
+      </p>
 
       {state.error != null ? (
         <p role="alert">
@@ -147,6 +166,29 @@ function GameView({ token }: { token: string }): React.JSX.Element {
       ) : null}
     </main>
   );
+}
+
+/** Derive the screen-reader announcement from the latest meaningful state. */
+function buildAnnouncement(
+  state: {
+    phase: string;
+    mySeat: number | null;
+    lastMove: { uci: string; moverSeat: number } | null;
+    drawOffer: { by: number } | null;
+    result: unknown;
+  },
+  myTurn: boolean,
+): string {
+  if (state.phase === "game_over") return t("announce.game_over");
+  if (state.drawOffer != null) return t("announce.draw_offered");
+  if (state.lastMove != null) {
+    const mine = state.lastMove.moverSeat === state.mySeat;
+    const who = mine ? t("announce.you_moved") : t("announce.opponent_moved");
+    const turn = myTurn ? ` ${t("announce.your_move")}` : "";
+    return `${who} ${state.lastMove.uci}.${turn}`;
+  }
+  if (myTurn) return t("announce.your_move");
+  return "";
 }
 
 function ClockBar({ clocks, mySeat }: { clocks: number[]; mySeat: number | null }): React.JSX.Element {
