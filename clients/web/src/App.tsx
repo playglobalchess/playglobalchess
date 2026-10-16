@@ -10,11 +10,11 @@ import { codecProtocolVersion } from "./codec/seam";
 import { useGame } from "./game/useGame";
 import { Board } from "./game/Board";
 import { Reason, ErrorCode, type ReasonCode } from "./codec/messages";
+import { DEV_POOL, DEV_TIME_CONTROL } from "./devConfig";
 
-// The dev matchmaking pool + time control for first-playable. These are fixed
-// dev constants in this slice (a pool/time-control picker is a later slice).
-const DEV_POOL = "blitz";
-const DEV_TIME_CONTROL = "300+0";
+// The dev matchmaking pool + time control for first-playable live in a shared
+// module (src/devConfig) so the real-server e2e sends the SAME values the UI
+// does — see devConfig.ts for why (the "300+0" game-creation bug).
 
 export function App(): React.JSX.Element {
   const [token, setToken] = useState<string | null>(null);

@@ -99,9 +99,31 @@ export function useGame(opts: UseGameOptions): UseGameResult {
       onStatus: (s) => setStatus(s),
     });
     sockRef.current = sock;
-    sock.connect();
+    // DEFER the connect by a tick in the REAL-WebSocket path. React StrictMode
+    // (dev) double-invokes this effect: mount → cleanup → mount, synchronously.
+    // An eager connect on the discarded first mount opens a socket and closes it
+    // immediately — and through a dev-server WS proxy that half-open upgrade
+    // orphans the proxy's upstream pipe (server write → EPIPE, killing the real
+    // second socket too). Deferring to a 0ms timer and cancelling it in cleanup
+    // means the discarded mount never opens a socket; only the surviving mount
+    // connects. Tests inject a `factory` (a synchronous fake with no proxy and
+    // no real upgrade) and want connect to happen now — so defer only when there
+    // is no injected factory (i.e. the real browser WebSocket).
+    if (opts.factory != null) {
+      sock.connect();
+      return () => {
+        sock.close();
+        sockRef.current = null;
+      };
+    }
+    let connected = false;
+    const timer = setTimeout(() => {
+      connected = true;
+      sock.connect();
+    }, 0);
     return () => {
-      sock.close();
+      clearTimeout(timer);
+      if (connected) sock.close();
       sockRef.current = null;
     };
     // url/token/factory identify the connection; changing them re-connects.

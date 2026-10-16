@@ -11,6 +11,17 @@ export default defineConfig({
     // Dev server binds loopback only (never 0.0.0.0) — the control plane rule.
     host: "127.0.0.1",
     port: 5173,
+    // Proxy the §4A WebSocket to the local game server (industry-standard dev
+    // setup — browser stays same-origin on the Vite port). ws:true forwards the
+    // upgrade. We do NOT set changeOrigin: the server allows the loopback dev
+    // Origin (127.0.0.1:5173) via OriginPatterns, so the browser's real Origin
+    // is forwarded unchanged — rewriting it has caused frame-flow breakage.
+    proxy: {
+      "/ws": {
+        target: process.env.PGC_WS_TARGET ?? "ws://127.0.0.1:7733",
+        ws: true,
+      },
+    },
   },
   build: {
     target: "es2022",

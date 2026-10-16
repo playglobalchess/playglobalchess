@@ -21,6 +21,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { GameSocket } from "../src/net/GameSocket";
 import type { ServerMsg } from "../src/codec/messages";
+import { DEV_POOL, DEV_TIME_CONTROL } from "../src/devConfig";
 
 // The harness builds the binary to this path (see npm run e2e). Overridable.
 const SERVER_BIN = process.env.PGC_E2E_SERVER ?? "../../services/game-server/bin/e2e-server";
@@ -68,7 +69,10 @@ class Client {
     this.sock.connect();
   }
   seek(): void {
-    this.sock.seek("blitz", "blitz-5+3", false);
+    // The SAME pool + time control the UI sends (src/devConfig), so a malformed
+    // value (e.g. the "300+0" the server rejected with "could not start game")
+    // fails this e2e in CI rather than only a manual browser run.
+    this.sock.seek(DEV_POOL, DEV_TIME_CONTROL, false);
   }
   move(gameId: string, ply: number, uci: string): void {
     this.sock.move(gameId, ply, uci);
@@ -131,6 +135,13 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     expect(moverAck.MoveAccepted.uci).toBe("e2e4"); // the mover's own echo
     expect(oppAck.MoveAccepted.ply).toBe(1);
     expect(oppAck.MoveAccepted.uci).toBe("e2e4"); // the OPPONENT saw the move — the whole point
+
+    // No client received an ERROR frame — a malformed seek (e.g. a time control
+    // the server cannot resolve) would arrive here as Error "could not start
+    // game" and must fail the test, not pass silently.
+    const anyError = (c: Client): boolean => c.inbox.some((m) => "Error" in m);
+    expect(anyError(white)).toBe(false);
+    expect(anyError(black)).toBe(false);
 
     white.close();
     black.close();
