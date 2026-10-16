@@ -234,9 +234,23 @@ export class GameSocket {
   }
 }
 
-/** Coerce an incoming WebSocket message payload to Uint8Array, or null if not binary. */
+/** Coerce an incoming WebSocket message payload to Uint8Array, or null if not
+ * binary. Detection is REALM-ROBUST: `instanceof ArrayBuffer` is false for a
+ * buffer created in a different JS realm (e.g. a test harness, or a worker),
+ * so we tag-check with Object.prototype.toString and fall back to the
+ * structural shape (a numeric byteLength + a slice/ArrayBuffer.isView view).
+ * A real browser has one realm so instanceof would also work there; this just
+ * never misclassifies a genuine binary frame as "non-binary" and drops it. */
 function toBytes(data: unknown): Uint8Array | null {
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (data instanceof Uint8Array) return data;
+  if (data == null || typeof data !== "object") return null;
+  if (ArrayBuffer.isView(data)) {
+    // Any typed-array / DataView view → copy its exact byte window.
+    const v = data as ArrayBufferView;
+    return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  }
+  const tag = Object.prototype.toString.call(data);
+  if (tag === "[object ArrayBuffer]" || tag === "[object SharedArrayBuffer]") {
+    return new Uint8Array(data as ArrayBufferLike);
+  }
   return null;
 }

@@ -44,6 +44,9 @@ export default [
     rules: {
       ...tseslint.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
+      // Underscore-prefixed args are intentional ignores (e.g. a factory's url
+      // param required by the signature but unused in a test stub).
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
       // TS resolves identifiers; core no-undef only false-positives here.
       "no-undef": "off",
       // NFR-5-adjacent discipline: no `any` escapes (use unknown + narrow).
@@ -63,9 +66,25 @@ export default [
     // Tests control their own invariants: a non-null assertion on an array
     // index the test just populated is clearer than a redundant guard. The ban
     // stays a hard error in production src (above).
-    files: ["src/**/*.test.ts"],
+    files: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    languageOptions: {
+      globals: {
+        ...browserGlobals,
+        document: "readonly",
+        MouseEvent: "readonly",
+        TextEncoder: "readonly",
+        TextDecoder: "readonly",
+        HTMLDivElement: "readonly",
+        globalThis: "readonly",
+      },
+    },
     rules: {
       "@typescript-eslint/no-non-null-assertion": "off",
+      // Test harnesses legitimately capture hook output into an outer binding
+      // and touch jsdom DOM globals; these component-purity rules are aimed at
+      // production components, not the mount harness.
+      "react-hooks/globals": "off",
+      "react-hooks/rules": "off",
     },
   },
 ];

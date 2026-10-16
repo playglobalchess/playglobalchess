@@ -1,0 +1,102 @@
+// @vitest-environment jsdom
+//
+// Board component tests — the two-click move interaction and orientation. We
+// mount with react-dom/client + act (no extra testing library) and drive real
+// click events through the grid cells. The board implements NO rules (NFR-5);
+// these tests assert only that a click sequence emits the right UCI string and
+// that orientation/selection behave, which is the board's whole contract.
+
+import { afterEach, describe, expect, it } from "vitest";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { Board } from "./Board";
+import { parseFen } from "../board/position";
+
+let root: Root | null = null;
+let container: HTMLDivElement | null = null;
+
+function mount(el: React.JSX.Element): void {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  act(() => root!.render(el));
+}
+
+afterEach(() => {
+  act(() => root?.unmount());
+  root = null;
+  if (container != null) container.remove();
+  container = null;
+});
+
+/** Click the gridcell whose aria-label ends with the given square name. */
+function clickSquare(sq: string): void {
+  const cells = Array.from(container!.querySelectorAll('[role="gridcell"]'));
+  const cell = cells.find((c) => (c.getAttribute("aria-label") ?? "").split(" ")[1] === sq);
+  if (cell == null) throw new Error(`no cell for ${sq}`);
+  act(() => {
+    cell.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+}
+
+const START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+describe("Board", () => {
+  it("renders 64 cells", () => {
+    const moves: string[] = [];
+    mount(
+      <Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />,
+    );
+    expect(container!.querySelectorAll('[role="gridcell"]').length).toBe(64);
+  });
+
+  it("emits a UCI move on from→to click (white pawn e2e4)", () => {
+    const moves: string[] = [];
+    mount(
+      <Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />,
+    );
+    clickSquare("e2"); // select own pawn
+    clickSquare("e4"); // destination
+    expect(moves).toEqual(["e2e4"]);
+  });
+
+  it("does not select an opponent piece as the from-square", () => {
+    const moves: string[] = [];
+    mount(
+      <Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />,
+    );
+    clickSquare("e7"); // black pawn — not ours
+    clickSquare("e5");
+    expect(moves).toEqual([]); // no move emitted (first click selected nothing)
+  });
+
+  it("defaults a promotion to queen (white pawn to the 8th rank)", () => {
+    const moves: string[] = [];
+    // White pawn on a7, empty a8 — a7a8 is a promotion.
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    expect(moves).toEqual(["a7a8q"]);
+  });
+
+  it("is inert when not interactive", () => {
+    const moves: string[] = [];
+    mount(
+      <Board position={parseFen(START)} mySeat={0} interactive={false} onMove={(u) => moves.push(u)} />,
+    );
+    clickSquare("e2");
+    clickSquare("e4");
+    expect(moves).toEqual([]);
+  });
+
+  it("renders for a black seat without error and emits black's move", () => {
+    const moves: string[] = [];
+    // Black to move after 1.e4; black plays e7e5.
+    const fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={1} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("e7");
+    clickSquare("e5");
+    expect(moves).toEqual(["e7e5"]);
+  });
+});
