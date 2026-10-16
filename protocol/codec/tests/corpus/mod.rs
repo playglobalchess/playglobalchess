@@ -137,6 +137,7 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
             Item::Server(ServerMsg::MoveAccepted {
                 game_id: gid(),
                 ply: 18,
+                uci: "e2e4".to_string(),
                 clock_after_ms: 297_500,
             }),
         ),

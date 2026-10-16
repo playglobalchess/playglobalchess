@@ -72,10 +72,15 @@ pub enum ServerMsg {
         opponent: String,
         start_state: StateBody,
     },
-    /// `0x82` — `game_id:str36, ply:u32, clock_after_ms:u32`.
+    /// `0x82` — `game_id:str36, ply:u32, uci:str5, clock_after_ms:u32`.
+    /// `uci` is the move just applied (§4A v1.2, ADR-18) — carried so a client
+    /// (mover AND opponent, both seats are sent this frame) applies the one
+    /// authoritative move to its own board without a local engine. Field order
+    /// mirrors the `MovePlayed` event body (Q-V12a).
     MoveAccepted {
         game_id: GameId,
         ply: u32,
+        uci: String,
         clock_after_ms: u32,
     },
     /// `0x83` — `game_id:str36, ply_expected:u32, reason:enum8`.
@@ -203,11 +208,13 @@ pub(crate) struct MatchedPayload {
     pub start_state: StateBody,
 }
 
-/// `MOVE_ACCEPTED` payload (§4A.3): `game_id, ply, clock_after_ms`.
+/// `MOVE_ACCEPTED` payload (§4A.3, v1.2 ADR-18): `game_id, ply, uci,
+/// clock_after_ms`. `uci` added after `ply` (Q-V12a, matching `MovePlayed`).
 #[derive(Serialize, Deserialize)]
 pub(crate) struct MoveAcceptedPayload {
     pub game_id: GameId,
     pub ply: u32,
+    pub uci: String,
     pub clock_after_ms: u32,
 }
 

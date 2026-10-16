@@ -32,8 +32,11 @@ func TestE2E_FullGameToMate(t *testing.T) {
 		{white, 7, "h5f7"}, // Qxf7#
 	}
 	for _, m := range moves {
-		move(t, m.c, gameID, m.ply, m.uci)
-		m.c.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+		opp := black
+		if m.c == black {
+			opp = white
+		}
+		moveAndAwaitBoth(t, m.c, opp, gameID, m.ply, m.uci)
 	}
 	// Both clients receive GAME_END{MATE}; white (the mover) wins.
 	geW := white.waitForServer(t, codec.SMGameEnd, 2*time.Second)
@@ -59,10 +62,8 @@ func TestE2E_GameEndsByResign(t *testing.T) {
 	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 	white, black := whiteBlack(ca, cb, seatA, seatB)
 
-	move(t, white, gameID, 1, "e2e4")
-	white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-	move(t, black, gameID, 2, "e7e5")
-	black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	moveAndAwaitBoth(t, black, white, gameID, 2, "e7e5")
 	// White resigns.
 	white.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
 	geW := white.waitForServer(t, codec.SMGameEnd, 2*time.Second)
@@ -81,10 +82,8 @@ func TestE2E_GameEndsByDraw(t *testing.T) {
 	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 	white, black := whiteBlack(ca, cb, seatA, seatB)
 
-	move(t, white, gameID, 1, "e2e4")
-	white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-	move(t, black, gameID, 2, "e7e5")
-	black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	moveAndAwaitBoth(t, black, white, gameID, 2, "e7e5")
 	// White offers a draw; black agrees (second offer = agreement).
 	white.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
 	time.Sleep(20 * time.Millisecond)

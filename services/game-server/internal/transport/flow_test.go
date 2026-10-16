@@ -41,6 +41,18 @@ func move(t *testing.T, c *fakeConn, gameID string, ply uint32, uci string) {
 	}})
 }
 
+// moveAndAwaitBoth plays a move and consumes the MOVE_ACCEPTED that §4A v1.2
+// (ADR-18) now broadcasts to BOTH seats — the mover and the opponent. Returns
+// the mover's accepted frame (both carry the same uci/ply). Draining both keeps
+// each conn's seen-offset aligned so a later move does not re-match a stale ack.
+func moveAndAwaitBoth(t *testing.T, mover, opponent *fakeConn, gameID string, ply uint32, uci string) codec.ServerMsg {
+	t.Helper()
+	move(t, mover, gameID, ply, uci)
+	acc := mover.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	opponent.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	return acc
+}
+
 // TestMoveAcceptedAndRejected drives the move hot path.
 func TestMoveAcceptedAndRejected(t *testing.T) {
 	h := newHarness(t)
@@ -386,8 +398,11 @@ func TestSingleGameEndNoDoubleFire(t *testing.T) {
 		{white, 7, "h5f7"},
 	}
 	for _, m := range moves {
-		move(t, m.c, gameID, m.ply, m.uci)
-		m.c.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+		opp := black
+		if m.c == black {
+			opp = white
+		}
+		moveAndAwaitBoth(t, m.c, opp, gameID, m.ply, m.uci)
 	}
 	white.waitForServer(t, codec.SMGameEnd, 2*time.Second)
 	black.waitForServer(t, codec.SMGameEnd, 2*time.Second)
@@ -498,5 +513,65 @@ func TestRepeatOfferDrawNoDuplicateNotify(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("opponent received %d DRAW_OFFERED, want exactly 1 (repeat offer must not re-notify)", n)
+	}
+}
+
+// TestMoveBroadcastToBothSeats is the §4A v1.2 (ADR-18) gap-closer: an accepted
+// move is broadcast to BOTH seats carrying the authoritative uci, so the
+// OPPONENT's board can advance. The pre-v1.2 transport sent MOVE_ACCEPTED to the
+// mover only — this asserts the opponent now receives it with the right move,
+// the assertion the old e2e never made.
+func TestMoveBroadcastToBothSeats(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+
+	move(t, white, gameID, 1, "e2e4")
+	// The MOVER sees its ack with the uci.
+	accW := white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	if accW.MoveAccepted.UCI != "e2e4" {
+		t.Fatalf("mover ack uci = %q, want e2e4", accW.MoveAccepted.UCI)
+	}
+	// The OPPONENT also receives the move (the gap this closes), same uci + ply.
+	accB := black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	if accB.MoveAccepted.UCI != "e2e4" {
+		t.Fatalf("opponent ack uci = %q, want e2e4", accB.MoveAccepted.UCI)
+	}
+	if accB.MoveAccepted.Ply != 1 || accB.MoveAccepted.GameID != gameID {
+		t.Fatalf("opponent ack ply/game = %d/%s, want 1/%s", accB.MoveAccepted.Ply, accB.MoveAccepted.GameID, gameID)
+	}
+	// Both seats must see the SAME authoritative clock (belt-and-suspenders
+	// against a uci/clock field-order swap the corpus freeze also guards).
+	if accB.MoveAccepted.ClockAfterMs != accW.MoveAccepted.ClockAfterMs {
+		t.Fatalf("opponent clock = %d, mover clock = %d, want equal", accB.MoveAccepted.ClockAfterMs, accW.MoveAccepted.ClockAfterMs)
+	}
+}
+
+// TestReAckEchoesPersistedUCI: a duplicate MOVE on an already-persisted ply that
+// carries a DIFFERENT uci must re-ack the PERSISTED move's uci, never the
+// retry's — the §4A v1.2 server-authoritative re-ack (the pipeline reads
+// mv.UCI, the transport reads out.UCI, not p.UCI). Regression against the
+// blank/stale-field class of bug.
+func TestReAckEchoesPersistedUCI(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+
+	// White plays the real move e2e4 at ply 1 (both seats ack).
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+
+	// White re-sends ply 1 but with a DIFFERENT uci (a buggy/garbled retry). The
+	// move is already persisted as e2e4; the re-ack must echo e2e4, not d2d4.
+	move(t, white, gameID, 1, "d2d4")
+	reack := white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	if reack.MoveAccepted.UCI != "e2e4" {
+		t.Fatalf("re-ack uci = %q, want the PERSISTED e2e4 (not the retry's d2d4)", reack.MoveAccepted.UCI)
+	}
+	if reack.MoveAccepted.Ply != 1 {
+		t.Fatalf("re-ack ply = %d, want 1", reack.MoveAccepted.Ply)
 	}
 }

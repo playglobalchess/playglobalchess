@@ -168,10 +168,13 @@ type MatchedPayload struct {
 	StartState StateBody
 }
 
-// MoveAcceptedPayload — §4A.3 MOVE_ACCEPTED: game_id, ply:u32, clock_after_ms:u32.
+// MoveAcceptedPayload — §4A.3 MOVE_ACCEPTED (v1.2, ADR-18): game_id, ply:u32,
+// uci:str5, clock_after_ms:u32. uci is the move just applied, carried so both
+// seats can advance their boards (broadcast to both).
 type MoveAcceptedPayload struct {
 	GameID       string
 	Ply          uint32
+	UCI          string
 	ClockAfterMs uint32
 }
 
@@ -403,6 +406,7 @@ func marshalServerIntermediate(m ServerMsg) ([]byte, error) {
 		}
 		w.str(m.MoveAccepted.GameID)
 		w.uvarint(uint64(m.MoveAccepted.Ply))
+		w.str(m.MoveAccepted.UCI)
 		w.uvarint(uint64(m.MoveAccepted.ClockAfterMs))
 	case SMMoveRejected:
 		if m.MoveRejected == nil {
@@ -492,11 +496,15 @@ func unmarshalServerIntermediate(b []byte) (ServerMsg, error) {
 		if err != nil {
 			return ServerMsg{}, err
 		}
+		uci, err := r.str()
+		if err != nil {
+			return ServerMsg{}, err
+		}
 		clk, err := r.uvarint()
 		if err != nil {
 			return ServerMsg{}, err
 		}
-		m = ServerMsg{Type: SMMoveAccepted, MoveAccepted: &MoveAcceptedPayload{GameID: gid, Ply: uint32(ply), ClockAfterMs: uint32(clk)}}
+		m = ServerMsg{Type: SMMoveAccepted, MoveAccepted: &MoveAcceptedPayload{GameID: gid, Ply: uint32(ply), UCI: uci, ClockAfterMs: uint32(clk)}}
 	case SMMoveRejected:
 		gid, err := r.str()
 		if err != nil {

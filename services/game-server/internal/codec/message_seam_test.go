@@ -173,7 +173,7 @@ func corpusServerMsgs() map[string]ServerMsg {
 			},
 		}},
 		"server/move_accepted": {Type: SMMoveAccepted, MoveAccepted: &MoveAcceptedPayload{
-			GameID: gid, Ply: 18, ClockAfterMs: 297500,
+			GameID: gid, Ply: 18, UCI: "e2e4", ClockAfterMs: 297500,
 		}},
 		"server/move_rejected": {Type: SMMoveRejected, MoveRejected: &MoveRejectedPayload{
 			GameID: gid, PlyExpected: 18, Reason: 0x02, // STALE_PLY
