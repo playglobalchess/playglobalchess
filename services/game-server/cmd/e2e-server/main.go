@@ -50,7 +50,13 @@ func main() {
 	srv := transport.NewServer(transport.DevAuthenticator{}, mm, reg)
 
 	mux := http.NewServeMux()
-	mux.Handle(*path, srv.HTTPHandler())
+	// Dev server: accept loopback dev origins. A browser reaching this through
+	// the Vite dev proxy carries Origin=127.0.0.1:5173 (the dev host) while the
+	// upstream Host is this server — coder/websocket's default same-origin check
+	// would 403 it (and the proxy's upstream write would EPIPE). A real
+	// WebSocket client (the e2e harness) sends no Origin and is unaffected. NOT
+	// a production policy.
+	mux.Handle(*path, srv.HTTPHandlerWithOrigins([]string{"127.0.0.1:*", "localhost:*", "[::1]:*"}))
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           mux,
