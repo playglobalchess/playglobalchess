@@ -171,4 +171,73 @@ describe("GameSocket (fake socket, real codec)", () => {
     expect(fakes[0]!.closed).toBe(true);
     expect(fakes.length).toBe(1); // no reconnect socket created
   });
+
+  it("UNSUPPORTED_VERSION error closes the socket and does NOT reconnect (§5)", () => {
+    sock = new GameSocket({
+      url: "ws://test", token: "t", onServerMsg: (m) => received.push(m),
+      factory: () => { const f = new FakeSocket(); fakes.push(f); return f; },
+      backoffMs: 1,
+    });
+    sock.connect();
+    fakes[0]!.open();
+    // Server rejects the protocol major → UNSUPPORTED_VERSION (code 1).
+    fakes[0]!.feed({ Error: { code: 1, msg: "unsupported version" } });
+    // The error is forwarded (UI shows refresh), the socket is closed...
+    expect("Error" in received.at(-1)!).toBe(true);
+    expect(fakes[0]!.closed).toBe(true);
+    // ...and the subsequent onclose must NOT spawn a reconnect (closedByUs set).
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        expect(fakes.length).toBe(1); // no reconnect — would busy-loop otherwise
+        resolve();
+      }, 10);
+    });
+  });
+
+  it("stale old-socket callbacks are ignored after a reconnect (B1)", () => {
+    sock = new GameSocket({
+      url: "ws://test", token: "t", onServerMsg: (m) => received.push(m),
+      factory: () => { const f = new FakeSocket(); fakes.push(f); return f; },
+      backoffMs: 1,
+    });
+    sock.connect();
+    const first = fakes[0]!;
+    first.open();
+    first.onclose?.(); // unexpected drop → schedules reconnect
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        expect(fakes.length).toBe(2);
+        fakes[1]!.open();
+        const beforeStale = received.length;
+        const sockets1 = fakes.length;
+        // The OLD socket now emits a late frame AND a second close. Both must be
+        // ignored — no dispatch, and crucially NO new reconnect socket.
+        first.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+        first.onclose?.();
+        expect(received.length).toBe(beforeStale); // stale frame dropped
+        setTimeout(() => {
+          expect(fakes.length).toBe(sockets1); // stale onclose spawned no reconnect
+          resolve();
+        }, 10);
+      }, 10);
+    });
+  });
+
+  it("close() during a pending reconnect timer stops the reconnect", () => {
+    sock = new GameSocket({
+      url: "ws://test", token: "t", onServerMsg: (m) => received.push(m),
+      factory: () => { const f = new FakeSocket(); fakes.push(f); return f; },
+      backoffMs: 50, // long enough that we close() before it fires
+    });
+    sock.connect();
+    fakes[0]!.open();
+    fakes[0]!.onclose?.(); // schedules a reconnect in ~50ms
+    sock.close(); // deliberate close BEFORE the timer fires
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        expect(fakes.length).toBe(1); // the pending reconnect timer was cancelled
+        resolve();
+      }, 80);
+    });
+  });
 });

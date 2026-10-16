@@ -10,11 +10,15 @@
 //
 // Reconnection (§3.4): on close, it reconnects, re-sends AUTHENTICATE (the
 // server auto-pushes STATE, Option A), and re-sends SEEK only if we had not yet
-// matched. The caller can also request an explicit RESYNC (e.g. when the reducer
-// sets needsResync on a detected ply gap).
+// matched. GameSocket exposes resync() but does NOT itself observe the reducer's
+// needsResync flag — it never reads reducer output. Wiring "reducer flags a ply
+// gap → call sock.resync(gameId)" belongs to the React layer (step 5), which
+// owns both the dispatch into the reducer and the resulting state. The primary
+// resync path (auto-STATE on re-AUTHENTICATE) is handled here; resync() is the
+// secondary on-demand path the UI layer drives.
 
 import { encode, decode } from "../codec/seam";
-import type { ClientMsg, ServerMsg } from "../codec/messages";
+import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
 
 /** The minimal WebSocket surface GameSocket needs — real `WebSocket` satisfies it. */
 export interface SocketLike {
@@ -67,18 +71,38 @@ export class GameSocket {
 
   /** Open the socket and run the connect→AUTHENTICATE flow. */
   connect(): void {
+    // Guard against a double connect() (React StrictMode double-mount, a retry):
+    // tear down any existing socket first so we never leak a live one (S2/B1).
+    if (this.sock != null) {
+      this.detach(this.sock);
+      this.sock = null;
+    }
     this.closedByUs = false;
     this.open();
   }
 
+  /** Null a socket's handlers so a superseded socket can never call back into us. */
+  private detach(sock: SocketLike): void {
+    sock.onopen = null;
+    sock.onclose = null;
+    sock.onerror = null;
+    sock.onmessage = null;
+  }
+
   private open(): void {
+    // Detach the previous socket before replacing it — otherwise its live
+    // onclose/onmessage closures keep firing after the new socket opens, which
+    // spawns concurrent reconnect chains and lets stale frames through (B1).
+    if (this.sock != null) this.detach(this.sock);
+
     this.status("connecting");
     const sock = this.factory(this.opts.url);
     sock.binaryType = "arraybuffer";
     this.sock = sock;
 
     sock.onopen = () => {
-      this.attempt = 0;
+      // Ignore if this socket was superseded or we closed deliberately (S1/B1).
+      if (sock !== this.sock || this.closedByUs) return;
       this.status("connected");
       // First frame MUST be AUTHENTICATE (§3.1). The server auto-pushes STATE
       // for any live game this user is seated in (reconnect resync, Option A).
@@ -87,23 +111,48 @@ export class GameSocket {
       if (this.pendingSeek != null && !this.matched) {
         this.sendMsg(this.pendingSeek);
       }
+      // NOTE: `attempt` (backoff) is reset on the FIRST decoded message, not
+      // here — a raw socket open that the server immediately rejects must not
+      // reset backoff into a tight reconnect loop (S3).
     };
 
     sock.onmessage = (ev: { data: unknown }) => {
+      if (sock !== this.sock) return; // drop frames from a superseded socket (B1)
       const bytes = toBytes(ev.data);
-      if (bytes == null) return; // ignore a non-binary frame rather than crash
+      if (bytes == null) {
+        console.warn("GameSocket: ignoring non-binary frame");
+        return;
+      }
       let msg: ServerMsg;
       try {
         msg = decode(bytes);
-      } catch {
+      } catch (err) {
         // A garbled/oversized frame: log + ignore, never break the read loop (§5).
+        console.warn("GameSocket: ignoring undecodable frame", err);
         return;
       }
-      if ("Matched" in msg) this.matched = true;
-      this.opts.onServerMsg(msg);
+      // The connection is proven usable — now reset the backoff counter (S3).
+      this.attempt = 0;
+      if ("Matched" in msg) {
+        this.matched = true;
+        this.pendingSeek = null; // matched — the seek is consumed (explicit invariant)
+      }
+      // §5: an UNSUPPORTED_VERSION error is unrecoverable — the client's protocol
+      // major mismatches the server. Forward it (so the UI can show "please
+      // refresh"), suppress reconnect, and close — never busy-loop re-auth (S5).
+      if ("Error" in msg && msg.Error.code === ErrorCode.UnsupportedVersion) {
+        this.safeDispatch(msg);
+        this.closedByUs = true;
+        if (this.timer != null) clearTimeout(this.timer);
+        this.status("closed");
+        this.sock?.close();
+        return;
+      }
+      this.safeDispatch(msg);
     };
 
     sock.onclose = () => {
+      if (sock !== this.sock) return; // a superseded socket closing — ignore (B1)
       if (this.closedByUs) {
         this.status("closed");
         return;
@@ -115,6 +164,15 @@ export class GameSocket {
     sock.onerror = () => {
       // onclose follows; reconnect is driven there. Nothing to do here.
     };
+  }
+
+  /** Dispatch to the reducer callback, isolating a throwing callback from the read loop. */
+  private safeDispatch(msg: ServerMsg): void {
+    try {
+      this.opts.onServerMsg(msg);
+    } catch (err) {
+      console.warn("GameSocket: onServerMsg threw", err);
+    }
   }
 
   private scheduleReconnect(): void {
@@ -146,7 +204,8 @@ export class GameSocket {
   offerDraw(gameId: string): void {
     this.sendMsg({ OfferDraw: { game_id: gameId } });
   }
-  /** Force a fresh STATE (§4A v1.1 RESYNC) — e.g. when the reducer flags needsResync. */
+  /** Force a fresh STATE (§4A v1.1 RESYNC). Called by the React layer when the
+   * reducer's needsResync flag is set (GameSocket does not observe it itself). */
   resync(gameId: string): void {
     this.sendMsg({ Resync: { game_id: gameId } });
   }
