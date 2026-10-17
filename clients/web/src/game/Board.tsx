@@ -16,7 +16,7 @@
 //    piece then plays to the next focused square, Escape cancels a selection.
 //    Home/End jump to the row edges. Exactly one cell is tabbable at a time.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Position } from "../board/position";
 import { indexToSquare } from "../board/position";
 import { t } from "../i18n";
@@ -71,6 +71,10 @@ function squareLabel(idx: number, piece: string | null): string {
 export function Board(props: BoardProps): React.JSX.Element {
   const { position, mySeat, interactive, onMove } = props;
   const [selected, setSelected] = useState<number | null>(null);
+  // A promotion awaiting the player's piece choice (from/to squares in UCI).
+  const [pendingPromotion, setPendingPromotion] = useState<{ from: string; to: string } | null>(
+    null,
+  );
   // Roving focus cursor (a board index). Starts at a sensible home square.
   const [cursor, setCursor] = useState<number>(() => (mySeat === 1 ? 0 : 56)); // a1-ish for white
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -80,15 +84,29 @@ export function Board(props: BoardProps): React.JSX.Element {
   const indices = Array.from({ length: 64 }, (_, i) => i);
   const ordered = flipped ? indices.slice().reverse() : indices;
 
-  /** Commit a move from `fromIdx` to `toIdx` (mechanical UCI, default-queen promo). */
+  /** Commit a move from `fromIdx` to `toIdx`. A promotion opens the piece
+   * picker (pendingPromotion) instead of defaulting to queen; a normal move
+   * emits its UCI immediately. */
   function commitMove(fromIdx: number, toIdx: number): void {
     const from = indexToSquare(fromIdx);
     const to = indexToSquare(toIdx);
     const movingPiece = position.board[fromIdx];
-    let uci = `${from}${to}`;
-    if (movingPiece != null && isPromotion(movingPiece, to)) uci += "q";
+    if (movingPiece != null && isPromotion(movingPiece, to)) {
+      setSelected(null);
+      setPendingPromotion({ from, to });
+      return;
+    }
     setSelected(null);
-    onMove(uci);
+    onMove(`${from}${to}`);
+  }
+
+  /** Finish a pending promotion with the chosen piece (q/r/b/n), emitting the
+   * 5-char UCI. piece is the lowercase promotion letter the server expects. */
+  function choosePromotion(piece: "q" | "r" | "b" | "n"): void {
+    const p = pendingPromotion;
+    if (p == null) return;
+    setPendingPromotion(null);
+    onMove(`${p.from}${p.to}${piece}`);
   }
 
   /** Shared select/move decision for a target square (used by click AND keyboard). */
@@ -146,6 +164,7 @@ export function Board(props: BoardProps): React.JSX.Element {
       case "Escape":
         e.preventDefault();
         setSelected(null);
+        setPendingPromotion(null);
         break;
       default:
         break;
@@ -157,6 +176,7 @@ export function Board(props: BoardProps): React.JSX.Element {
   for (let r = 0; r < 8; r++) rows.push(ordered.slice(r * 8, r * 8 + 8));
 
   return (
+    <div style={{ position: "relative", width: "min(90vmin, 560px)" }}>
     <div
       ref={gridRef}
       role="grid"
@@ -165,7 +185,7 @@ export function Board(props: BoardProps): React.JSX.Element {
       style={{
         display: "grid",
         gridTemplateRows: "repeat(8, 1fr)",
-        width: "min(90vmin, 560px)",
+        width: "100%",
         aspectRatio: "1 / 1",
         border: "2px solid var(--board-border, #333)",
       }}
@@ -224,6 +244,76 @@ export function Board(props: BoardProps): React.JSX.Element {
             );
           })}
         </div>
+      ))}
+    </div>
+    {pendingPromotion != null ? (
+      <PromotionPicker white={mySeat === 0} onChoose={choosePromotion} onCancel={() => setPendingPromotion(null)} />
+    ) : null}
+    </div>
+  );
+}
+
+/** The promotion piece chooser, shown over the board when a pawn reaches the
+ * last rank. Keyboard-accessible: role=dialog, the first option is auto-focused,
+ * arrow/tab move between options, Escape cancels. Glyphs reflect the player's
+ * color; the emitted letter is always lowercase (what the server expects). */
+function PromotionPicker(props: {
+  white: boolean;
+  onChoose: (piece: "q" | "r" | "b" | "n") => void;
+  onCancel: () => void;
+}): React.JSX.Element {
+  const { white, onChoose, onCancel } = props;
+  const first = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    first.current?.focus();
+  }, []);
+  const options: { piece: "q" | "r" | "b" | "n"; glyph: string; labelKey: string }[] = [
+    { piece: "q", glyph: white ? "\u2655" : "\u265B", labelKey: "piece.queen" },
+    { piece: "r", glyph: white ? "\u2656" : "\u265C", labelKey: "piece.rook" },
+    { piece: "b", glyph: white ? "\u2657" : "\u265D", labelKey: "piece.bishop" },
+    { piece: "n", glyph: white ? "\u2658" : "\u265E", labelKey: "piece.knight" },
+  ];
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("promotion.aria")}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          onCancel();
+        }
+      }}
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "0.5rem",
+        background: "var(--board-overlay, rgba(0,0,0,0.55))",
+      }}
+    >
+      {options.map((o, i) => (
+        <button
+          key={o.piece}
+          ref={i === 0 ? first : undefined}
+          type="button"
+          aria-label={t(o.labelKey as Parameters<typeof t>[0])}
+          onClick={() => onChoose(o.piece)}
+          style={{
+            fontSize: "clamp(24px, 9vmin, 56px)",
+            lineHeight: 1,
+            padding: "0.3rem 0.5rem",
+            cursor: "pointer",
+            background: "var(--board-light, #d8dee6)",
+            color: "var(--board-piece, #111)",
+            border: "2px solid var(--board-border, #333)",
+            borderRadius: 6,
+          }}
+        >
+          <span aria-hidden="true">{o.glyph}</span>
+        </button>
       ))}
     </div>
   );
