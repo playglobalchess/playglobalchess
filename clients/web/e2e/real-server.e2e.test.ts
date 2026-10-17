@@ -80,12 +80,20 @@ class Client {
   close(): void {
     this.sock.close();
   }
-  /** Wait until a predicate matches an inbox message, or time out. */
+  /** Wait until a predicate matches an UNCONSUMED inbox message, or time out.
+   * Tracks a consumed offset so a multi-move driver gets the NEXT matching
+   * frame rather than re-matching a stale earlier one of the same type. */
+  private consumed = 0;
   async waitFor<T extends ServerMsg>(pred: (m: ServerMsg) => m is T, ms = 5000): Promise<T> {
     const deadline = Date.now() + ms;
     for (;;) {
-      const hit = this.inbox.find(pred);
-      if (hit != null) return hit;
+      for (let i = this.consumed; i < this.inbox.length; i++) {
+        const m = this.inbox[i]!;
+        if (pred(m)) {
+          this.consumed = i + 1;
+          return m;
+        }
+      }
       if (Date.now() > deadline) throw new Error("timed out waiting for a server message");
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -95,6 +103,7 @@ class Client {
 const isMatched = (m: ServerMsg): m is Extract<ServerMsg, { Matched: unknown }> => "Matched" in m;
 const isMoveAccepted = (m: ServerMsg): m is Extract<ServerMsg, { MoveAccepted: unknown }> =>
   "MoveAccepted" in m;
+const isGameEnd = (m: ServerMsg): m is Extract<ServerMsg, { GameEnd: unknown }> => "GameEnd" in m;
 
 d("real-server e2e (web client <-> Go game-server)", () => {
   beforeAll(async () => {
@@ -139,6 +148,65 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     // No client received an ERROR frame — a malformed seek (e.g. a time control
     // the server cannot resolve) would arrive here as Error "could not start
     // game" and must fail the test, not pass silently.
+    const anyError = (c: Client): boolean => c.inbox.some((m) => "Error" in m);
+    expect(anyError(white)).toBe(false);
+    expect(anyError(black)).toBe(false);
+
+    white.close();
+    black.close();
+  }, 20_000);
+
+  it("plays a full game to a terminal (Fool's mate) — both seats, every ply + GAME_END", async () => {
+    const white = new Client("carol");
+    const black = new Client("dave");
+    white.connect();
+    black.connect();
+    white.seek();
+    await new Promise((r) => setTimeout(r, 50));
+    black.seek();
+
+    const wm = await white.waitFor(isMatched);
+    const bm = await black.waitFor(isMatched);
+    const gameId = wm.Matched.game_id;
+    expect(bm.Matched.game_id).toBe(gameId);
+
+    // Seat 0 is White and moves on odd plies. Map our two clients to seats.
+    const bySeat: Record<number, Client> = {
+      [wm.Matched.seat_idx]: white,
+      [bm.Matched.seat_idx]: black,
+    };
+    const whiteSeat = bySeat[0]!;
+    const blackSeat = bySeat[1]!;
+
+    // Fool's mate: 1. f3 e5 2. g4 Qh4#  → Black mates on ply 4.
+    const script: Array<{ by: Client; uci: string }> = [
+      { by: whiteSeat, uci: "f2f3" },
+      { by: blackSeat, uci: "e7e5" },
+      { by: whiteSeat, uci: "g2g4" },
+      { by: blackSeat, uci: "d8h4" }, // mate
+    ];
+
+    for (let i = 0; i < script.length; i++) {
+      const ply = i + 1;
+      script[i]!.by.move(gameId, ply, script[i]!.uci);
+      // BOTH seats must see each accepted move, with a monotonically increasing ply.
+      const wAck = await white.waitFor(isMoveAccepted);
+      const bAck = await black.waitFor(isMoveAccepted);
+      expect(wAck.MoveAccepted.ply).toBe(ply);
+      expect(bAck.MoveAccepted.ply).toBe(ply);
+      expect(wAck.MoveAccepted.uci).toBe(script[i]!.uci);
+      expect(bAck.MoveAccepted.uci).toBe(script[i]!.uci);
+    }
+
+    // The mating move ends the game: BOTH seats receive GAME_END with Mate (1).
+    const wEnd = await white.waitFor(isGameEnd);
+    const bEnd = await black.waitFor(isGameEnd);
+    expect(wEnd.GameEnd.termination).toBe(1); // Termination.Mate
+    expect(bEnd.GameEnd.termination).toBe(1);
+    // result_vector: the mated side (White, seat 0) lost (0), Black won (2).
+    expect(wEnd.GameEnd.result_vector[0]).toBe(0);
+    expect(wEnd.GameEnd.result_vector[1]).toBe(2);
+
     const anyError = (c: Client): boolean => c.inbox.some((m) => "Error" in m);
     expect(anyError(white)).toBe(false);
     expect(anyError(black)).toBe(false);
