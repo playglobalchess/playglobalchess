@@ -70,14 +70,41 @@ describe("Board", () => {
     expect(moves).toEqual([]); // no move emitted (first click selected nothing)
   });
 
-  it("defaults a promotion to queen (white pawn to the 8th rank)", () => {
+  it("a promotion opens the picker and does NOT emit a move until a piece is chosen", () => {
     const moves: string[] = [];
-    // White pawn on a7, empty a8 — a7a8 is a promotion.
-    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1"; // white pawn a7, a8 empty
     mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
     clickSquare("a7");
     clickSquare("a8");
-    expect(moves).toEqual(["a7a8q"]);
+    expect(moves).toEqual([]); // nothing emitted yet
+    expect(container!.querySelector('[role="dialog"]')).not.toBeNull(); // picker shown
+  });
+
+  it("promotion picker emits the chosen piece — queen AND each underpromotion", () => {
+    const cases: Array<{ label: string; uci: string }> = [
+      { label: "queen", uci: "a7a8q" },
+      { label: "rook", uci: "a7a8r" },
+      { label: "bishop", uci: "a7a8b" },
+      { label: "knight", uci: "a7a8n" },
+    ];
+    for (const c of cases) {
+      const moves: string[] = [];
+      const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+      mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+      clickSquare("a7");
+      clickSquare("a8");
+      // Click the picker option whose aria-label is the piece name.
+      const btn = Array.from(container!.querySelectorAll('[role="dialog"] button')).find(
+        (b) => (b.getAttribute("aria-label") ?? "") === c.label,
+      );
+      if (btn == null) throw new Error(`no promotion option for ${c.label}`);
+      act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+      expect(moves).toEqual([c.uci]);
+      act(() => root?.unmount());
+      root = null;
+      if (container != null) container.remove();
+      container = null;
+    }
   });
 
   it("is inert when not interactive", () => {
@@ -148,5 +175,52 @@ describe("Board", () => {
     expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(1);
     key("Escape");
     expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(0);
+  });
+
+  // --- review-fix regressions (PR #66 context-free review) -----------------
+
+  it("does NOT render a dangling promotion picker when the board goes non-interactive (#1)", () => {
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={() => {}} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    expect(container!.querySelector('[role="dialog"]')).not.toBeNull(); // picker open
+    // A server frame arrives → board becomes non-interactive while the picker is open.
+    const nonInteractive = (
+      <Board position={parseFen(fen)} mySeat={0} interactive={false} onMove={() => {}} />
+    );
+    act(() => {
+      root!.render(nonInteractive);
+    });
+    expect(container!.querySelector('[role="dialog"]')).toBeNull(); // no stale overlay
+  });
+
+  it("promotion picker: Arrow roving to a non-first option + Enter emits that underpromotion (#2/#3)", () => {
+    const moves: string[] = [];
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    const dialog = container!.querySelector('[role="dialog"]')!;
+    const key = (k: string): void => {
+      act(() => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true })));
+    };
+    // Options are Q,R,B,N (index 0..3). Right twice → bishop; Enter → a7a8b.
+    key("ArrowRight");
+    key("ArrowRight");
+    key("Enter");
+    expect(moves).toEqual(["a7a8b"]);
+  });
+
+  it("promotion picker: Escape cancels and leaves no dialog (#2)", () => {
+    const moves: string[] = [];
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    const dialog = container!.querySelector('[role="dialog"]')!;
+    act(() => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(container!.querySelector('[role="dialog"]')).toBeNull();
+    expect(moves).toEqual([]); // nothing emitted on cancel
   });
 });

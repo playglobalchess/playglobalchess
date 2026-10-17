@@ -32,6 +32,7 @@ export const en = {
   "piece.bishop": "bishop",
   "piece.knight": "knight",
   "piece.pawn": "pawn",
+  "promotion.aria": "Choose promotion piece",
   "announce.your_move": "Your move.",
   "announce.opponent_moved": "Opponent played",
   "announce.you_moved": "You played",
