@@ -114,6 +114,11 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     server?.kill("SIGTERM");
   });
 
+  // Guards against in-memory-pool state leaking between the two tests (they
+  // share one beforeAll server): each test's match must be a NEW game_id, so a
+  // leftover seek/half-game from the prior test cannot silently pair here.
+  const seenGameIds = new Set<string>();
+
   it("two clients match and a move reaches BOTH seats with the right uci", async () => {
     const white = new Client("alice");
     const black = new Client("bob");
@@ -129,6 +134,8 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     const bm = await black.waitFor(isMatched);
     const gameId = wm.Matched.game_id;
     expect(bm.Matched.game_id).toBe(gameId);
+    expect(seenGameIds.has(gameId)).toBe(false); // a NEW game, not a leaked one
+    seenGameIds.add(gameId);
 
     // Whichever of our two clients drew seat 0 is White and moves first.
     const mover = wm.Matched.seat_idx === 0 ? white : black;
@@ -169,6 +176,8 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     const bm = await black.waitFor(isMatched);
     const gameId = wm.Matched.game_id;
     expect(bm.Matched.game_id).toBe(gameId);
+    expect(seenGameIds.has(gameId)).toBe(false); // a NEW game, not a leaked one
+    seenGameIds.add(gameId);
 
     // Seat 0 is White and moves on odd plies. Map our two clients to seats.
     const bySeat: Record<number, Client> = {

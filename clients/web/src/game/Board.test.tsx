@@ -176,4 +176,51 @@ describe("Board", () => {
     key("Escape");
     expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(0);
   });
+
+  // --- review-fix regressions (PR #66 context-free review) -----------------
+
+  it("does NOT render a dangling promotion picker when the board goes non-interactive (#1)", () => {
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={() => {}} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    expect(container!.querySelector('[role="dialog"]')).not.toBeNull(); // picker open
+    // A server frame arrives → board becomes non-interactive while the picker is open.
+    const nonInteractive = (
+      <Board position={parseFen(fen)} mySeat={0} interactive={false} onMove={() => {}} />
+    );
+    act(() => {
+      root!.render(nonInteractive);
+    });
+    expect(container!.querySelector('[role="dialog"]')).toBeNull(); // no stale overlay
+  });
+
+  it("promotion picker: Arrow roving to a non-first option + Enter emits that underpromotion (#2/#3)", () => {
+    const moves: string[] = [];
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    const dialog = container!.querySelector('[role="dialog"]')!;
+    const key = (k: string): void => {
+      act(() => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true })));
+    };
+    // Options are Q,R,B,N (index 0..3). Right twice → bishop; Enter → a7a8b.
+    key("ArrowRight");
+    key("ArrowRight");
+    key("Enter");
+    expect(moves).toEqual(["a7a8b"]);
+  });
+
+  it("promotion picker: Escape cancels and leaves no dialog (#2)", () => {
+    const moves: string[] = [];
+    const fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1";
+    mount(<Board position={parseFen(fen)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);
+    clickSquare("a7");
+    clickSquare("a8");
+    const dialog = container!.querySelector('[role="dialog"]')!;
+    act(() => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(container!.querySelector('[role="dialog"]')).toBeNull();
+    expect(moves).toEqual([]); // nothing emitted on cancel
+  });
 });

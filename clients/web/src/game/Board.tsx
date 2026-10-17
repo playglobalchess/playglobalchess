@@ -246,7 +246,7 @@ export function Board(props: BoardProps): React.JSX.Element {
         </div>
       ))}
     </div>
-    {pendingPromotion != null ? (
+    {interactive && pendingPromotion != null ? (
       <PromotionPicker white={mySeat === 0} onChoose={choosePromotion} onCancel={() => setPendingPromotion(null)} />
     ) : null}
     </div>
@@ -254,36 +254,91 @@ export function Board(props: BoardProps): React.JSX.Element {
 }
 
 /** The promotion piece chooser, shown over the board when a pawn reaches the
- * last rank. Keyboard-accessible: role=dialog, the first option is auto-focused,
- * arrow/tab move between options, Escape cancels. Glyphs reflect the player's
- * color; the emitted letter is always lowercase (what the server expects). */
+ * last rank. A real modal (NFR-8): role=dialog + aria-modal with a FOCUS TRAP —
+ * the first option is focused on open, Arrow keys and Tab/Shift-Tab rove (and
+ * cycle) between the four options without escaping to the board behind it,
+ * Enter/Space choose, Escape cancels, and all other keys are swallowed so none
+ * reach the board grid. Focus is restored to the previously-focused element on
+ * close. Glyphs reflect the player's color; the emitted letter is always
+ * lowercase (what the server expects). */
 function PromotionPicker(props: {
   white: boolean;
   onChoose: (piece: "q" | "r" | "b" | "n") => void;
   onCancel: () => void;
 }): React.JSX.Element {
   const { white, onChoose, onCancel } = props;
-  const first = useRef<HTMLButtonElement | null>(null);
-  useEffect(() => {
-    first.current?.focus();
-  }, []);
   const options: { piece: "q" | "r" | "b" | "n"; glyph: string; labelKey: string }[] = [
     { piece: "q", glyph: white ? "\u2655" : "\u265B", labelKey: "piece.queen" },
     { piece: "r", glyph: white ? "\u2656" : "\u265C", labelKey: "piece.rook" },
     { piece: "b", glyph: white ? "\u2657" : "\u265D", labelKey: "piece.bishop" },
     { piece: "n", glyph: white ? "\u2658" : "\u265E", labelKey: "piece.knight" },
   ];
+  const btns = useRef<Array<HTMLButtonElement | null>>([]);
+  const [active, setActive] = useState(0);
+  // Capture the element focused before the dialog opened, restore it on close
+  // (WCAG 2.4.3 focus restoration). Focus the first option on open.
+  const restoreTo = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    restoreTo.current = (document.activeElement as HTMLElement) ?? null;
+    btns.current[0]?.focus();
+    return () => {
+      restoreTo.current?.focus();
+    };
+  }, []);
+  // Keep DOM focus on the active option as it changes.
+  useEffect(() => {
+    btns.current[active]?.focus();
+  }, [active]);
+
+  function onKeyDown(e: React.KeyboardEvent): void {
+    // The dialog TRAPS keys: nothing reaches the board grid behind it.
+    switch (e.key) {
+      case "Escape":
+        e.preventDefault();
+        e.stopPropagation();
+        onCancel();
+        break;
+      case "ArrowRight":
+      case "ArrowDown":
+      case "Tab":
+        if (e.key === "Tab" && e.shiftKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          setActive((a) => (a + options.length - 1) % options.length);
+          break;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        setActive((a) => (a + 1) % options.length);
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        e.preventDefault();
+        e.stopPropagation();
+        setActive((a) => (a + options.length - 1) % options.length);
+        break;
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        e.stopPropagation();
+        {
+          const opt = options[active];
+          if (opt != null) onChoose(opt.piece);
+        }
+        break;
+      default:
+        // Swallow every other key so it cannot reach the board grid.
+        e.stopPropagation();
+        break;
+    }
+  }
+
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-label={t("promotion.aria")}
-      onKeyDown={(e) => {
-        if (e.key === "Escape") {
-          e.preventDefault();
-          onCancel();
-        }
-      }}
+      onKeyDown={onKeyDown}
       style={{
         position: "absolute",
         inset: 0,
@@ -297,10 +352,14 @@ function PromotionPicker(props: {
       {options.map((o, i) => (
         <button
           key={o.piece}
-          ref={i === 0 ? first : undefined}
+          ref={(el) => {
+            btns.current[i] = el;
+          }}
           type="button"
           aria-label={t(o.labelKey as Parameters<typeof t>[0])}
+          tabIndex={i === active ? 0 : -1}
           onClick={() => onChoose(o.piece)}
+          onFocus={() => setActive(i)}
           style={{
             fontSize: "clamp(24px, 9vmin, 56px)",
             lineHeight: 1,
