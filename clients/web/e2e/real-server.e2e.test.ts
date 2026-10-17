@@ -80,17 +80,21 @@ class Client {
   close(): void {
     this.sock.close();
   }
-  /** Wait until a predicate matches an UNCONSUMED inbox message, or time out.
-   * Tracks a consumed offset so a multi-move driver gets the NEXT matching
-   * frame rather than re-matching a stale earlier one of the same type. */
-  private consumed = 0;
+  /** Wait until a predicate matches an UNCONSUMED inbox frame, or time out.
+   * Consumption is tracked PER-INDEX (a Set), NOT via a single moving cursor:
+   * matching a MOVE_ACCEPTED must not step a shared cursor PAST a GAME_END that
+   * happens to sit at an earlier index (server interleave ordering is not
+   * guaranteed), which would make a later waitFor(isGameEnd) miss it. Each frame
+   * is consumed at most once; a non-matching frame is left for its own waitFor. */
+  private readonly consumedIdx = new Set<number>();
   async waitFor<T extends ServerMsg>(pred: (m: ServerMsg) => m is T, ms = 5000): Promise<T> {
     const deadline = Date.now() + ms;
     for (;;) {
-      for (let i = this.consumed; i < this.inbox.length; i++) {
+      for (let i = 0; i < this.inbox.length; i++) {
+        if (this.consumedIdx.has(i)) continue;
         const m = this.inbox[i]!;
         if (pred(m)) {
-          this.consumed = i + 1;
+          this.consumedIdx.add(i);
           return m;
         }
       }
