@@ -5,7 +5,7 @@
 | Spec ID | SPEC-S3-ACCOUNTS |
 | Owner | S3 Platform (stream lead — fill in); co-reviewed by PE + S2 + S6 (fair-play veto) + Architecture group |
 | Status | REVIEW |
-| Version | 0.2 |
+| Version | 0.3 |
 | Last updated | 2026-10-21 |
 | Implements (master IDs) | X-3; F-46 (profile hook); ADR-6 (GDPR/COPPA), ADR-8 (entitlements hook); NFR-6 (ASVS L2), NFR-12 (compliance); Part XI T-5, T-9, T-10 |
 | Depends on | SPEC-S3-DATA-MODEL (`User`/`Credential`/`Profile`/`Entitlement` entity truth — cited, never redefined); SPEC-PE-API-CONTRACT (RATIFIED — the auth endpoint catalog, Bearer convention, RFC-7807 errors, this spec fulfils its explicit "token internals + service implementation delegated to X-3" out-of-scope lines); ADR-6, ADR-8 |
@@ -39,9 +39,9 @@ This is a **spec, not code.** Per the build manual §0 it is written, set to REV
 | Master ID | Requirement | Where handled |
 |---|---|---|
 | X-3 | Signup/login (OAuth + email), profiles, sessions, device management, COPPA for F-41 | whole spec; §3.2–3.7 mechanisms, §3.1 sessions, §3.8 device/session management, §3.9 compliance |
-| F-46 | Profile created at account creation | §3.2 (register provisions `Profile`), cites DATA-MODEL `Profile` |
-| ADR-6 | GDPR baseline + COPPA-as-needed | §3.9.1 (age gate), §3.9.2 (parental consent), §3.9.3 (erasure boundary) |
-| ADR-8 | Freemium entitlements hook, server-verified | §3.10 (entitlement granted at account creation; guests get none) |
+| F-46 | Profile created at account creation | §3.10 step 4 (shared pipeline provisions `Profile` on every creation path), cites DATA-MODEL `Profile` |
+| ADR-6 | GDPR baseline + COPPA-as-needed | §3.9.1 (age gate, run via §3.10 step 2 on all creation paths), §3.9.2 (parental consent), §3.9.3 (erasure boundary) |
+| ADR-8 | Freemium entitlements hook, server-verified | §3.10 step 5 (entitlement granted in the shared creation pipeline; guests get none) |
 | NFR-6 | OWASP ASVS L2 | §7 (password storage, session binding, transport, input validation) |
 | NFR-12 | GDPR/COPPA, export/delete within statutory windows | §3.9.3 (erasure boundary + 30-day windows) |
 | NFR-4 (indirect) | 100% of rated games scored → persistent identity | §3.6 (unrated-only guest invariant), §4 |
@@ -61,6 +61,16 @@ Two identity kinds, one session shape:
 Both resolve to the **same `Session` output shape** (API-CONTRACT Appendix A `Session { token, user_id, expires_at }`) so one client auth path handles both — with the subject-kind distinction carried **inside the opaque token**, not as a new public field (§3.1). A guest's `Session.user_id` is its `GuestSession.id` (an opaque subject id); clients never branch on the id's shape.
 
 > **Design rule (server-authoritative identity).** The token is opaque to clients (API-CONTRACT §3.1 Auth: *"token minted by X-3, opaque here"*). Every authorization decision — "is this subject an account or a guest?", "may it enter a rated pool?" — is made **server-side** from the session record, never from a client-supplied claim. This mirrors the move-path rule (clients send intents, server decides) and closes T-11-style client-trust gaps on the identity surface.
+
+### 3.0.1 Handle assignment (DECIDED — all account-creation paths) — was Q-ACC-HANDLE
+
+`handle` is the unique public identifier (§3.0; DATA-MODEL `User.handle U` — NOT NULL, unique). Every account-creation path must populate it; the population strategy differs by whether the user supplied one, and every path uses the same collision resolution:
+
+- **Register / upgrade** — the user **supplies** a `handle`; a taken one → `409 conflict` (the user picks another). No server generation.
+- **OAuth-create / magic-link-create** — the user supplied **no** handle, so the server **generates a provisional unique handle** and the account is flagged `handle_provisional=true` (additive `User` field, §11.2): the user is **prompted to claim a permanent handle** on first authenticated use (a later S4/S5 UI step), and may keep the provisional one. Generation algorithm (deterministic, collision-safe): derive a candidate base (from the OAuth display name or the email local-part, slugified to the handle charset), then append a short random discriminator and **retry on the uniqueness constraint** (bounded retries, widen the discriminator on repeated collision) until the insert succeeds — the uniqueness check is the DB constraint, never a read-then-write race. A generated handle is **never null** and never guessable-by-position (the random discriminator prevents enumeration of "GoogleUser1, GoogleUser2…").
+- **Guest** — has **no** handle at all (a `GuestSession` is not a `User`, §3.5); this rule does not apply to guests.
+
+This closes the "uniqueness-constrained column with no defined population strategy on two creation paths" gap: all four paths now have an explicit, consistent, collision-safe handle origin.
 
 ### 3.1 Token & session model
 
@@ -101,9 +111,8 @@ Both endpoints already exist in the ratified API-CONTRACT (§3.2 catalog + Appen
 **Register (`POST /v1/auth/register`, auth: none → `201 Session`).**
 1. Validate `{handle, email, password?, locale?}` (API-CONTRACT A.2). `handle` unique among live users (DATA-MODEL `User.handle U`); `email` well-formed; `password` meets policy (**Q-ACC5** — ASVS L2 password policy: min length, breach-check via a k-anonymity range API against a breached-password corpus, no composition rules per NFR-6/ASVS).
 2. Create `User` (`email_enc` + `email_hash` per DATA-MODEL — the raw email is never stored plain), create a `Credential{type=password, secret_ref}` where `secret_ref` is a **vault pointer to the password verifier** (argon2id hash held in the vault, never a column — DATA-MODEL `Credential.secret_ref` is "a vault reference, NOT the secret").
-3. Provision `Profile` (F-46), fire the ADR-8 entitlement grant (§3.10).
-4. **Age gate (DECIDED — §3.9.1).** Registration runs a **neutral age screen** (a date-of-birth entry, not a yes/no "are you over 13?" — a yes/no toggle is not a neutral screen under FTC guidance and invites mis-answer). The DOB is **not stored**; only the derived outcome is persisted: the service computes age against the jurisdiction's digital-consent age (§3.9.1 table) and sets `kid_account=true` when the user is **under that age**. An under-age registration is **not completed as a normal account**: it is routed to the verifiable-parental-consent flow (§3.9.2) and the account is held **restricted** (created but comms-muted, social features and rated play disabled) until consent is captured — mirroring the industry-standard pattern (chess.com mutes a minor account and disables social features until the guardian's form is returned). The age-screen outcome cannot be edited by the client afterward (server-authoritative, T-9).
-5. Mint a session (§3.1), return `201 Session`.
+3. Run the **shared account-creation pipeline (§3.10)** — provision `Profile` (F-46), run the **age gate / `kid_account` assignment (§3.9.1)**, and fire the ADR-8 entitlement grant. The age gate is **not** register-specific; it is step 2 of the shared pipeline (§3.10) and therefore applies identically to OAuth-create, magic-link-create, and upgrade.
+4. Mint a session (§3.1), return `201 Session` (or route to the consent-and-restrict flow if the age gate set `kid_account=true`, §3.9.2).
 
 **Login (`POST /v1/auth/login`, auth: none → `200 Session | 401`).**
 1. Look up by `handle_or_email` (via `email_hash` for email). Verify the password against the vault verifier.
@@ -116,7 +125,7 @@ Password storage: **argon2id** (ASVS L2), parameters pinned by the vault/service
 
 Exists in API-CONTRACT (`POST /v1/auth/oauth/{provider}`, auth: none, req `{code, redirect_uri}` → `200 Session | 401`). Behaviour:
 1. Exchange the authorization `code` with the provider (server-side, standard OAuth 2.0 / OIDC authorization-code flow; the client never handles the provider secret).
-2. Resolve the provider identity to a `User`: match an existing `Credential{type=oauth, provider}`; else, if the verified provider email matches an existing `User.email_hash`, **account-linking policy applies** (link vs. separate account — **Q-ACC10**); else create a new `User` + `Credential{type=oauth, provider, secret_ref=provider-subject-ref}` + `Profile` + entitlement grant, with a generated/claimed `handle`.
+2. Resolve the provider identity to a `User`: match an existing `Credential{type=oauth, provider}`; else, if the verified provider email matches an existing `User.email_hash`, **account-linking policy applies** (link vs. separate account — **Q-ACC10**); else **create a new account via the shared account-creation pipeline (§3.10)** — `User` + `Credential{type=oauth, provider, secret_ref=provider-subject-ref}` + `Profile` + entitlement grant + **age gate / `kid_account` (§3.9.1)**, with a `handle` populated per the **handle-assignment rule (§3.0.1)**. The age gate runs here exactly as it does on register: an OAuth sign-up by an under-age user lands in `RESTRICTED` pending consent (§3.9.2), not a full `ACTIVE` account.
 3. Mint a session, return `200 Session`.
 
 **Provider list (DECIDED — Q-ACC7).** v1 ships four federated providers plus the two first-party credential paths, for six total sign-up/login methods:
@@ -136,7 +145,7 @@ The `{provider}` path param and `Credential.provider` column already generalise 
 A credential model **distinct from the password path**: single-use, short-lived, **no stored secret** (`secret_ref` is password-only; a magic-link uses no `Credential.secret_ref`). Shares the `Session` output shape. Two steps (both NEW endpoints, §11 API-CONTRACT amendment):
 
 1. **Request** — `POST /v1/auth/magic-link` req `{email}` → `202` (always `202`, even for an unknown email — never reveal account existence, T-6). The service mints a **single-use, short-lived token** (random, high-entropy), stores only its **hash** with an expiry and a consumed-flag, and sends the link/code out of band (email — delivery infra is an infra action, not built here). Lifetime + single-use semantics are **Q-ACC6**.
-2. **Verify/consume** — `POST /v1/auth/magic-link/verify` req `{token}` (from the link) → `200 Session | 401`. Validates: token hash exists, not expired, not already consumed. On success: mark consumed (atomic compare-and-set so a replay cannot double-consume), resolve/create the `User` (first magic-link login for a new email creates a `User` + `Profile` + entitlement, like register-without-password), mint a session. On failure (expired/consumed/unknown): `401`.
+2. **Verify/consume** — `POST /v1/auth/magic-link/verify` req `{token}` (from the link) → `200 Session | 401`. Validates: token hash exists, not expired, not already consumed. On success: mark consumed (atomic compare-and-set so a replay cannot double-consume), resolve the `User`; **a first magic-link login for a new email creates a new account via the shared account-creation pipeline (§3.10)** — `User` + `Profile` + entitlement grant + **age gate / `kid_account` (§3.9.1)**, with a `handle` populated per the **handle-assignment rule (§3.0.1)** (like register-without-password). An under-age magic-link sign-up lands in `RESTRICTED` pending consent (§3.9.2), identically to register. Then mint a session. On failure (expired/consumed/unknown): `401`.
 
 Design notes: the magic-link token is itself a bearer credential for one step, so it gets the **same at-rest discipline as the session token** (hash-at-rest, never logged, §7). It is **not** a `Credential` row — it is a transient issuance record (proposed storage shape in §11; it is ephemeral → Redis with a TTL, like sessions). An email-code variant (6-digit OTP) is the same model with a different delivery/entry shape and a stricter attempt limit (brute-force guard, T-10); whether v1 ships link, code, or both is folded into **Q-ACC6**.
 
@@ -168,7 +177,7 @@ The invariant is stated in all three specs' contracts (this one authoritative; S
 Lets a guest convert to a full account and keep their session's games. `POST /v1/auth/upgrade` (auth: **guest session required**) req `{handle, email, password? | oauth{...} | magic-link intent}` → `200 Session` (a fresh **account** session; NEW endpoint, §11).
 
 1. Require a valid `subject_kind=guest` session (else `401`/`403`).
-2. Create a full `User` + `Credential` (via whichever mechanism the body carries — password / oauth / passwordless) + `Profile` + ADR-8 entitlement grant, exactly as register would.
+2. **Create a full account via the shared account-creation pipeline (§3.10)** — `User` + `Credential` (via whichever mechanism the body carries — password / oauth / passwordless) + `Profile` + ADR-8 entitlement grant **+ age gate / `kid_account` (§3.9.1)**, exactly as register would. A guest who is under the jurisdiction age is caught by the age gate here and lands in `RESTRICTED` pending consent (§3.9.2) — upgrade is **not** a bypass of the child-safety control.
 3. **Re-key the guest's game references** to the new `User.id`. Because guest games are **unrated**, this is a provenance re-attribution of unrated game history, not a rating transfer (a guest never had a rating). The authoritative game events live in the event store (ADR-10); the upgrade writes the new `user_id` into the appropriate projection/association. Exactly which references carry over (unrated game list only vs. anything else) is **Q-ACC12** (shared with guest expiry — the two are the same "what is a guest's game history" question from opposite ends).
 4. **Rotate the token** (§3.1): revoke the guest session, mint a fresh account session (privilege elevation). Return `200 Session`.
 5. Destroy the `GuestSession` ephemeral record (its purpose is served).
@@ -187,14 +196,14 @@ The owner delegated this to the acting legal/compliance/trust-&-safety function 
 
 #### 3.9.1 Age thresholds & jurisdiction (DECIDED — was Q-ACC9)
 
-- **No date of birth is stored.** The neutral age screen (§3.2 step 4) collects a DOB only to compute an outcome, then discards it; persisting a child's DOB is itself regulated PII we have no need to keep (data-minimisation, GDPR Art. 5(1)(c)).
+- **No date of birth is stored.** The neutral age screen (**shared account-creation pipeline, §3.10 step 2** — runs on register, OAuth-create, magic-link-create, and upgrade alike) collects a DOB only to compute an outcome, then discards it; persisting a child's DOB is itself regulated PII we have no need to keep (data-minimisation, GDPR Art. 5(1)(c)).
 - **Digital-consent age is jurisdiction-dependent.** The service resolves the applicable age from the user's declared/located jurisdiction against a **configuration table** (not a hard-coded constant), defaulting to **13** (COPPA / GDPR member-state floor) and rising where a jurisdiction sets it higher (GDPR Art. 8 permits 13–16; e.g. 16 in DE/NL/IE, 15 in FR, 14 in IT). The table is config so a new jurisdiction is an ops change, not a code change — the same shape as the chess.com per-country table. Under the resolved age → `kid_account=true` + consent flow (§3.9.2).
 - **Two outcomes, not a hard block.** A user at/over the age proceeds normally. A user under it is **not rejected** (rejection just trains kids to lie about their age — the FTC's stated concern); they are routed to parental consent and held restricted. This is the design the reference platforms converged on.
 - **ChessKid-style under-13 walled garden is OUT of v1 scope** (a separate product like chess.com's ChessKid); PGC v1 handles under-age users via the consent-and-restrict flow, and names the walled-garden option as a future product decision (§3.9.4).
 
 #### 3.9.2 Verifiable parental consent flow (DECIDED — COPPA §312.5 / GDPR Art. 8) — was Q-ACC13 (consent half)
 
-When `kid_account=true` is set at registration:
+When `kid_account=true` is set by the age gate (§3.10 step 2) on **any** account-creation path (register / OAuth-create / magic-link-create / upgrade):
 
 1. **Account created in `RESTRICTED` state.** The child account exists (so progress isn't lost) but with: comms **muted**, all social/UGC surfaces disabled, profile not publicly listed, and **rated play disabled** (independently of ACC-INV-1). It can play **unrated** chess against the engine or in unrated pools. This is the chess.com "muted until consent" pattern, stated as an explicit account state.
 2. **Guardian contact captured, child PII minimised.** The flow collects a **parent/guardian email** (not more child data) and sends a consent request. Until consent, the only child PII held is what registration already required (`email_enc`/`email_hash`, `handle`) plus the `kid_account` flag — no DOB, no extra profile data.
@@ -231,9 +240,20 @@ The mechanism and state machine above are decided and buildable. A lawyer confir
 
 The three bullets that previously lived here (kid_account seam, export/delete hook, freed-handle reuse) are now fully specified in §3.9.1–§3.9.3; freed-handle reuse is DECIDED in §3.9.3 + Q-ACC14 (tombstoned, not reclaimable).
 
-### 3.10 Entitlements hook (ADR-8)
+### 3.10 Shared account-creation pipeline (register / oauth-create / passwordless-create / upgrade)
 
-At **account creation** (register / oauth-create / passwordless-create / upgrade), the service fires the ADR-8 entitlement grant: write the baseline freemium `Entitlement` row(s) (DATA-MODEL §3.5 `Entitlement`, server-verified, T-11). The capability/plan values are owned by the ADR-8 entitlement model (tier boundaries are "a later product decision" per ADR-8) — this spec fixes **when** the hook fires (at creation) and **that** it is server-written, not **which** tiers exist (**Q-ACC15** routes any tier detail the auth flow needs to ADR-8). **Guests get no `Entitlement`** (consistent with the guest model) — a guest's capabilities are the fixed anonymous-unrated baseline, enforced by `subject_kind=guest`, not by a row.
+All four account-creation paths — register (§3.2), OAuth-create (§3.3), magic-link-create (§3.4), and guest→account upgrade (§3.7) — **MUST** run this single ordered pipeline so that no creation path can skip a cross-cutting obligation (the defect this spec closes: the age gate was previously defined only on register, letting an under-age OAuth/magic-link sign-up reach a full `ACTIVE` account and defeat T-9/COPPA). The pipeline is defined **once, here**, and each mechanism cites it rather than re-specifying creation:
+
+1. **Create the identity rows** — `User` (+ the path's `Credential`, if any; magic-link creates none), with `handle` populated per the **handle-assignment rule (§3.0.1)**.
+2. **Age gate / `kid_account` assignment (§3.9.1)** — run the **neutral age screen** (a date-of-birth entry, not a yes/no "are you over 13?" — a yes/no toggle is not a neutral screen under FTC guidance and invites mis-answer). The DOB is **not stored**; only the derived outcome is persisted: compute age against the jurisdiction's digital-consent age (§3.9.1 table) and set `kid_account=true` when the user is **under that age**. This step is **identical on every creation path** — an OAuth or magic-link sign-up presents the same neutral age screen as register; a provider never supplies an age we trust. The age-screen outcome cannot be edited by the client afterward (server-authoritative, T-9).
+3. **Consent-and-restrict branch (§3.9.2)** — if step 2 set `kid_account=true`, the account is created in **`account_state=RESTRICTED`** (comms-muted, social + rated disabled, unrated-only play allowed) and routed to the verifiable-parental-consent flow (§3.9.2); it does **not** become a normal `ACTIVE` account on any path. Otherwise `account_state=ACTIVE`.
+4. **Profile provisioning (F-46)** — create the `Profile`.
+5. **Entitlement grant (ADR-8)** — write the baseline freemium `Entitlement` row(s), server-verified (T-11). The grant is **idempotent / repair-on-next-login** so a crash between row-create and grant cannot leave a permanently entitlement-less account (§8 restart walk). **Guests never enter this pipeline**, so they get no `Entitlement` (consistent with the guest model).
+6. **Mint the session (§3.1)** — `subject_kind=account`.
+
+> **Invariant ACC-INV-2 — every account-creation path runs steps 1–6 in order.** No path may create a `User` without running the age gate (step 2). This is the structural fix for the register-only age-gate gap: the obligation lives in the shared pipeline, not in one mechanism's prose, so an implementer wiring a new OAuth provider cannot forget it. (The same layer-gap lesson that put the ACC-INV-1 rated-seek rejection under a named owner.)
+
+**Entitlement timing detail (ADR-8).** The capability/plan values are owned by the ADR-8 entitlement model (tier boundaries are "a later product decision" per ADR-8) — this spec fixes **when** the hook fires (step 5, at creation) and **that** it is server-written, not **which** tiers exist (**Q-ACC15**). On **upgrade** (§3.7), the pipeline runs for the new account; the former guest held no `Entitlement`, so step 5 is a first grant, not a migration.
 
 ## 4. Interfaces & contracts
 
@@ -254,7 +274,7 @@ At **account creation** (register / oauth-create / passwordless-create / upgrade
 |---|---|
 | Login with wrong password | `401 unauthenticated`; per-account + per-IP throttle; lockout after N failures (§7, T-10). Uniform message — no handle/email enumeration (T-6). |
 | Register with a taken handle | `409 conflict` (API-CONTRACT Appendix B `conflict`); handle uniqueness is DATA-MODEL `User.handle U`. |
-| Register with an email already in use | Uniform success-shaped response path **or** `409` — must not leak which emails are registered (T-6). Resolution pinned in **Q-ACC5** (register enumeration policy). |
+| Register with an email already in use | **Uniform success-shaped response** (never a `409`) + an out-of-band "this email is already registered, log in?" email — the response must **not** reveal which emails are registered (T-6). **DECIDED, Q-ACC5** (no `409` enumeration branch). |
 | Register by an under-age user (below jurisdiction digital-consent age) | Not rejected: `kid_account=true`, account created in `RESTRICTED` (comms-muted, social + rated disabled, unrated-only play allowed), routed to parental-consent flow (§3.9.2). DOB discarded. |
 | Parental consent not captured within the window (30d) | `RESTRICTED` child account is **purged** (§3.9.3) — holding a child's data without consent is the violation. Consent captured → `RESTRICTED→ACTIVE`; consent later revoked → back to `RESTRICTED`, erasable on request. |
 | GDPR delete request on an account | Person erased (email/secret_ref/profile PII, sessions, consent contact); `handle` tombstoned+reserved (not reusable, Q-ACC14); game record anonymised-and-retained in the event store via `PublicUser`; completed within 30 days. |
@@ -286,7 +306,7 @@ Part XI threats this surface owns, each with its control:
 
 - **T-5 account takeover.** argon2id verifier (vault); opaque server-side sessions → **instant revocation**; session binding + anomalous-login challenge; rotation on elevation/step-up with an audit chain (`rotated_from`); breach-password check at register/login; optional 2FA/WebAuthn (DATA-MODEL `Credential.type` already includes `webauthn`) — v1 scope of 2FA is **Q-ACC8**. Tokens are hashed at rest (never the raw token in Redis or logs) and never placed in a URL (magic-link verify takes the token in the body, not a logged query string where feasible — the link transport is the one exception, mitigated by single-use + short TTL).
 - **T-10 credential stuffing / API abuse.** Per-IP **and** per-account rate limits with `429 + Retry-After` (API-CONTRACT §3.1/§7); progressive lockout/backoff after repeated failures; a bot-challenge hook on `/v1/auth/*` (API-CONTRACT §7 names this hook); email-code (if shipped) gets a strict attempt cap (brute-force guard). Lockout thresholds are **Q-ACC5** (tuned to not become a self-DoS vector — a locked-out legitimate user must have a recovery path, i.e. passwordless/reset).
-- **T-9 child safety.** `kid_account` gates restricted-comms surfaces (§3.9); COPPA consent flow referenced (ADR-6). The flag is set server-side at registration, never client-asserted.
+- **T-9 child safety.** `kid_account` gates restricted-comms surfaces (§3.9); COPPA consent flow referenced (ADR-6). The flag is set server-side by the age gate in the **shared account-creation pipeline (§3.10 step 2)** — on **every** creation path (register, OAuth-create, magic-link-create, upgrade), never client-asserted and never skipped by a federated/passwordless sign-up.
 - **T-6 (enumeration, borrowed).** Uniform responses on login failure, magic-link request, and (per Q-ACC5) register — never reveal which handles/emails exist.
 - **NFR-6 input validation / least privilege.** Every body validated against the API-CONTRACT schema; the accounts service holds least-privilege access to the vault and the PII columns; PII access is audit-logged (T-12, DATA-MODEL §7).
 - **S6 fair-play veto.** ACC-INV-1 (guests unrated-only) is a fair-play-load-bearing rule; **S6 reviews this spec** and holds veto on any change that would let an unauthenticated/ephemeral subject into rated play (CONVENTIONS: "a spec touching rated play… also needs S6 review").
@@ -296,13 +316,14 @@ Part XI threats this surface owns, each with its control:
 The contract's conformance corpus (CONVENTIONS: the test plan is part of the spec). Edge-first (steering §30 adversarial review):
 
 - **Session lifecycle.** Issue → validate → expire (absolute + idle) → `401`; revoke → immediate `401`; rotate on upgrade → old token dead, new token live, `rotated_from` chain intact.
-- **Mechanism conformance.** register (creates `User`+`Credential`+`Profile`+`Entitlement`, fires the hook once); login (success/fail/lockout, uniform-failure enumeration guard); oauth (new vs. existing-link vs. collision); magic-link (request→verify happy path; **replay → single `401`**; expired → `401`; unknown email → `202` no-leak); guest (creates `GuestSession`, **no** `User`/`Profile`/`Entitlement`); upgrade (guest→account re-keys game refs, rotates token, destroys `GuestSession`; non-guest → `403`; collision → `409`).
+- **Mechanism conformance.** register (runs the §3.10 pipeline: creates `User`+`Credential`+`Profile`+`Entitlement`, fires the hook once, runs the age gate); login (success/fail/lockout, uniform-failure enumeration guard; **register-with-existing-email returns the uniform success shape, never `409`** — Q-ACC5 enumeration guard); oauth (new-via-§3.10-pipeline vs. existing-link vs. collision); magic-link (request→verify happy path, new-email verify runs the §3.10 pipeline; **replay → single `401`**; expired → `401`; unknown email → `202` no-leak); guest (creates `GuestSession`, **no** `User`/`Profile`/`Entitlement`, **does not** enter the §3.10 pipeline); upgrade (runs the §3.10 pipeline for the new account, re-keys game refs, rotates token, destroys `GuestSession`; non-guest → `403`; collision → `409`).
 - **ACC-INV-1 (the load-bearing invariant) — prove it has teeth.** A `subject_kind=guest` session attempting a `rated=true` seek is rejected; assert the rejection is driven by `subject_kind` server-side, **not** by the client's `rated` flag (set the client flag to the "wrong" value and confirm the server still decides correctly — mirrors the "prove the e2e has teeth" lesson). Assert X-4 writes **no** `Rating` row for a guest even if the seek guard is bypassed in the test (belt-and-braces test).
 - **Per-field write-coverage (steering §30 pass 3).** Every `Session` record field written on every path that should (e.g. `rotated_from` set on rotation, `revoked_at` on logout, `subject_kind` on both guest and account issuance — the guest path must not leave it defaulted to `account`).
 - **Callee-contract enumeration (steering §30 pass 1).** For the vault verify, the OAuth code-exchange, and the atomic magic-link consume: enumerate each callee's success/failure/edge returns and prove each is handled (the consume's "already consumed" branch is the replay guard; a vault "verifier not found" is a `401`, not a `500`).
 - **Failure/retry/restart walk (steering §30 pass 2).** A client resending a register (idempotency); a crash between `User` create and entitlement grant (is the account left without entitlements? — the grant must be idempotent / repair-on-next-login); a magic-link verify racing a second verify of the same token (atomic consume serialises).
 - **Security.** Token never stored raw (assert only a hash at rest); token never in a log line (assert); breach-password path flags not blocks; lockout triggers and *clears* on a recovery path (not a permanent self-DoS).
-- **Compliance.** Age gate sets `kid_account` under the jurisdiction age and **discards DOB** (assert no DOB persisted); an under-age register lands in `RESTRICTED` (comms-muted, rated disabled) not `ACTIVE`; consent captured → `RESTRICTED→ACTIVE` + consent evidence written to the audit path; consent not captured within the window → account purged; consent revoked → back to `RESTRICTED`. Erasure: delete anonymises `PublicUser` projections (DATA-MODEL §5) and tombstones the `handle` while the event-store game history + anti-cheat signals are retained anonymised (§3.9.3); assert the erased person's email/secret_ref/profile PII are gone and all login paths dead; guest delete is a no-op. Export returns account+profile+game-ref list within the window.
+- **Compliance — age gate runs on EVERY creation path (ACC-INV-2).** Prove the age gate is not register-only: run an **under-age sign-up through each of register, OAuth-create, magic-link-create, and upgrade** and assert **all four** land in `account_state=RESTRICTED` (comms-muted, rated disabled) with `kid_account=true`, never a full `ACTIVE` account (this is the regression test for the register-only-age-gate defect — a test that would fail on the pre-fix spec where OAuth/magic-link skipped the gate). Age gate sets `kid_account` under the jurisdiction age and **discards DOB** (assert no DOB persisted on any path). Consent captured → `RESTRICTED→ACTIVE` + consent evidence written to the audit path; consent not captured within the window → account purged; consent revoked → back to `RESTRICTED`. Erasure: delete anonymises `PublicUser` projections (DATA-MODEL §5) and tombstones the `handle` while the event-store game history + anti-cheat signals are retained anonymised (§3.9.3); assert the erased person's email/secret_ref/profile PII are gone and all login paths dead; guest delete is a no-op. Export returns account+profile+game-ref list within the window.
+- **Handle assignment (§3.0.1 / ACC-INV-2) on every path.** register/upgrade with a taken handle → `409`; OAuth-create and magic-link-create with **no** supplied handle → a **non-null, unique** handle is generated, `handle_provisional=true` is set, and the user is flagged to claim one; force a generation collision (seed the DB with the first candidate) and assert the retry widens the discriminator and still produces a unique non-null handle (never a null-constraint violation, never a position-guessable sequence); a guest has no handle.
 - **Contract-schema conformance.** The new endpoints' request/response bodies validate against the §11 Appendix-A amendment, run as part of the shared contract suite (NFR-10) once the service exists (R2, deferred with API-CONTRACT §9 R2).
 
 **Not tested here:** rating math (X-4/G-C), anti-cheat detection (X-5/G-B), email-delivery infra, the OAuth provider's own flow, load/latency (G-E).
@@ -311,6 +332,7 @@ The contract's conformance corpus (CONVENTIONS: the test plan is part of the spe
 
 This spec is DONE (ready to leave REVIEW for RATIFIED) when:
 - [ ] All five mechanisms (email+password, OAuth, passwordless, guest, upgrade) have a defined per-endpoint behaviour + state transitions, citing DATA-MODEL entities and never redefining fields.
+- [ ] **All four account-creation paths (register / oauth-create / passwordless-create / upgrade) run the single shared creation pipeline (§3.10), so the age gate / `kid_account` assignment (ACC-INV-2) and the handle-assignment rule (§3.0.1) apply on every path — not register-only.**
 - [ ] The token/session model (format, issuance, binding, rotation, expiry, revocation, storage) is unambiguous, with every lifetime/strength parameter **DECIDED** in the §10 ledger (not left ambiguous for code time).
 - [ ] ACC-INV-1 (guests unrated-only) is stated with its three enforcement points and the S2/X-4 cross-stream obligations named.
 - [ ] The guest-identity model is defined as distinct from `User`, with the §11 DATA-MODEL amendment drafted (not self-applied).
@@ -323,7 +345,7 @@ This spec is DONE (ready to leave REVIEW for RATIFIED) when:
 
 ## 10. Decisions ledger (all items DECIDED this round; legal confirmations named in §3.9.4)
 
-The owner accepted the engineering defaults, named the OAuth/sign-up set, and delegated the COPPA/GDPR design to the acting compliance function (this spec). Every Q-item below is now **DECIDED**; the only residue is a set of *confirmations of a built mechanism* that a licensed reviewer signs off before the **G-F launch gate** (§3.9.4) — these do **not** block the `services/accounts` build chunk.
+The owner accepted the engineering defaults, named the OAuth/sign-up set, and delegated the COPPA/GDPR design to the acting compliance function (this spec). Every Q-item below (the original 15 plus Q-ACC-HANDLE, surfaced during review) is now **DECIDED**; the only residue is a set of *confirmations of a built mechanism* that a licensed reviewer signs off before the **G-F launch gate** (§3.9.4) — these do **not** block the `services/accounts` build chunk.
 
 | Q | Decision (ratified value) | Basis |
 |---|---|---|
@@ -342,6 +364,7 @@ The owner accepted the engineering defaults, named the OAuth/sign-up set, and de
 | **Q-ACC13** | **DECIDED (§3.9.2 + §3.9.3):** COPPA email-plus verifiable-consent state machine (RESTRICTED→ACTIVE, 30-day purge-if-unconsented, revocable); GDPR erasure boundary (erase the person, anonymise-retain the game record + anti-cheat legitimate-interest), 30-day export/erasure windows, 24-month dormant auto-delete. Licensed-reviewer confirmations are named in §3.9.4 as a **G-F gate item**, not open design | COPPA §312.5 / GDPR Art. 8 & 17; chess.com + Lichess patterns |
 | **Q-ACC14** | **DECIDED:** tombstoned `handle` **not** reclaimable (held reserved) | impersonation risk + breaks external references (PGN archives, links) |
 | **Q-ACC15** | **DECIDED:** new account = freemium baseline `Entitlement` at creation; guest = fixed anonymous-unrated baseline (no `Entitlement` row). Tier *names* remain owned by the ADR-8 entitlement model | ADR-8 hook fires at creation; this pins *when*, not *which tiers* |
+| **Q-ACC-HANDLE** | **DECIDED (§3.0.1):** register/upgrade take a user-supplied handle (`409` on collision); OAuth/magic-link **generate** a unique handle (slug base + random discriminator, retry on the DB uniqueness constraint) flagged `handle_provisional=true` and prompt the user to claim one; guests have no handle | closes the undefined handle-population gap on the two no-supplied-handle creation paths |
 
 > **No open design remains.** The spec made no silent assumptions: each decision above is recorded with its basis. The §3.9.4 legal confirmations are gated to **G-F (launch)**, downstream of implementation — a lawyer confirms a built mechanism rather than designing it. The §11 contract amendments still need the formal cross-stream (PE/S3) + architecture + S6 sign-off before PE/S3 apply them to the frozen files; that is a review step, not an undecided question.
 
@@ -409,7 +432,11 @@ User (additive fields only — existing fields unchanged)
                    -- RESTRICTED: created but comms-muted + social/rated disabled,
                    --   pending verifiable parental consent (§3.9.2) OR other hold
                    -- TOMBSTONED: erased-person record per §3.9.3 (handle held reserved)
-  -- kid_account (bool) ALREADY EXISTS in DATA-MODEL §7; this spec only assigns its setter (§3.9.1).
+  handle_provisional  bool  default false
+                   -- true when the handle was server-generated on an OAuth/magic-link
+                   --   sign-up (§3.0.1); the user is prompted to claim a permanent handle.
+                   --   false for register/upgrade (user supplied it) and once claimed.
+  -- kid_account (bool) ALREADY EXISTS in DATA-MODEL §7; this spec only assigns its setter (§3.10 step 2).
   -- NO date_of_birth column — the age screen discards DOB, persists only the derived outcome (§3.9.1).
 ```
 Consent evidence (who/when/method/scope — COPPA retention) and the GDPR export/erasure request log are written to the **durable audit path** (DATA-MODEL §7 audit log / the event-audit store), **not** new `User` columns — so no further relational-schema change is proposed here beyond `account_state`.
