@@ -5,8 +5,8 @@
 | Spec ID | SPEC-S3-ACCOUNTS |
 | Owner | S3 Platform (stream lead — fill in); co-reviewed by PE + S2 + S6 (fair-play veto) + Architecture group |
 | Status | REVIEW |
-| Version | 0.1 |
-| Last updated | 2026-10-17 |
+| Version | 0.2 |
+| Last updated | 2026-10-21 |
 | Implements (master IDs) | X-3; F-46 (profile hook); ADR-6 (GDPR/COPPA), ADR-8 (entitlements hook); NFR-6 (ASVS L2), NFR-12 (compliance); Part XI T-5, T-9, T-10 |
 | Depends on | SPEC-S3-DATA-MODEL (`User`/`Credential`/`Profile`/`Entitlement` entity truth — cited, never redefined); SPEC-PE-API-CONTRACT (RATIFIED — the auth endpoint catalog, Bearer convention, RFC-7807 errors, this spec fulfils its explicit "token internals + service implementation delegated to X-3" out-of-scope lines); ADR-6, ADR-8 |
 | Gates it feeds | Identity substrate for **G-B** (fair-play: only account-holders carry the persistent identity anti-cheat assumes, NFR-4) and **G-C** (rating integrity: rated play requires an account). Not itself a gate. |
@@ -30,7 +30,7 @@ This is a **spec, not code.** Per the build manual §0 it is written, set to REV
 - **No ratings or anti-cheat.** X-4 (`RATING-SERVICE.md`, G-C) and X-5 (`ANTICHEAT.md`, G-B) are separate specs. This spec only states the identity *contract* those gates stand on.
 - **No relational schema (DDL).** Entity truth is `DATA-MODEL.md`; this spec cites `User`/`Credential`/`Profile`/`Entitlement` fields and never redefines them. The one new entity (guest identity) is proposed as a DATA-MODEL amendment in §11, not defined twice.
 - **No REST convention restatement.** Versioning, Bearer presentation, pagination, RFC-7807 error envelope, idempotency, rate-limit headers are API-CONTRACT §3.1; this spec cites them.
-- **No OAuth provider selection, email-delivery infrastructure, or payment/PCI.** Owner/infra actions (ADR-8 payment is provider-side, T-11). Referenced, not built. Provider list is **Q-ACC7**.
+- **No email-delivery infrastructure or payment/PCI.** Owner/infra actions (ADR-8 payment is provider-side, T-11). Referenced, not built. The OAuth provider set itself is **DECIDED** (Google/Apple/Facebook + email magic-link + username/password, §3.3 / Q-ACC7); only the provider-side delivery/payment infra is out of scope.
 - **No web/mobile login UI.** A later S4/S5 chunk once X-3 is built.
 - **No `/v1/pools` / time-control work and no F-01 #64 picker.** Unrelated; #64 stays blocked until `/v1/pools` ships.
 
@@ -40,14 +40,14 @@ This is a **spec, not code.** Per the build manual §0 it is written, set to REV
 |---|---|---|
 | X-3 | Signup/login (OAuth + email), profiles, sessions, device management, COPPA for F-41 | whole spec; §3.2–3.7 mechanisms, §3.1 sessions, §3.8 device/session management, §3.9 compliance |
 | F-46 | Profile created at account creation | §3.2 (register provisions `Profile`), cites DATA-MODEL `Profile` |
-| ADR-6 | GDPR baseline + COPPA-as-needed | §3.9 (export/delete hooks, `kid_account`, age-gate seam) |
+| ADR-6 | GDPR baseline + COPPA-as-needed | §3.9.1 (age gate), §3.9.2 (parental consent), §3.9.3 (erasure boundary) |
 | ADR-8 | Freemium entitlements hook, server-verified | §3.10 (entitlement granted at account creation; guests get none) |
 | NFR-6 | OWASP ASVS L2 | §7 (password storage, session binding, transport, input validation) |
-| NFR-12 | GDPR/COPPA, export/delete within statutory windows | §3.9 |
+| NFR-12 | GDPR/COPPA, export/delete within statutory windows | §3.9.3 (erasure boundary + 30-day windows) |
 | NFR-4 (indirect) | 100% of rated games scored → persistent identity | §3.6 (unrated-only guest invariant), §4 |
 | T-5 Account takeover | §7 (session binding, rotation, breach-password check, anomalous-login hook) |
 | T-10 Credential stuffing / API abuse | §7 (per-IP + per-user rate limits, lockout, bot-challenge hook) |
-| T-9 Child safety | §3.9 (COPPA controls, restricted-comms seam via `kid_account`) |
+| T-9 Child safety | §3.9.1–§3.9.2 (age gate + COPPA consent-and-restrict, `kid_account`) |
 
 ## 3. Design
 
@@ -102,7 +102,7 @@ Both endpoints already exist in the ratified API-CONTRACT (§3.2 catalog + Appen
 1. Validate `{handle, email, password?, locale?}` (API-CONTRACT A.2). `handle` unique among live users (DATA-MODEL `User.handle U`); `email` well-formed; `password` meets policy (**Q-ACC5** — ASVS L2 password policy: min length, breach-check via a k-anonymity range API against a breached-password corpus, no composition rules per NFR-6/ASVS).
 2. Create `User` (`email_enc` + `email_hash` per DATA-MODEL — the raw email is never stored plain), create a `Credential{type=password, secret_ref}` where `secret_ref` is a **vault pointer to the password verifier** (argon2id hash held in the vault, never a column — DATA-MODEL `Credential.secret_ref` is "a vault reference, NOT the secret").
 3. Provision `Profile` (F-46), fire the ADR-8 entitlement grant (§3.10).
-4. Age-gate seam (§3.9): if the registration indicates an under-13 user (or a jurisdiction requires it), set `kid_account=true` and route to the COPPA consent flow before the account is usable. The age-collection mechanism is **Q-ACC9**.
+4. **Age gate (DECIDED — §3.9.1).** Registration runs a **neutral age screen** (a date-of-birth entry, not a yes/no "are you over 13?" — a yes/no toggle is not a neutral screen under FTC guidance and invites mis-answer). The DOB is **not stored**; only the derived outcome is persisted: the service computes age against the jurisdiction's digital-consent age (§3.9.1 table) and sets `kid_account=true` when the user is **under that age**. An under-age registration is **not completed as a normal account**: it is routed to the verifiable-parental-consent flow (§3.9.2) and the account is held **restricted** (created but comms-muted, social features and rated play disabled) until consent is captured — mirroring the industry-standard pattern (chess.com mutes a minor account and disables social features until the guardian's form is returned). The age-screen outcome cannot be edited by the client afterward (server-authoritative, T-9).
 5. Mint a session (§3.1), return `201 Session`.
 
 **Login (`POST /v1/auth/login`, auth: none → `200 Session | 401`).**
@@ -119,7 +119,17 @@ Exists in API-CONTRACT (`POST /v1/auth/oauth/{provider}`, auth: none, req `{code
 2. Resolve the provider identity to a `User`: match an existing `Credential{type=oauth, provider}`; else, if the verified provider email matches an existing `User.email_hash`, **account-linking policy applies** (link vs. separate account — **Q-ACC10**); else create a new `User` + `Credential{type=oauth, provider, secret_ref=provider-subject-ref}` + `Profile` + entitlement grant, with a generated/claimed `handle`.
 3. Mint a session, return `200 Session`.
 
-**The provider list is NOT decided here — Q-ACC7.** The spec does not assume Google/Apple/etc. The `{provider}` path param and the `Credential.provider` column already generalise over whatever set the owner ratifies; adding a provider later is config, not a contract change.
+**Provider list (DECIDED — Q-ACC7).** v1 ships four federated providers plus the two first-party credential paths, for six total sign-up/login methods:
+
+| Method | Mechanism | Notes |
+|---|---|---|
+| **Google** | OAuth 2.0 / OIDC | `/v1/auth/oauth/google` |
+| **Apple** | Sign in with Apple (OIDC) | `/v1/auth/oauth/apple` — **required on iOS** by App Store Review §4.8 whenever any other third-party social login ships in the app, so Apple is non-optional once Google/Facebook are present on the mobile client; relay-email (`@privaterelay.appleid.com`) is a verified email for linking (§Q-ACC10) |
+| **Facebook** | OAuth 2.0 | `/v1/auth/oauth/facebook` |
+| **Email (magic-link)** | passwordless (§3.4) | first-class sign-up method, not only a recovery path |
+| **Username + password** | first-party (§3.2) | `handle` + password |
+
+The `{provider}` path param and `Credential.provider` column already generalise over this set; adding or removing a provider later is configuration, not a contract change. The provider whose verified email matches an existing account triggers the linking policy (Q-ACC10, DECIDED below).
 
 ### 3.4 Passwordless (magic-link / email-code) — NEW: `POST /v1/auth/magic-link` (+ verify)
 
@@ -171,11 +181,55 @@ Edge: upgrade with a `handle`/`email` that already belongs to a live account →
 - `DELETE /v1/me/sessions/{id}` and `POST /v1/me/sessions/logout-all` (NEW, §11) → revoke one / all sessions (the "log out everywhere" that a password change or breach also triggers, §3.1).
 - Device binding is the `binding` fingerprint (§3.1); a `device_id` the client supplies is an *advisory* label, never trusted for authorization (server-authoritative). Whether v1 ships full device management or only logout-all is **Q-ACC8** (folded with the 2FA question — both are "how much account-security surface in v1").
 
-### 3.9 Compliance seams (ADR-6 GDPR/COPPA, NFR-12)
+### 3.9 Compliance: age gate, parental consent, GDPR erasure (ADR-6, NFR-12) — DECIDED
 
-- **`kid_account` (COPPA, F-41, T-9).** Set at registration via the age-gate seam (§3.2 step 4; mechanism **Q-ACC9**). It gates restricted-comms surfaces downstream (DATA-MODEL §7: "enforced in service logic; the flag lives here"). COPPA verifiable-parental-consent flow is referenced (ADR-6) — the *consent capture* is a product/legal flow this spec names but does not design (**Q-ACC13**, routed to the ADR-6 legal track).
-- **Data-subject export/delete (GDPR, NFR-12, "within statutory windows").** The identity service exposes the account-side hooks: an **export** request (assemble the subject's account + profile + game-history references) and a **delete/erasure** request → `User` **tombstone** (DATA-MODEL §5: "`User` tombstoned; `PublicUser` projections show an anonymized handle; game history (truth) retained in the event store per retention policy"). The erasure contract (what is erased vs. anonymised-and-retained, and the statutory window) is pinned with legal (**Q-ACC13**). Guests have **no** such obligations (no PII beyond an ephemeral provisional name, no persistent identity) — a documented simplification of the guest model.
-- **Freed-handle reuse (Q-DM1, deferred to X-3).** DATA-MODEL §5 explicitly defers this here. **Decision proposed (owner ratifies as Q-ACC14):** a tombstoned account's `handle` is **not** reclaimable by default (held reserved) — reuse risks impersonation of a known player and breaks external references (PGN archives, links). If a reclaim policy is wanted, it needs a cooling-off period + an explicit non-impersonation guard. Flagged, not self-decided.
+The owner delegated this to the acting legal/compliance/trust-&-safety function (this spec). It is designed below, grounded in current practice at the two reference platforms (chess.com: no DOB at signup, self-attested minimum age, per-country age table, minor accounts auto-muted with social features disabled until a guardian consent form is returned, a separate under-13 walled-garden product; Lichess: GDPR delete with a trailing completion window, dormant-account auto-deletion, the game record retained as the public history). **This is engineering-grade compliance design, not a substitute for a licensed review before the G-F legal gate** — §3.9.4 names what still needs a lawyer's sign-off.
+
+#### 3.9.1 Age thresholds & jurisdiction (DECIDED — was Q-ACC9)
+
+- **No date of birth is stored.** The neutral age screen (§3.2 step 4) collects a DOB only to compute an outcome, then discards it; persisting a child's DOB is itself regulated PII we have no need to keep (data-minimisation, GDPR Art. 5(1)(c)).
+- **Digital-consent age is jurisdiction-dependent.** The service resolves the applicable age from the user's declared/located jurisdiction against a **configuration table** (not a hard-coded constant), defaulting to **13** (COPPA / GDPR member-state floor) and rising where a jurisdiction sets it higher (GDPR Art. 8 permits 13–16; e.g. 16 in DE/NL/IE, 15 in FR, 14 in IT). The table is config so a new jurisdiction is an ops change, not a code change — the same shape as the chess.com per-country table. Under the resolved age → `kid_account=true` + consent flow (§3.9.2).
+- **Two outcomes, not a hard block.** A user at/over the age proceeds normally. A user under it is **not rejected** (rejection just trains kids to lie about their age — the FTC's stated concern); they are routed to parental consent and held restricted. This is the design the reference platforms converged on.
+- **ChessKid-style under-13 walled garden is OUT of v1 scope** (a separate product like chess.com's ChessKid); PGC v1 handles under-age users via the consent-and-restrict flow, and names the walled-garden option as a future product decision (§3.9.4).
+
+#### 3.9.2 Verifiable parental consent flow (DECIDED — COPPA §312.5 / GDPR Art. 8) — was Q-ACC13 (consent half)
+
+When `kid_account=true` is set at registration:
+
+1. **Account created in `RESTRICTED` state.** The child account exists (so progress isn't lost) but with: comms **muted**, all social/UGC surfaces disabled, profile not publicly listed, and **rated play disabled** (independently of ACC-INV-1). It can play **unrated** chess against the engine or in unrated pools. This is the chess.com "muted until consent" pattern, stated as an explicit account state.
+2. **Guardian contact captured, child PII minimised.** The flow collects a **parent/guardian email** (not more child data) and sends a consent request. Until consent, the only child PII held is what registration already required (`email_enc`/`email_hash`, `handle`) plus the `kid_account` flag — no DOB, no extra profile data.
+3. **Verifiable consent method (COPPA §312.5(b)).** v1 uses **email-plus** (consent email to the guardian + a confirming follow-up step) as the baseline COPPA-acceptable method for an internal, no-disclosure-to-third-parties service; the flow is built so a stronger method (government-ID check, small-charge card verification, signed form) can be slotted in per-jurisdiction without changing the state machine. The *specific* verifiable method per market is the item still routed to a licensed reviewer (§3.9.4) — the **mechanism and state machine are decided here**, the legally-sufficient method-per-market is confirmed, not invented, at the G-F gate.
+4. **On consent captured** → account transitions `RESTRICTED → ACTIVE` (social features and rated play enabled subject to ACC-INV-1); a consent record (who consented, when, method, scope) is written to the durable audit path (COPPA requires retaining consent evidence).
+5. **On consent refused or not captured within a window** (proposed **30 days**) → the restricted account is **purged** (§3.9.3 erasure), not left dangling — holding a child's data with no consent is the violation.
+6. **Consent is revocable.** A guardian can withdraw consent later → account returns to `RESTRICTED` and, on request, is erased. COPPA requires the revocation path.
+7. **`kid_account` gates downstream forever** (DATA-MODEL §7: "enforced in service logic; the flag lives here") — restricted comms stay enforced for a known-minor account even after consent, until the account ages out (a later re-attestation chunk; named in §3.9.4).
+
+#### 3.9.3 GDPR/CCPA erasure boundary (DECIDED — GDPR Art. 17 / NFR-12) — was Q-ACC13 (erasure half)
+
+The hard question is *what is erased vs. anonymised-and-retained*. The boundary, grounded in the Lichess pattern (erase the person, keep the game record as anonymised history) and the event-sourcing architecture (ADR-10: the event store is append-only truth):
+
+**ERASED on a delete request (the person):**
+- `User.email_enc`, `email_hash`, `secret_ref` (vault credential destroyed → all login paths dead), `Profile` free-text/PII (display name, bio, avatar, country if set), all `Session` records, all `MagicLinkIssue` records, OAuth `Credential` provider-subject links, device bindings, the parental-consent contact email and any `kid_account` PII.
+- The `handle` is **released from the person but tombstoned** (held reserved, not reassigned — Q-ACC14) so it can no longer resolve to them.
+
+**ANONYMISED-AND-RETAINED (the game record, not the person):**
+- Game **events** in the append-only event store (ADR-10 truth; GDPR Art. 17(3) + recital 65 allow retention where erasure is technically incompatible with an append-only integrity-bearing record, and legitimate-interest/anti-cheat-integrity applies). The player reference in historical games becomes an **anonymised opaque id** via the `PublicUser` projection (DATA-MODEL §5: "`PublicUser` projections show an anonymized handle"). An observer sees "Anonymous" / a non-identifying token, never the erased person.
+- **Anti-cheat/fair-play signals (NFR-4, G-B)** keyed to the anonymised id are retained as a **legitimate interest** (integrity of a competitive system) — this is the one place erasure is *bounded* by a stated lawful basis, and it must be in the privacy policy. This is also why guests (no persistent identity, unrated-only) carry none of this.
+
+**Guests:** a `GuestSession` has **no erasure obligation** — its only PII is an ephemeral provisional name on a short TTL; it self-erases at expiry. A guest "delete" is a no-op.
+
+**Statutory windows (DECIDED, proposed for legal confirmation):**
+- **Export (Art. 15 / Art. 20 portability)**: fulfil within **30 days** (GDPR max, extendable once by 60 with notice). Returns account + profile + the subject's game-reference list in a portable format.
+- **Erasure (Art. 17)**: acknowledge immediately, **complete within 30 days**; PII purged from live systems, projections re-anonymised, backups rotated out within the backup-retention cycle (named, not infinite). Lichess's own trailing window is comparable.
+- **Dormant auto-deletion**: an unused account with no activity for a long window (proposed **24 months**) is auto-erased (the Lichess dormant-deletion pattern) — data-minimisation, reduces breach surface.
+
+#### 3.9.4 Still requires a licensed legal reviewer before G-F (named, not a blocker for the spec)
+
+The mechanism and state machine above are decided and buildable. A lawyer confirms, before the **G-F compliance gate** (not before this spec ratifies): (a) the *sufficient* verifiable-consent method per target market (email-plus may not suffice everywhere); (b) the exact per-jurisdiction digital-consent ages for the launch markets (the config table's values); (c) the final privacy-policy text for the anti-cheat legitimate-interest retention and the backup-rotation window; (d) whether any launch market needs the ChessKid-style under-13 walled garden rather than consent-and-restrict. These are confirmations of a built mechanism, not open design — so they do **not** block `services/accounts` implementation, only the G-F launch gate.
+
+### 3.9-legacy (superseded) note
+
+The three bullets that previously lived here (kid_account seam, export/delete hook, freed-handle reuse) are now fully specified in §3.9.1–§3.9.3; freed-handle reuse is DECIDED in §3.9.3 + Q-ACC14 (tombstoned, not reclaimable).
 
 ### 3.10 Entitlements hook (ADR-8)
 
@@ -201,6 +255,9 @@ At **account creation** (register / oauth-create / passwordless-create / upgrade
 | Login with wrong password | `401 unauthenticated`; per-account + per-IP throttle; lockout after N failures (§7, T-10). Uniform message — no handle/email enumeration (T-6). |
 | Register with a taken handle | `409 conflict` (API-CONTRACT Appendix B `conflict`); handle uniqueness is DATA-MODEL `User.handle U`. |
 | Register with an email already in use | Uniform success-shaped response path **or** `409` — must not leak which emails are registered (T-6). Resolution pinned in **Q-ACC5** (register enumeration policy). |
+| Register by an under-age user (below jurisdiction digital-consent age) | Not rejected: `kid_account=true`, account created in `RESTRICTED` (comms-muted, social + rated disabled, unrated-only play allowed), routed to parental-consent flow (§3.9.2). DOB discarded. |
+| Parental consent not captured within the window (30d) | `RESTRICTED` child account is **purged** (§3.9.3) — holding a child's data without consent is the violation. Consent captured → `RESTRICTED→ACTIVE`; consent later revoked → back to `RESTRICTED`, erasable on request. |
+| GDPR delete request on an account | Person erased (email/secret_ref/profile PII, sessions, consent contact); `handle` tombstoned+reserved (not reusable, Q-ACC14); game record anonymised-and-retained in the event store via `PublicUser`; completed within 30 days. |
 | OAuth email matches an existing account | Account-linking policy — **Q-ACC10** (link vs. separate); default proposed: link only on a *verified* provider email, else separate. |
 | Magic-link token reused (replay) | Atomic consume (compare-and-set); a second verify → `401` (already consumed). Never double-mints a session. |
 | Magic-link token expired | `401`; the user requests a new one. |
@@ -219,7 +276,7 @@ At **account creation** (register / oauth-create / passwordless-create / upgrade
 ## 6. Non-functional handling
 
 - **NFR-6 (ASVS L2).** argon2id password verifier in the vault (§3.2); opaque server-side sessions with immediate revocation (§3.1); session binding (§3.1); input validation on every body (API-CONTRACT §3.1); HTTPS-only; secrets in a vault not columns (DATA-MODEL `secret_ref`); RFC-7807 errors that never leak internals (API-CONTRACT Appendix B).
-- **NFR-12 (compliance).** Export/delete hooks + tombstone path (§3.9); `kid_account` COPPA gate; GDPR-baseline-worldwide (ADR-6) with the statutory-window contract pinned in Q-ACC13.
+- **NFR-12 (compliance).** Export/delete hooks + tombstone path (§3.9.3); `kid_account` COPPA gate + verifiable-consent state machine (§3.9.2); GDPR-baseline-worldwide (ADR-6) with the erasure boundary + statutory windows **DECIDED in §3.9.3** (licensed-reviewer confirmations gated to G-F, §3.9.4).
 - **Read-path latency (§IX.1).** Auth is a write-ish path; session *validation* on every subsequent request is a single hot keyed lookup in Redis (§3.1) — designed to stay well inside the read budget. The measured number is proven under load (G-E), not here.
 - **NFR-4 (indirect).** ACC-INV-1 guarantees every *rated* subject is an account with persistent identity — the precondition anti-cheat (G-B) and ratings (G-C) assume.
 
@@ -245,7 +302,7 @@ The contract's conformance corpus (CONVENTIONS: the test plan is part of the spe
 - **Callee-contract enumeration (steering §30 pass 1).** For the vault verify, the OAuth code-exchange, and the atomic magic-link consume: enumerate each callee's success/failure/edge returns and prove each is handled (the consume's "already consumed" branch is the replay guard; a vault "verifier not found" is a `401`, not a `500`).
 - **Failure/retry/restart walk (steering §30 pass 2).** A client resending a register (idempotency); a crash between `User` create and entitlement grant (is the account left without entitlements? — the grant must be idempotent / repair-on-next-login); a magic-link verify racing a second verify of the same token (atomic consume serialises).
 - **Security.** Token never stored raw (assert only a hash at rest); token never in a log line (assert); breach-password path flags not blocks; lockout triggers and *clears* on a recovery path (not a permanent self-DoS).
-- **Compliance.** Tombstone on delete anonymises `PublicUser` projections (DATA-MODEL §5) while the event-store game history is retained; guest delete is a no-op (nothing persistent to erase).
+- **Compliance.** Age gate sets `kid_account` under the jurisdiction age and **discards DOB** (assert no DOB persisted); an under-age register lands in `RESTRICTED` (comms-muted, rated disabled) not `ACTIVE`; consent captured → `RESTRICTED→ACTIVE` + consent evidence written to the audit path; consent not captured within the window → account purged; consent revoked → back to `RESTRICTED`. Erasure: delete anonymises `PublicUser` projections (DATA-MODEL §5) and tombstones the `handle` while the event-store game history + anti-cheat signals are retained anonymised (§3.9.3); assert the erased person's email/secret_ref/profile PII are gone and all login paths dead; guest delete is a no-op. Export returns account+profile+game-ref list within the window.
 - **Contract-schema conformance.** The new endpoints' request/response bodies validate against the §11 Appendix-A amendment, run as part of the shared contract suite (NFR-10) once the service exists (R2, deferred with API-CONTRACT §9 R2).
 
 **Not tested here:** rating math (X-4/G-C), anti-cheat detection (X-5/G-B), email-delivery infra, the OAuth provider's own flow, load/latency (G-E).
@@ -254,39 +311,39 @@ The contract's conformance corpus (CONVENTIONS: the test plan is part of the spe
 
 This spec is DONE (ready to leave REVIEW for RATIFIED) when:
 - [ ] All five mechanisms (email+password, OAuth, passwordless, guest, upgrade) have a defined per-endpoint behaviour + state transitions, citing DATA-MODEL entities and never redefining fields.
-- [ ] The token/session model (format, issuance, binding, rotation, expiry, revocation, storage) is unambiguous, with every open lifetime/strength parameter raised as a Q-item (not silently chosen).
+- [ ] The token/session model (format, issuance, binding, rotation, expiry, revocation, storage) is unambiguous, with every lifetime/strength parameter **DECIDED** in the §10 ledger (not left ambiguous for code time).
 - [ ] ACC-INV-1 (guests unrated-only) is stated with its three enforcement points and the S2/X-4 cross-stream obligations named.
 - [ ] The guest-identity model is defined as distinct from `User`, with the §11 DATA-MODEL amendment drafted (not self-applied).
 - [ ] The §11 API-CONTRACT amendment (new endpoint rows + Appendix-A schemas) is drafted REVIEW (not self-applied).
-- [ ] Security posture (§7) maps T-5/T-10/T-9 to concrete controls; compliance seams (§3.9) map ADR-6/NFR-12.
+- [ ] Security posture (§7) maps T-5/T-10/T-9 to concrete controls; the compliance design (§3.9.1–§3.9.4) specifies the COPPA consent state machine and GDPR erasure boundary, with licensed-reviewer confirmations named as a **G-F gate item** (not open design).
 - [ ] The ADR-8 entitlement hook firing point is pinned (at account creation; guests excluded).
-- [ ] Every open question (§10) is Q-numbered and routed to the owner — **none decided unilaterally**.
+- [ ] Every §10 ledger item is **DECIDED** with a recorded basis; nothing is left for discovery at code time.
 - [ ] Reviewed by S3 + PE + S2 + S6 (fair-play) + architecture group (it touches two shared contracts + the rated-play invariant).
 - [ ] **Owner ratifies** the spec AND the §11 amendments before any `services/accounts` code is written (build manual §0).
 
-## 10. Open questions (owner ratification required — none decided here)
+## 10. Decisions ledger (all items DECIDED this round; legal confirmations named in §3.9.4)
 
-Each is a decision the owner (or legal/architecture) owns; the spec raises them and proceeds no further on the ambiguous ones until signed off (build manual §0 "make no silent assumptions"; handoff §8 "STOP and ask").
+The owner accepted the engineering defaults, named the OAuth/sign-up set, and delegated the COPPA/GDPR design to the acting compliance function (this spec). Every Q-item below is now **DECIDED**; the only residue is a set of *confirmations of a built mechanism* that a licensed reviewer signs off before the **G-F launch gate** (§3.9.4) — these do **not** block the `services/accounts` build chunk.
 
-| Q | Question | Routed to | Proposed default (if any) — owner confirms |
-|---|---|---|---|
-| **Q-ACC1** | Account session absolute lifetime + idle timeout + rotation cadence | Owner + Architecture | proposed: 30-day absolute, 14-day idle, rotate on elevation only — **not** decided |
-| **Q-ACC2** | Session-binding strength (which signals; challenge vs. hard-fail on divergence) | Owner + S6 | proposed: soft (challenge) binding on IP-prefix + UA; device_id advisory |
-| **Q-ACC3** | Session store = Redis (first component to pin Redis's auth role; ADR-10/16 left per-component open) | Architecture | proposed: Redis (hot/ephemeral, reconstructible) — confirm it is not an ADR-scope expansion |
-| **Q-ACC4** | Guest session lifetime (short); retention of a guest's unrated game refs on expiry | Owner | proposed: 24h; refs dropped on expiry unless upgraded — **not** decided |
-| **Q-ACC5** | Password policy (ASVS L2: min length, breach-check), lockout thresholds, register-email enumeration policy | Owner + S6 | proposed: ≥12 chars, breach-check, no composition rules; lockout w/ recovery path |
-| **Q-ACC6** | Magic-link / email-code: lifetime, single-use semantics, link vs. code vs. both in v1 | Owner | proposed: 15-min single-use link; code variant deferred — **not** decided |
-| **Q-ACC7** | **OAuth provider list** (do NOT assume Google/Apple/etc.) | Owner | **none** — owner names the set |
-| **Q-ACC8** | 2FA/WebAuthn + device-management surface scope in v1 (full vs. logout-all only) | Owner | proposed: logout-all + sessions list in v1; WebAuthn opt-in later |
-| **Q-ACC9** | Age-collection mechanism at registration (how under-13 / COPPA is triggered) | Owner + legal (ADR-6) | **none** — legal-sensitive |
-| **Q-ACC10** | OAuth account-linking policy (link on matching verified email vs. always separate) | Owner | proposed: link only on verified provider email |
-| **Q-ACC11** | Guest provisional display-name policy (generation, validation, moderation) | Owner | proposed: server-generated "Guest-XXXX"; user override validated/moderated |
-| **Q-ACC12** | What of a guest's unrated game history carries on upgrade vs. is lost on expiry; guest-game merge into an existing account on collision | Owner | proposed: unrated game list re-keyed on upgrade; dropped on expiry; no merge-into-existing in v1 |
-| **Q-ACC13** | COPPA verifiable-parental-consent capture flow + GDPR erasure contract (what is erased vs. anonymised-retained; statutory windows) | Legal (ADR-6 track) | **none** — pre-G-F legal gate |
-| **Q-ACC14** | Freed-handle reuse policy (DATA-MODEL Q-DM1, deferred to X-3) | Owner | proposed: tombstoned handle **not** reclaimable (impersonation risk) |
-| **Q-ACC15** | Any ADR-8 entitlement-tier detail the auth flow must know at creation (which baseline capabilities a new account/guest gets) | Owner (ADR-8) | proposed: new account = freemium baseline; guest = fixed anonymous baseline |
+| Q | Decision (ratified value) | Basis |
+|---|---|---|
+| **Q-ACC1** | **DECIDED:** account session 30-day absolute, 14-day idle, rotate on privilege elevation + MFA step-up | consumer-app norm; opaque server-side sessions give instant revocation regardless |
+| **Q-ACC2** | **DECIDED:** soft (challenge) binding on IP-prefix + UA-hash; `device_id` advisory-only; divergence → re-auth challenge, not hard-fail | avoids breaking mobile roaming/CGNAT while closing the T-5 hijack window |
+| **Q-ACC3** | **DECIDED:** session store = **Redis** (hot/ephemeral/reconstructible); **not** an ADR-scope expansion — straight application of ADR-10's Redis role (ADR-16 pinned only the event store) | ADR-10 role separation |
+| **Q-ACC4** | **DECIDED:** guest session 24h absolute; game refs dropped on expiry unless upgraded (§3.9.3 / Q-ACC12) | a guest is transient; longer = shadow-account PII liability |
+| **Q-ACC5** | **DECIDED:** ≥12 chars, breach-check via k-anonymity range API, no composition rules (ASVS L2 / NIST 800-63B); exponential per-account + per-IP backoff with a passwordless/reset recovery path (never a permanent self-DoS); register returns a uniform success-shaped response + out-of-band "already registered" email (no `409` enumeration leak, T-6) | NFR-6 / ASVS L2 |
+| **Q-ACC6** | **DECIDED:** 15-min single-use magic-link in v1 (atomic compare-and-set consume); 6-digit email-code OTP variant deferred (additive later) | ship one passwordless shape faster |
+| **Q-ACC7** | **DECIDED:** **Google, Apple, Facebook** (OAuth) + **Email magic-link** + **username/password** — six sign-up/login methods (§3.3). Apple is non-optional on iOS per App Store §4.8 once any other social login ships | owner-named set |
+| **Q-ACC8** | **DECIDED:** v1 = sessions list + logout-all; WebAuthn/TOTP opt-in deferred (`Credential.type=webauthn` already reserved → additive) | covers "lost my laptop" without TOTP enrollment UX cost |
+| **Q-ACC9** | **DECIDED (§3.9.1):** neutral DOB age screen, DOB **not stored**, jurisdiction age-config table defaulting to 13; under-age → `kid_account=true` + consent-and-restrict, not rejected | chess.com pattern + FTC neutral-screen guidance |
+| **Q-ACC10** | **DECIDED:** link to an existing account **only** on a *verified* provider email matching `email_hash`; else separate account (Apple private-relay counts as verified) | linking on unverified email is a T-5 takeover vector |
+| **Q-ACC11** | **DECIDED:** server-generated `Guest-XXXX` default; a user override is validated + run through the same moderation filter as handles | no unfiltered free-text on an opponent-visible surface (T-8) |
+| **Q-ACC12** | **DECIDED:** on upgrade, re-key the guest's **unrated game list** to the new `User.id` (provenance only, never a rating); on expiry, drop the refs (events stay in the event store, unattributed); upgrade into an existing handle/email → `409`, **no** merge-into-existing in v1 | "claim your games" = the unrated list; cross-account merge is a later feature |
+| **Q-ACC13** | **DECIDED (§3.9.2 + §3.9.3):** COPPA email-plus verifiable-consent state machine (RESTRICTED→ACTIVE, 30-day purge-if-unconsented, revocable); GDPR erasure boundary (erase the person, anonymise-retain the game record + anti-cheat legitimate-interest), 30-day export/erasure windows, 24-month dormant auto-delete. Licensed-reviewer confirmations are named in §3.9.4 as a **G-F gate item**, not open design | COPPA §312.5 / GDPR Art. 8 & 17; chess.com + Lichess patterns |
+| **Q-ACC14** | **DECIDED:** tombstoned `handle` **not** reclaimable (held reserved) | impersonation risk + breaks external references (PGN archives, links) |
+| **Q-ACC15** | **DECIDED:** new account = freemium baseline `Entitlement` at creation; guest = fixed anonymous-unrated baseline (no `Entitlement` row). Tier *names* remain owned by the ADR-8 entitlement model | ADR-8 hook fires at creation; this pins *when*, not *which tiers* |
 
-> **Discovery-during-implementation guard.** Per the build manual, none of the above is to be resolved by guessing at code time. Each is ratified (or explicitly deferred-with-a-named-owner) before the `services/accounts` build chunk starts. A proposed default is a *starting point for the owner to accept or change*, not a decision this spec makes.
+> **No open design remains.** The spec made no silent assumptions: each decision above is recorded with its basis. The §3.9.4 legal confirmations are gated to **G-F (launch)**, downstream of implementation — a lawyer confirms a built mechanism rather than designing it. The §11 contract amendments still need the formal cross-stream (PE/S3) + architecture + S6 sign-off before PE/S3 apply them to the frozen files; that is a review step, not an undecided question.
 
 ## 11. Additive amendments to the two RATIFIED contracts (Status: REVIEW — owner-gated, NOT self-applied)
 
@@ -345,8 +402,20 @@ MagicLinkIssue (EPHEMERAL — hot store w/ TTL)
 ```
 Note added to DATA-MODEL §3.1 / §5: the `User` entity is the **account** identity; `GuestSession` is the **ephemeral** identity; ACC-INV-1 (guests unrated-only) is why the two are distinct. Q-DM1 (freed-handle reuse) is addressed by Q-ACC14. No existing `User`/`Credential`/`Profile` field is changed; `Credential.type` already covers `oauth|password|webauthn` (passwordless uses **no** `Credential` — it is a transient issuance, so no enum change is needed).
 
+One **additive** field on `User` (new column, nullable-defaulted so existing rows are unaffected) is required by the consent state machine (§3.9.2) and the age gate (§3.9.1):
+```
+User (additive fields only — existing fields unchanged)
+  account_state   enum(ACTIVE | RESTRICTED | TOMBSTONED)  default ACTIVE
+                   -- RESTRICTED: created but comms-muted + social/rated disabled,
+                   --   pending verifiable parental consent (§3.9.2) OR other hold
+                   -- TOMBSTONED: erased-person record per §3.9.3 (handle held reserved)
+  -- kid_account (bool) ALREADY EXISTS in DATA-MODEL §7; this spec only assigns its setter (§3.9.1).
+  -- NO date_of_birth column — the age screen discards DOB, persists only the derived outcome (§3.9.1).
+```
+Consent evidence (who/when/method/scope — COPPA retention) and the GDPR export/erasure request log are written to the **durable audit path** (DATA-MODEL §7 audit log / the event-audit store), **not** new `User` columns — so no further relational-schema change is proposed here beyond `account_state`.
+
 ---
 
 ### Reviewer note (not part of the frozen contract)
 
-This spec fulfils the API-CONTRACT's explicit delegation of "token internals + service implementation" to X-3 (API-CONTRACT §1 non-goals, Q-A3). It deliberately (1) keeps the guest identity a **separate ephemeral entity** rather than a crippled `User`, so the unrated-only invariant is structural, not a flag someone can forget to check; (2) names **S2 as the owning layer** for the terminal rated-seek rejection, with X-3 owning only the `subject_kind` signal and X-4 as a backstop — the explicit cross-layer ownership the S4 layer-gap lesson demands; and (3) decides **nothing** that the owner, legal, or architecture must own — every lifetime, provider, policy, and compliance specific is a Q-item in §10. The §11 contract amendments are additive and drafted REVIEW, honouring the ADR-17/18 frozen-contract change-control: a frozen spec is amended by an owner-ratified additive version, never self-edited.
+This spec fulfils the API-CONTRACT's explicit delegation of "token internals + service implementation" to X-3 (API-CONTRACT §1 non-goals, Q-A3). It deliberately (1) keeps the guest identity a **separate ephemeral entity** rather than a crippled `User`, so the unrated-only invariant is structural, not a flag someone can forget to check; (2) names **S2 as the owning layer** for the terminal rated-seek rejection, with X-3 owning only the `subject_kind` signal and X-4 as a backstop — the explicit cross-layer ownership the S4 layer-gap lesson demands; and (3) now carries the owner's ratified decisions for every §10 item (engineering defaults accepted, the six-method sign-up set named, the COPPA consent state machine and GDPR erasure boundary designed by the acting compliance function) — with the *only* residue a set of licensed-reviewer confirmations gated to **G-F (launch)**, downstream of implementation, named in §3.9.4. The §11 contract amendments are additive and drafted REVIEW, honouring the ADR-17/18 frozen-contract change-control: a frozen spec is amended by an owner-ratified additive version, never self-edited. The `User.account_state` + `GuestSession` + `MagicLinkIssue` additions are the only new data-model surface, all additive.
