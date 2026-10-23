@@ -299,6 +299,15 @@ jobs:
             echo "::notice::services/game-server has no go.mod yet — stub, no build."
           fi
           # Other services (rating→G-C, anti-cheat→G-B, …) build/test here as they land.
+          # accounts (X-3, Go, SPEC-S3-ACCOUNTS): PURE Go (no cgo — the move hot
+          # path / rules engine do not live here), so no `make lib` step. Honest
+          # stub-guard: no-op until the Go module exists.
+          if [ -f services/accounts/go.mod ]; then
+            make -C services/accounts vet
+            make -C services/accounts test
+          else
+            echo "::notice::services/accounts has no go.mod yet — stub, no build."
+          fi
 
   web:
     needs: changes
