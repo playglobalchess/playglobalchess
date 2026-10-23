@@ -50,12 +50,25 @@ Types: `uuid`, `text`, `int`, `bigint`, `float`, `bool`, `timestamptz` (epoch), 
 ```
 User
   id            uuid PK
-  handle        text U            (public)   -- login + display handle
+  handle        text U            (public)   -- login + display handle. UNIQUENESS SCOPE (X-3 §11.2 amendment, 2026-10-23): unique over all live rows (account_state ∈ {active, restricted}) PLUS any row with handle_reserved=true. See the handle_reserved column + §5 note.
   email_enc     text             (internal)  -- encrypted; never in any API body
   email_hash    text U            (internal)  -- for lookup/dedupe, breach-check (T-5)
   country       text?            (public)
   locale        text              (authed-self)  default from Accept-Language (ADR-7)
   kid_account   bool             (internal)  -- COPPA gating (F-41, ADR-6)
+  account_state enum(active | restricted | tombstoned)  default active  (internal)
+                   -- X-3 §11.2 amendment (2026-10-23). Lowercase canonical casing, used on the
+                   --   server Session record + every comparison. restricted: comms-muted + social/rated
+                   --   disabled pending verifiable parental consent (ADR-6) or other hold. tombstoned:
+                   --   erased-person record (GDPR); row + FKs kept, PII anonymised in PublicUser projection.
+  handle_provisional bool  default false  (internal)
+                   -- X-3 §11.2 amendment. true when the handle was server-generated on an OAuth/magic-link
+                   --   sign-up; the user is prompted to claim a permanent handle.
+  handle_reserved    bool  default false  (internal)
+                   -- X-3 §11.2 amendment. Discriminates two tombstone sub-kinds for handle reuse:
+                   --   true = GDPR-erased/established-account tombstone (handle stays reserved); false =
+                   --   purged-child-with-games tombstone (handle released). account_state=tombstoned alone
+                   --   never decides reuse — handle_reserved does.
   flags         jsonb             (internal)  -- moderation/state flags
   created_at    timestamptz       (public)
 
@@ -72,6 +85,37 @@ Profile
   bio           text?            (public, subject to privacy)
   title         enum(GM|IM|FM|WGM|WIM|WFM|NM|WNM|CM|WCM)?  (public)  -- F-08.5 title filter set
   privacy       enum(public|friends|private)  (authed-self)
+
+# --- X-3 §11.2 amendment (2026-10-23): ephemeral identity-surface entities ---
+# These are EPHEMERAL (hot store w/ TTL, e.g. Redis), NOT relational truth, NOT Postgres rows.
+# Listed here for completeness of the identity surface. A guest is distinct from User BY DESIGN
+# (ACC-INV-1: guests are unrated-only) — no handle, no Profile, no Credential, no Entitlement,
+# no Rating, no GDPR tombstone.
+
+GuestSession   (EPHEMERAL — hot store w/ TTL; distinct from User)
+  id                        text PK        -- opaque guest subject id (becomes Session.user_id for a guest)
+  provisional_display_name  text           -- supplied or server-generated; NOT a unique handle
+  created_at                timestamptz
+  expires_at                timestamptz    -- short TTL
+
+MagicLinkIssue (EPHEMERAL — hot store w/ TTL)   -- passwordless single-use issuance
+  token_hash   text PK     -- hash of the single-use token (raw token never stored)
+  email_hash   text        -- hash of the REQUESTED email (recorded even on the unknown-email 202 path, for the per-target throttle); same hashing as User.email_hash, no User FK
+  expires_at   timestamptz
+  consumed     bool        -- atomic compare-and-set on verify (replay guard)
+
+UpgradeClaim   (EPHEMERAL — hot store w/ TTL)   -- guest→account pending intent across the email round-trip
+  token_hash           text PK   -- hash of the single-use claim token; raw token NEVER stored or logged
+  guest_session_id     text      -- originating GuestSession.id, captured at the authenticated initial /upgrade call
+  handle               text      -- requested handle (validated + collision-checked at the initial call)
+  email_hash           text      -- hash of the requested email
+  cred_ref             text      -- password: vault secret_ref. oauth: verified provider identity (exchanged at step 1, NOT the code). passwordless: null. NEVER a raw secret.
+  cred_kind            text      -- password | oauth | passwordless
+  kid_account_outcome  bool      -- age outcome RESOLVED at the initial call from the guest's flow_id
+  claim_kind           text      -- create (email was free) | login (email already has an account)
+  expires_at           timestamptz
+  consumed             bool      -- atomic compare-and-set on confirm (single-use; replay → 401)
+  -- NO raw password/secret stored (only cred_ref → vault); NO FK to a not-yet-created User.
 ```
 
 ### 3.2 Rating pools & time controls (X-4; backs `GET /v1/pools`, Q-A4)
@@ -181,7 +225,7 @@ PE Appendix A originally listed `RatingSummary.volatility` without a visibility 
 | Projection vs event-store disagreement | Event stream wins; projection rebuilt from the fold (ADR-10). Projections are never authoritative. |
 | Rating correction | New compensating `RatingApplied` event → `Rating` row re-folded; no in-place edit (NFR-7). |
 | Deleted/anonymized user (GDPR, G-F) | `User` tombstoned; `PublicUser` projections show an anonymized handle; game history (truth) retained in the event store per retention policy. |
-| Handle reuse after deletion | `handle` unique among live users; a freed handle policy is an X-3 decision (flagged, not decided here). |
+| Handle reuse after deletion | `handle` uniqueness scope = all live rows PLUS any row with `handle_reserved=true` (X-3 §11.2 amendment, 2026-10-23). A GDPR-erased/established-account tombstone keeps `handle_reserved=true` (handle stays reserved); a purged never-consented child releases its handle (`handle_reserved=false`, or the row is physically removed when it played no games). `account_state=tombstoned` alone never decides reuse. |
 | Custom time control | No `TimeControl` row; id is canonically encoded (`custom-<base>+<inc>`) and parsed, not looked up (Q-A4). |
 | N-seat variant (ADR-3) | `GameSeat` already keyed by `(game_id, seat_idx)`; `color` enum extends for >2-seat variants (future, not v1). |
 
