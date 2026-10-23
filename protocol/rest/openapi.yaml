@@ -115,6 +115,16 @@ components:
         token: { type: string }
         user_id: { type: string }
         expires_at: { type: integer, description: epoch seconds }
+    SessionInfo:
+      type: object
+      required: [id, created_at, last_seen_at, current]
+      description: Per-session metadata for GET /v1/me/sessions — NEVER the token itself.
+      properties:
+        id: { type: string }
+        created_at: { type: integer }
+        last_seen_at: { type: integer }
+        current: { type: boolean }
+        device_label: { type: string }
     PublicUser:
       type: object
       required: [id, handle, created_at]
@@ -329,6 +339,198 @@ paths:
       responses:
         "204": { description: No Content }
         "401": { $ref: "#/components/responses/Problem" }
+  /auth/guest:
+    post:
+      operationId: postAuthGuest
+      tags: [auth]
+      summary: Create a guest session (auth none; guest subject, unrated-only — X-3)
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+      responses:
+        "201": { description: Created (guest Session), content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+  /auth/age-screen:
+    post:
+      operationId: postAuthAgeScreen
+      tags: [auth]
+      summary: Age screen (auth none — X-3 §11; server discards dob, returns a flow_id)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dob]
+              properties:
+                dob: { type: string, format: date }
+      responses:
+        "200":
+          description: OK (server computes outcome vs jurisdiction, DISCARDS dob, returns a short-lived flow_id)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [flow_id]
+                properties:
+                  flow_id: { type: string }
+        "400": { $ref: "#/components/responses/Problem" }
+  /auth/oauth/start:
+    post:
+      operationId: postAuthOauthStart
+      tags: [auth]
+      summary: Link-aware OAuth entry (auth none — X-3; existing-email collision → link_required)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, code, redirect_uri]
+              properties:
+                provider: { type: string }
+                code: { type: string }
+                redirect_uri: { type: string }
+                flow_id: { type: string }
+      responses:
+        "200":
+          description: OK — a Session, or a link_required marker (no token) when the email already exists; completes via POST /auth/oauth/link.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Session"
+                  - type: object
+                    required: [status]
+                    properties:
+                      status: { type: string, enum: [link_required] }
+        "401": { $ref: "#/components/responses/Problem" }
+  /auth/oauth/link:
+    post:
+      operationId: postAuthOauthLink
+      tags: [auth]
+      summary: Attach an OAuth credential to the caller's OWN account (auth required — X-3)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, code, redirect_uri]
+              properties:
+                provider: { type: string }
+                code: { type: string }
+                redirect_uri: { type: string }
+      responses:
+        "204": { description: No Content (credential attached; creates NO new User) }
+        "401": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /auth/magic-link:
+    post:
+      operationId: postAuthMagicLink
+      tags: [auth]
+      summary: Request a magic link (auth none — X-3; no enumeration, T-6)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string }
+      responses:
+        "202": { description: Accepted (identical whether or not the email exists — no enumeration) }
+  /auth/magic-link/verify:
+    post:
+      operationId: postAuthMagicLinkVerify
+      tags: [auth]
+      summary: Verify a magic-link token (auth none — X-3)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                flow_id: { type: string }
+      responses:
+        "200": { description: OK (Session), content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /auth/upgrade:
+    post:
+      operationId: postAuthUpgrade
+      tags: [auth]
+      summary: Upgrade a guest to a full account (auth guest session — X-3; verify-first, no enumeration)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle, email]
+              properties:
+                handle: { type: string }
+                email: { type: string }
+                password: { type: string }
+                flow_id: { type: string }
+                oauth:
+                  type: object
+                  required: [provider, code, redirect_uri]
+                  properties:
+                    provider: { type: string }
+                    code: { type: string }
+                    redirect_uri: { type: string }
+      responses:
+        "202":
+          description: Accepted — identical for taken/free email (no enumeration); account minted only on /auth/upgrade/confirm.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [verification_sent] }
+        "400": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /auth/upgrade/confirm:
+    post:
+      operationId: postAuthUpgradeConfirm
+      tags: [auth]
+      summary: Confirm a guest upgrade via the claim link token (auth none — X-3)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                handle: { type: string, description: only on a 409 handle_taken re-pick }
+      responses:
+        "200": { description: OK (Session), content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+        "409":
+          description: Conflict (handle taken) — carries a repick_token to retry with a new handle.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
   /me:
     get:
       operationId: getMe
@@ -364,6 +566,45 @@ paths:
                 required: [items]
                 properties:
                   items: { type: array, items: { $ref: "#/components/schemas/Entitlement" } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /me/sessions:
+    get:
+      operationId: getMeSessions
+      tags: [auth]
+      summary: List the caller's active sessions (auth required — X-3; 403 for a guest caller)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK (never returns the token itself)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/SessionInfo" } }
+        "401": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+  /me/sessions/{id}:
+    delete:
+      operationId: deleteMeSessionsId
+      tags: [auth]
+      summary: Revoke one of the caller's sessions (auth required — X-3; 403 for a guest caller)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: No Content }
+        "401": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+  /me/sessions/logout-all:
+    post:
+      operationId: postMeSessionsLogoutAll
+      tags: [auth]
+      summary: Revoke all of the caller's sessions (auth required — X-3)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: No Content }
         "401": { $ref: "#/components/responses/Problem" }
   /users/{handle}:
     get:
