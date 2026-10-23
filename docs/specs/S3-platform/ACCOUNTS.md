@@ -5,7 +5,7 @@
 | Spec ID | SPEC-S3-ACCOUNTS |
 | Owner | S3 Platform — Ashish Kumar; co-reviewed by PE + S2 + S6 (fair-play veto) + Architecture group |
 | Status | RATIFIED (2026-10-23, v0.17) |
-| Version | 0.18 |
+| Version | 0.19 |
 | Last updated | 2026-10-23 |
 | Implements (master IDs) | X-3; F-46 (profile hook); ADR-6 (GDPR/COPPA), ADR-8 (entitlements hook); NFR-6 (ASVS L2), NFR-12 (compliance); Part XI T-5, T-9, T-10 |
 | Depends on | SPEC-S3-DATA-MODEL (`User`/`Credential`/`Profile`/`Entitlement` entity truth — cited, never redefined); SPEC-PE-API-CONTRACT (RATIFIED — the auth endpoint catalog, Bearer convention, RFC-7807 errors, this spec fulfils its explicit "token internals + service implementation delegated to X-3" out-of-scope lines); ADR-6, ADR-8 |
@@ -513,9 +513,13 @@ New Appendix-A schemas (language-neutral JSON; cite DATA-MODEL; `?` optional):
 ```
 POST /v1/auth/age-screen       req { dob: date }                                  → 200 { flow_id: str }
                                  // server computes outcome vs jurisdiction table, DISCARDS dob, writes a
-                                 //   short-lived server-side pending-age record keyed to flow_id AND bound
-                                 //   to the caller's client/session fingerprint (not a transferable token,
-                                 //   closes S-8). No DOB persisted (S-4, §3.9.1).
+                                 //   short-lived server-side pending-age record keyed to flow_id, resolved at
+                                 //   the create call by an EXACT single-use short-TTL HttpOnly flow_id cookie
+                                 //   match (NOT the soft session fingerprint — round-6 SHOULD-FIX-B: a soft
+                                 //   match is a NAT-collision T-9 bypass; the exact cookie is not a transferable
+                                 //   bearer token either, closes S-8). No DOB persisted (S-4, §3.9.1).
+                                 //   [drift fix 2026-10-23: this comment previously said "client/session
+                                 //   fingerprint", a line §3.9.1 had already superseded; corrected to match.]
 POST /v1/auth/guest            req { display_name?: str }                         → 201 Session
                                  // guest play needs no flow_id (unrated-only, no account, no PII store)
 POST /v1/auth/oauth/start      req { provider: str, code: str, redirect_uri: str, flow_id?: str }

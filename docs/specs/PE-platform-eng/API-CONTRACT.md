@@ -79,6 +79,19 @@ Grounded in MASTER §VIII.5 and completed to an exhaustive v1 set. Each row: met
 | POST | `/v1/auth/logout` | user | X-3 | `204` |
 | GET | `/v1/me` | user | X-3/F-46 | `User`+`Profile` (self) |
 | GET | `/v1/me/entitlements` | user | ADR-8 | `Entitlement[]` (server-verified, T-11) |
+| POST | `/v1/auth/age-screen` | none | X-3 (age gate) | `{flow_id}` (pending-age record; DOB discarded) |
+| POST | `/v1/auth/guest` | none | X-3 (guest play) | session (guest subject) |
+| POST | `/v1/auth/oauth/start` | none | X-3 (OAuth w/ link-aware outcome) | session OR `{status:"link_required"}` |
+| POST | `/v1/auth/magic-link` | none | X-3 (passwordless) | `202` (link/code sent out of band) |
+| POST | `/v1/auth/magic-link/verify` | none | X-3 (passwordless) | session |
+| POST | `/v1/auth/upgrade` | guest | X-3 (guest→account; verify-first) | `202 verification_sent` |
+| POST | `/v1/auth/upgrade/confirm` | none (link token) | X-3 (consume claim link → account session) | session |
+| POST | `/v1/auth/oauth/link` | user | X-3 (confirm OAuth link to existing acct) | `204` |
+| GET | `/v1/me/sessions` | user | X-3 (device mgmt) | active-session list |
+| DELETE | `/v1/me/sessions/{id}` | user | X-3 (device mgmt) | `204` |
+| POST | `/v1/me/sessions/logout-all` | user | X-3 (device mgmt) | `204` |
+
+> **X-3 §11.1 amendment (applied 2026-10-23; SPEC-S3-ACCOUNTS RATIFIED, PR #73).** The rows above are additive. The frozen endpoints (`register`, `login`, `oauth/{provider}`, `logout`, `GET /v1/me`, `/v1/me/entitlements`) keep their exact request/response **shapes**. Two declared **error-only** behavioral amendments apply to frozen endpoints, using the existing Appendix-B `forbidden` 403 (no new type, no shape change): (1) a **guest** subject on `GET /v1/me` and `/v1/me/sessions*` → `403` (`GET /v1/me/entitlements` for a guest stays `200`, the anonymous-unrated baseline); (2) a `register` call with **no resolvable pending-age record → `403 age_screen_required`** (the `flow_id` rides a short-TTL HttpOnly cookie set by `/age-screen`, never a new `register` body field).
 
 **Users, profiles, stats (F-05, F-46)**
 | GET | `/v1/users/{handle}` | optional | F-46 | public `Profile` |
@@ -174,8 +187,36 @@ POST /v1/auth/register   req { handle: str, email: str, password?: str, locale?:
 POST /v1/auth/login      req { handle_or_email: str, password: str }                     → 200 Session | 401
 POST /v1/auth/oauth/{provider}  req { code: str, redirect_uri: str }                     → 200 Session | 401
 POST /v1/auth/logout     req {}                                                           → 204
-GET  /v1/me              → 200 { user: PublicUser, profile: Profile, email: str(self) }
-GET  /v1/me/entitlements → 200 { items: Entitlement[] }                                   // server-verified (T-11)
+GET  /v1/me              → 200 { user: PublicUser, profile: Profile, email: str(self) }  // 403 if guest subject (X-3 §11.1)
+GET  /v1/me/entitlements → 200 { items: Entitlement[] }                                   // server-verified (T-11); guest → 200 anonymous-unrated baseline
+POST /v1/auth/age-screen       req { dob: date }                                  → 200 { flow_id: str }
+                                 // server computes outcome vs jurisdiction table, DISCARDS dob, writes a
+                                 //   short-lived server-side pending-age record keyed to flow_id, bound to a
+                                 //   single-use short-TTL HttpOnly cookie. No DOB persisted.
+POST /v1/auth/guest            req { display_name?: str }                         → 201 Session   // guest subject; unrated-only
+POST /v1/auth/oauth/start      req { provider: str, code: str, redirect_uri: str, flow_id?: str }
+                                                            → 200 Session | 200 { status:"link_required" } | 401
+                                 // NEW endpoint: link-aware entry. The frozen /oauth/{provider} stays pure
+                                 //   200 Session | 401 and is UNCHANGED. Existing-email collision → link_required
+                                 //   (no token); linking completes via POST /v1/auth/oauth/link.
+POST /v1/auth/oauth/link       req { provider: str, code: str, redirect_uri: str }
+                               (auth: a valid user session of the EXISTING account)         → 204 | 401 | 409
+                                 // attaches Credential{type=oauth} to the caller's OWN account; creates NO new User.
+POST /v1/auth/magic-link       req { email: str }                                 → 202 {}            // no enumeration (T-6)
+POST /v1/auth/magic-link/verify req { token: str, flow_id?: str }                 → 200 Session | 401
+POST /v1/auth/upgrade          req { handle: str, email: str, password?: str, flow_id?: str,
+                                     oauth?: { provider: str, code: str, redirect_uri: str } }
+                               (auth: guest session)              → 202 {status:"verification_sent"} | 403 | 409 | 400
+                                 // verify-first: identical 202 for taken/free email (no enumeration), account
+                                 //   minted only on /upgrade/confirm. oauth{} code is exchanged here (step 1) and
+                                 //   only the verified provider identity is carried in the claim.
+POST /v1/auth/upgrade/confirm  req { token: str, handle?: str }   (claim link token; handle only on a 409 re-pick)
+                                                                     → 200 Session | 401 | 409 {handle_taken, repick_token}
+GET  /v1/me/sessions           → 200 { items: SessionInfo[] } | 403               // 403 = guest caller
+SessionInfo  { id: str, created_at: int, last_seen_at: int, current: bool, device_label?: str }  // never the token
+DELETE /v1/me/sessions/{id}    → 204 | 403                               // 403 = guest caller
+POST /v1/me/sessions/logout-all → 204
+// New error outcomes reuse the EXISTING Appendix-B registry only (unauthenticated/forbidden/conflict/validation/rate-limited) — no new error type.
 ```
 
 **Users, profiles, stats (F-05, F-46)**
