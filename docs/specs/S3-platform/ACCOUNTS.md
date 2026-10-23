@@ -3,19 +3,33 @@
 | Field | Value |
 |---|---|
 | Spec ID | SPEC-S3-ACCOUNTS |
-| Owner | S3 Platform (stream lead — fill in); co-reviewed by PE + S2 + S6 (fair-play veto) + Architecture group |
-| Status | REVIEW |
-| Version | 0.17 |
+| Owner | S3 Platform — Ashish Kumar; co-reviewed by PE + S2 + S6 (fair-play veto) + Architecture group |
+| Status | RATIFIED (2026-10-23, v0.17) |
+| Version | 0.18 |
 | Last updated | 2026-10-23 |
 | Implements (master IDs) | X-3; F-46 (profile hook); ADR-6 (GDPR/COPPA), ADR-8 (entitlements hook); NFR-6 (ASVS L2), NFR-12 (compliance); Part XI T-5, T-9, T-10 |
 | Depends on | SPEC-S3-DATA-MODEL (`User`/`Credential`/`Profile`/`Entitlement` entity truth — cited, never redefined); SPEC-PE-API-CONTRACT (RATIFIED — the auth endpoint catalog, Bearer convention, RFC-7807 errors, this spec fulfils its explicit "token internals + service implementation delegated to X-3" out-of-scope lines); ADR-6, ADR-8 |
 | Gates it feeds | Identity substrate for **G-B** (fair-play: only account-holders carry the persistent identity anti-cheat assumes, NFR-4) and **G-C** (rating integrity: rated play requires an account). Not itself a gate. |
 
+## 0. Ratification record
+
+**RATIFIED 2026-10-23 at v0.17** (PR #72, merged to `main`; ratification recorded via follow-up PR). Owner: **Ashish Kumar** (S3 Platform). The spec left REVIEW for RATIFIED after all required cross-stream sign-offs completed and approved. Ratification signal: the final complete context-free independent review returned **RATIFY, BLOCKER class empty**, and the two subsequent owner-read findings (the `rated_eligible` live-recompute gap and the §3.10 path-drift) were closed in v0.17.
+
+| Stream | Scope reviewed | Sign-off |
+|---|---|---|
+| **S2** (matchmaking / sessions) | `rated_eligible` seek gate + per-request token-resolve transport (§3.1.1, §3.6) | Approved 2026-10-23 |
+| **S6** (fair-play) | ACC-INV-1 (guests unrated-only) + the COPPA/consent state machine (§3.6, §3.9) — fair-play veto | Approved 2026-10-23 |
+| **PE** (platform-eng) | API-CONTRACT §11.1 additive amendments (new endpoints + the two declared error-only frozen-endpoint behavioral amendments) | Approved 2026-10-23 |
+| **S3** (platform / data) | DATA-MODEL §11.2 additive amendments (`GuestSession`, `UpgradeClaim`, `handle_reserved`; the handle-uniqueness scope semantic) | Approved 2026-10-23 |
+| **Architecture group** | Cross-cutting: the frozen-contract amendment discipline + the `rated_eligible` single-signal design | Approved 2026-10-23 |
+
+> Sign-offs are recorded by stream name per the owner's instruction (no individual-reviewer attribution). The §3.9.4 items remain gated to **G-F (launch)** — a licensed legal confirmation of a built mechanism, downstream of implementation, not a ratification blocker.
+
 ## 1. Purpose & scope
 
 Define the **accounts & identity service contract (X-3)**: how a human (or a guest) obtains, presents, and ends a credential; how a session is minted, bound, rotated, and invalidated; the five authentication mechanisms the owner scoped this session; the ephemeral **guest-identity** model and the invariant that **guests are confined to unrated play**; and the guest→account upgrade flow (§3.7). This is the spec SPEC-PE-API-CONTRACT points at when it writes *"Auth token internals… is X-3's spec"* and *"How `services/accounts`… fulfils an endpoint is each service's spec"* (API-CONTRACT §1 non-goals, Q-A3).
 
-This is a **spec, not code.** Per the build manual §0 it is written, set to REVIEW, and **STOPs for owner ratification**; no `services/accounts` code is written until it is ratified. It also carries, as separate owner-gated amendments (§11), the additive changes to the two frozen contracts that guest + passwordless + upgrade require.
+This is a **spec, not code.** Per the build manual §0 it was written, set to REVIEW, and STOPped for owner ratification — now **RATIFIED (§0)**, so `services/accounts` implementation may proceed. It also carries, as separate owner-gated amendments (§11, now approved), the additive changes to the two frozen contracts that guest + passwordless + upgrade require.
 
 **In scope**
 1. **Token & session model** — session-credential format, issuance, binding, rotation, expiry, revocation, and the storage model behind it (which store, per ADR-10 role separation).
@@ -339,7 +353,7 @@ All four account-creation paths — register (§3.2), OAuth-create (§3.3), magi
 - **X-4 (rating)** — applies ratings only to a subject with `rated_eligible=true` (§3.6 point 3 backstop).
 - **ADR-8 entitlements** — reads `subject_kind` to resolve a guest's fixed baseline vs. an account's `Entitlement` rows.
 
-**Changes to shared contracts.** This spec requires **additive** changes to two RATIFIED contracts (API-CONTRACT, DATA-MODEL). Per CONVENTIONS + API-CONTRACT §3.1 versioning, these are **owner-gated amendments** reviewed by both affected streams + architecture (+ S6 for the rated-play invariant). They are drafted in §11 as Status: REVIEW and are **NOT self-applied** — same change-control discipline as the ADR-17/18 frozen-wire amendments. They are additive `/v1` changes (new rows, new optional entity), not a `/v2` break.
+**Changes to shared contracts.** This spec requires **additive** changes to two RATIFIED contracts (API-CONTRACT, DATA-MODEL). Per CONVENTIONS + API-CONTRACT §3.1 versioning, these are **owner-gated amendments** reviewed by both affected streams + architecture (+ S6 for the rated-play invariant). They were drafted in §11 for review and are **NOT self-applied** — same change-control discipline as the ADR-17/18 frozen-wire amendments; now cross-stream **approved (§0)** and awaiting mechanical application to the frozen files by PE/S3. They are additive `/v1` changes (new rows, new optional entity), not a `/v2` break.
 
 ## 5. Edge cases & failure modes
 
@@ -423,7 +437,7 @@ The contract's conformance corpus (CONVENTIONS: the test plan is part of the spe
 
 ## 9. Acceptance criteria (Definition of Done)
 
-This spec is DONE (ready to leave REVIEW for RATIFIED) when:
+This spec was DONE (left REVIEW for RATIFIED on 2026-10-23, v0.17 — see §0) when:
 - [ ] All five mechanisms (email+password, OAuth, passwordless, guest, upgrade) have a defined per-endpoint behaviour + state transitions, citing DATA-MODEL entities and never redefining fields.
 - [ ] **All four account-creation paths (register / oauth-create / magic-link-create / upgrade-confirm) run the single shared creation pipeline (§3.10), so the age gate / `kid_account` assignment (ACC-INV-2) and the handle-assignment rule (§3.0.1) apply on every path — not register-only.**
 - [ ] The token/session model (format, issuance, binding, rotation, expiry, revocation, storage) is unambiguous, with every lifetime/strength parameter **DECIDED** in the §10 ledger (not left ambiguous for code time).
@@ -463,9 +477,9 @@ The owner accepted the engineering defaults, named the OAuth/sign-up set, and de
 | **Q-ACC-UPGRADE** | **DECIDED (§3.7 / §11):** guest→account upgrade is **verify-first**, built on one ephemeral `UpgradeClaim` record that captures the originating `guest_session_id`, the resolved age outcome, the credential (vault `cred_ref`), and a `create`/`login` branch at the authenticated initial call, consumed by `/upgrade/confirm`. Initial call → identical `202` for taken/free email (no oracle); account minted + token rotated only on confirm (email-owner only). Designed state-first after five review rounds showed point-fixes kept re-opening defects — the single record closes the bind/age-gate/token/enumeration concerns together | state-first design replacing the reactive per-round patches |
 | **Q-ACC-UPGRADE-OAUTH** | **DECIDED (§3.7, round-8 B1):** an `oauth{}` upgrade **exchanges the provider authorization `code` at the authenticated step 1** (where it is still valid) and stores only the **verified provider identity** `{provider, provider_subject, email_hash}` in the `UpgradeClaim` — never the code/grant, which is single-use + seconds-TTL and cannot survive the minutes-to-hours email round-trip. `/upgrade/confirm` materialises `Credential{type=oauth}` from the stored identity with **no second provider call**, so there is no dead-code / stranded-user outcome on the oauth sub-path | a code cannot outlive the round-trip; carrying it would strand a user who clicked a real link on a confirm that can never succeed — so exchange early, carry the durable verified fact |
 
-> **No open design remains.** The spec made no silent assumptions: each decision above is recorded with its basis. The §3.9.4 legal confirmations are gated to **G-F (launch)**, downstream of implementation — a lawyer confirms a built mechanism rather than designing it. The §11 contract amendments still need the formal cross-stream (PE/S3) + architecture + S6 sign-off before PE/S3 apply them to the frozen files; that is a review step, not an undecided question.
+> **No open design remains.** The spec made no silent assumptions: each decision above is recorded with its basis. The §3.9.4 legal confirmations are gated to **G-F (launch)**, downstream of implementation — a lawyer confirms a built mechanism rather than designing it. The §11 contract amendments have the formal cross-stream (PE/S3) + architecture + S6 sign-off (ratified 2026-10-23, §0); what remains is the mechanical step of PE/S3 applying the approved new rows to the frozen files — not a review, and not an undecided question.
 
-## 11. Additive amendments to the two RATIFIED contracts (Status: REVIEW — owner-gated, NOT self-applied)
+## 11. Additive amendments to the two RATIFIED contracts (APPROVED 2026-10-23 — PE/S3 to apply to the frozen files)
 
 Guest + passwordless + upgrade + session-management add surface the frozen specs do not have. These amendments are drafted here for review and are applied **only after owner ratification**, by the owning stream (PE for API-CONTRACT, S3 for DATA-MODEL), with the same change-control as the ADR-17/18 frozen-wire process (both affected streams + architecture + S6). The **API-CONTRACT** changes are **additive in SHAPE** — only NEW endpoint rows + a NEW optional entity; **no frozen endpoint's request body or response shape is changed** (the link-aware OAuth outcome lives on the NEW `/oauth/start`, not the frozen `/oauth/{provider}`; the age gate binds via a server-side flow record, not a new field on frozen `register`). **Two error-only BEHAVIORAL amendments to frozen endpoints are declared explicitly (no shape/type change, existing Appendix-B `forbidden`), owner-ratified like any §11 change:** (1) a **guest** subject on `GET /v1/me`, `/v1/me/entitlements`, `/v1/me/sessions*` → `403` (§3.8, S-R4-2); (2) a **`register` call with no resolvable pending-age record → `403 age_screen_required`** (§3.9.1, BLOCKER-1) so the T-9 age gate binds on the frozen register path without a body-shape change. The **DATA-MODEL** change has **one genuine frozen-semantic amendment, surfaced explicitly as such**: the `handle` uniqueness **scope** moves to `{live ∪ tombstoned}` (§11.2, B-3). Everything else is additive. The frozen F-01 slice is untouched.
 
