@@ -21,6 +21,11 @@ buildscript {
             classpath("org.bouncycastle:bcutil-jdk18on:1.85")
             classpath("org.bitbucket.b_c:jose4j:0.9.6")
             classpath("org.jdom:jdom2:2.0.6.1")
+            // TEMPORARY BRIDGE: remove this line once a stable AGP bundles
+            // Kotlin >= 2.4.20 natively. AGP 9.4.1 (newest stable at the time)
+            // bundles Kotlin 2.2.10, which is below the GHSA-r937-wjx7-w2jp fix
+            // floor (2.4.20-Beta1). To retire: bump AGP, run
+            // ./gradlew buildEnvironment, and delete this if KGP resolves >= 2.4.20.
             classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.20")
         }
     }
