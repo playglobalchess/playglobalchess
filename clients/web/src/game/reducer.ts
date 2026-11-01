@@ -11,6 +11,7 @@
 // REVERTED if the server rejects it (§3.3).
 
 import { type Position, parseFen, applyUci, plyFromFen, hasValidFullmove } from "../board/position";
+import { settleClocks } from "./clock";
 import { SYNC_MAX_ATTEMPTS, SYNC_MAX_CYCLES } from "./recovery";
 import {
   type ServerMsg,
@@ -67,8 +68,11 @@ export interface GameState {
   position: Position | null;
   /** Authoritative current ply (server). The next MOVE sends ply_expected = ply + 1. */
   ply: number;
-  /** Per-seat remaining clock ms (index = seat). */
+  /** Per-seat clock value in ms (index = seat): the last authoritative value, or
+   * the value a seat was frozen at (§3.3.1). NOT a live countdown: see clock.ts. */
   clocks: number[];
+  /** Per-seat local receipt time (performance.now) that `clocks` is measured from. */
+  clockAt: number[];
   /** A move shown optimistically, awaiting the server's accept/reject. */
   pendingMove: { uci: string; prevPosition: Position; prevPly: number } | null;
   /** A pending draw offer FROM the opponent (DRAW_OFFERED), awaiting our accept/decline. */
@@ -96,6 +100,7 @@ export const initialState: GameState = {
   position: null,
   ply: 0,
   clocks: [],
+  clockAt: [],
   pendingMove: null,
   drawOffer: null,
   result: null,
@@ -107,8 +112,10 @@ export const initialState: GameState = {
 
 export type Action =
   | { kind: "seek" } // user clicked Play
-  | { kind: "localMove"; uci: string } // user made a board move (optimistic)
-  | { kind: "server"; msg: ServerMsg } // a decoded ServerMsg arrived
+  // `at` is the local receipt time (performance.now) stamped by useGame: the
+  // reducer stays pure, and every clock anchor comes from here (§3.3.1 C3).
+  | { kind: "localMove"; uci: string; at: number } // user made a board move (optimistic)
+  | { kind: "server"; msg: ServerMsg; at: number } // a decoded ServerMsg arrived
   // Timer-driven recovery actions. useGame owns the timers; the reducer only
   // transitions. Each carries the raise seq it was armed for so a stale timer
   // (one that raced a STATE or a newer attempt) is a no-op.
@@ -189,8 +196,11 @@ export function reduce(state: GameState, action: Action): GameState {
         // have produced it; never crash the reducer).
         return state;
       }
+      // C4: the mover's clock freezes at its displayed value and the opponent's
+      // starts (the optimistic position's side to move is now the opponent).
       return {
         ...state,
+        ...settleClocks(state, action.at),
         position: optimistic,
         pendingMove: { uci: action.uci, prevPosition, prevPly },
         lastReject: null,
@@ -198,7 +208,7 @@ export function reduce(state: GameState, action: Action): GameState {
     }
 
     case "server":
-      return reduceServer(state, action.msg);
+      return reduceServer(state, action.msg, action.at);
 
     case "syncReplyTimeout":
       if (!recovering(state.sync) || state.sync.step !== "await_reply" || action.seq !== state.sync.seq) return state;
@@ -213,7 +223,7 @@ export function reduce(state: GameState, action: Action): GameState {
   }
 }
 
-function reduceServer(state: GameState, msg: ServerMsg): GameState {
+function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
   const tag = serverTag(msg);
   switch (tag) {
     case "Matched": {
@@ -231,7 +241,10 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         opponent: m.opponent,
         position: startPos,
         ply: plyFromFen(m.start_state.fen),
+        // C1/C2: every seat's value from the frame, anchored at receipt; White
+        // (the side to move) runs from here.
         clocks: m.start_state.clocks.slice(),
+        clockAt: m.start_state.clocks.map(() => at),
       };
       return frameConsistent(m.start_state.fen, m.start_state.turn, startPos) ? next : raise(next, "T5_INCONSISTENT");
     }
@@ -275,16 +288,19 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       // Mover seat from PLY PARITY (race-proof, independent of board state):
       // ply 1 = white's first move, so odd ply => white (seat 0) just moved.
       // Seat/color: seat 0 = white, seat 1 = black (§4A.8 v1 2-seat).
-      const clocks = state.clocks.slice();
+      // C1/C4/C5: settle first (freeze the previous runner at its displayed
+      // value, start counting the others from receipt), then the mover's clock
+      // becomes clock_after_ms.
+      const { clocks, clockAt } = settleClocks(state, at);
       const moverSeat = a.ply % 2 === 1 ? 0 : 1;
-      if (moverSeat < clocks.length) {
-        clocks[moverSeat] = a.clock_after_ms;
-      }
+      // (settleClocks already anchored every seat at `at`.)
+      if (moverSeat < clocks.length) clocks[moverSeat] = a.clock_after_ms;
       return {
         ...state,
         position,
         ply: a.ply,
         clocks,
+        clockAt,
         pendingMove: null,
         lastReject: null,
         lastMove: { uci: a.uci, moverSeat },
@@ -300,6 +316,10 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
               ...state,
               position: state.pendingMove.prevPosition,
               ply: state.pendingMove.prevPly,
+              // C4: no clock change is needed. localMove folded the elapsed time
+              // into the values (settleClocks), so the mover's clock simply runs
+              // on from its frozen value as if it had never stopped, and the
+              // opponent's returns to its prior (not running) value.
               pendingMove: null,
               lastReject: r.reason,
             }
@@ -336,7 +356,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         // is exactly what a gap desynchronized — if we leave it stale, the next
         // MOVE sends ply_expected = stale+1 and the server rejects it StalePly.
         ply: plyFromFen(s.state.fen),
+        // C1/C8: the STATE overrides every seat's value; anchored at receipt.
         clocks: s.state.clocks.slice(),
+        clockAt: s.state.clocks.map(() => at),
         pendingMove: null,
         sync: { ...IN_SYNC, seq: state.sync.seq },
         lastReject: null,
@@ -356,8 +378,11 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       // Applied immediately in every phase and ends recovery (§3.4.1): the
       // result is authoritative and needs no position.
       const g = (msg as { GameEnd: { game_id: string; result_vector: number[]; termination: TerminationCode; rating_delta: number[] } }).GameEnd;
+      // C7: every clock stops at its displayed value. Settle while phase is still
+      // "playing" (so the running seat is charged up to now), then stop.
       return {
         ...state,
+        ...settleClocks(state, at),
         phase: "game_over",
         pendingMove: null,
         drawOffer: null,

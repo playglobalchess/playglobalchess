@@ -46,6 +46,8 @@ export const en = {
   "game.draw.offered": "Opponent offers a draw.",
   "game.draw.accept": "Accept draw",
   "game.clock.aria": "Remaining time",
+  "game.clock.you": "Your clock",
+  "game.clock.opponent": "Opponent's clock",
   "game.opponent.label": "Opponent",
   "game.resync": "Syncing game…",
   "game.sync.failed": "The game lost sync with the server.",

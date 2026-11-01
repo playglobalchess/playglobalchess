@@ -21,6 +21,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { GameSocket, type ConnStatus, type SocketLike } from "../src/net/GameSocket";
 import { reduce, initialState, type GameState } from "../src/game/reducer";
+import { displayedMs } from "../src/game/clock";
 import type { ServerMsg } from "../src/codec/messages";
 import { DEV_POOL, DEV_TIME_CONTROL } from "../src/devConfig";
 
@@ -128,7 +129,7 @@ class StatefulClient {
         return ws;
       },
       onServerMsg: (msg) => {
-        this.state = reduce(this.state, { kind: "server", msg });
+        this.state = reduce(this.state, { kind: "server", msg, at: performance.now() });
       },
       onStatus: (s) => {
         this.status = s;
@@ -311,6 +312,48 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     expect(white.state.position?.board).toEqual(black.state.position?.board);
     expect(white.state.sync.phase).toBe("IN_SYNC");
     expect(black.state.sync.phase).toBe("IN_SYNC");
+
+    white.sock.close();
+    black.sock.close();
+  }, 25_000);
+
+  it("after a move the opponent's displayed clock decreases over about a second of real time (§3.3.1)", async () => {
+    const a = new StatefulClient("gina");
+    const b = new StatefulClient("hank");
+    a.sock.connect();
+    b.sock.connect();
+    a.sock.seek(DEV_POOL, DEV_TIME_CONTROL, false);
+    await new Promise((r) => setTimeout(r, 50));
+    b.sock.seek(DEV_POOL, DEV_TIME_CONTROL, false);
+    await a.until((s) => s.phase === "playing");
+    await b.until((s) => s.phase === "playing");
+    const gameId = a.state.gameId!;
+    expect(seenGameIds.has(gameId)).toBe(false);
+    seenGameIds.add(gameId);
+    const white = a.state.mySeat === 0 ? a : b;
+    const black = white === a ? b : a;
+
+    white.sock.move(gameId, 1, "e2e4");
+    await white.until((s) => s.ply === 1);
+    await black.until((s) => s.ply === 1);
+
+    // White's view: Black (the opponent) is now the running clock; Black's view:
+    // its own clock runs. Both models must count down in real time.
+    const blackClockSeenByWhite = (): number => displayedMs(white.state, 1, performance.now());
+    const blackClockSeenByBlack = (): number => displayedMs(black.state, 1, performance.now());
+    const w0 = blackClockSeenByWhite();
+    const b0 = blackClockSeenByBlack();
+    await new Promise((r) => setTimeout(r, 1000));
+    const wDrop = w0 - blackClockSeenByWhite();
+    const bDrop = b0 - blackClockSeenByBlack();
+    expect(wDrop).toBeGreaterThan(800);
+    expect(wDrop).toBeLessThan(1600);
+    expect(bDrop).toBeGreaterThan(800);
+    expect(bDrop).toBeLessThan(1600);
+    // The mover's own clock is frozen from White's side.
+    const w1 = displayedMs(white.state, 0, performance.now());
+    await new Promise((r) => setTimeout(r, 200));
+    expect(displayedMs(white.state, 0, performance.now())).toBe(w1);
 
     white.sock.close();
     black.sock.close();

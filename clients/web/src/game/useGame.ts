@@ -49,6 +49,9 @@ export interface UseGameOptions {
   token: string;
   /** Injected socket factory for tests; real WebSocket in the browser. */
   factory?: SocketFactory;
+  /** Monotonic time source (ms) stamped on every frame and local move as the
+   * clock anchor (§3.3.1 C3). Injected by tests; performance.now in the browser. */
+  now?: () => number;
 }
 
 export interface GameCommands {
@@ -75,6 +78,11 @@ export function useGame(opts: UseGameOptions): UseGameResult {
   // React state only republishes it for rendering.
   const [state, setState] = useState<GameState>(initialState);
   const stateRef = useRef<GameState>(initialState);
+  // The time source is read at call time through a ref (never during render).
+  const nowRef = useRef<() => number>(opts.now ?? (() => performance.now()));
+  useEffect(() => {
+    nowRef.current = opts.now ?? (() => performance.now());
+  }, [opts.now]);
   const apply = useCallback((action: Action): GameState => {
     const next = reduce(stateRef.current, action);
     stateRef.current = next;
@@ -98,7 +106,7 @@ export function useGame(opts: UseGameOptions): UseGameResult {
       // Only include `factory` when provided — exactOptionalPropertyTypes
       // forbids passing an explicit `undefined` to an optional field.
       ...(opts.factory != null ? { factory: opts.factory } : {}),
-      onServerMsg: (msg: ServerMsg) => apply({ kind: "server", msg }),
+      onServerMsg: (msg: ServerMsg) => apply({ kind: "server", msg, at: nowRef.current() }),
       onStatus: (s) => {
         if (s === "connected") setConnEpoch((n) => n + 1);
         setStatus(s);
@@ -198,7 +206,7 @@ export function useGame(opts: UseGameOptions): UseGameResult {
     // trigger earlier in the same commit has already been applied here.
     const before = stateRef.current;
     if (before.gameId == null) return;
-    const after = apply({ kind: "localMove", uci });
+    const after = apply({ kind: "localMove", uci, at: nowRef.current() });
     // The reducer returns the SAME state object when it refuses a move.
     if (after === before || after.pendingMove == null) return;
     sockRef.current?.move(before.gameId, after.pendingMove.prevPly + 1, uci);

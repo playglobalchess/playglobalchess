@@ -7,7 +7,7 @@ describe("announcementKey (#71.2)", () => {
   it("does not change when an error is raised then cleared", () => {
     const base = { ...initialState, phase: "playing" as const, ply: 4 };
     const withError = reduce(base, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { Error: { code: ErrorCode.UnsupportedVersion, msg: "x" } },
     });
     expect(withError.error).not.toBeNull();

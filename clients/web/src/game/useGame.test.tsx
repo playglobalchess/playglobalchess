@@ -73,7 +73,7 @@ class FakeSocket implements SocketLike {
 let root: Root | null = null;
 let fakes: FakeSocket[] = [];
 
-function mountHook(): { get: () => UseGameResult; fake: () => FakeSocket } {
+function mountHook(now?: () => number): { get: () => UseGameResult; fake: () => FakeSocket } {
   fakes = [];
   const factory = (_url: string): SocketLike => {
     const f = new FakeSocket();
@@ -82,7 +82,7 @@ function mountHook(): { get: () => UseGameResult; fake: () => FakeSocket } {
   };
   let latest: UseGameResult | null = null;
   function Harness(): null {
-    latest = useGame({ url: "ws://test/ws", token: "dev-token", factory });
+    latest = useGame({ url: "ws://test/ws", token: "dev-token", factory, ...(now != null ? { now } : {}) });
     return null;
   }
   const container = document.createElement("div");
@@ -165,6 +165,24 @@ describe("useGame", () => {
     // would otherwise ship a frame with the same ply_expected and no optimistic
     // state behind it).
     expect(countMsgs(h.fake(), "Move")).toBe(1);
+  });
+
+  it("stamps clock anchors from the injected time source: frames at receipt, a local move at the click (§3.3.1 C3)", () => {
+    let t = 1000;
+    const h = mountHook(() => t);
+    act(() => h.fake().open());
+    act(() => h.fake().push(matched));
+    expect(h.get().state.clockAt).toEqual([1000, 1000]);
+    t = 4000;
+    act(() => h.get().commands.move("e2e4"));
+    expect(h.get().state.clockAt).toEqual([4000, 4000]);
+    expect(h.get().state.clocks[0]).toBe(297000);
+    t = 4500;
+    act(() =>
+      h.fake().push({ MoveAccepted: { game_id: "g1", ply: 1, uci: "e2e4", clock_after_ms: 296500 } }),
+    );
+    expect(h.get().state.clocks[0]).toBe(296500);
+    expect(h.get().state.clockAt[0]).toBe(4500);
   });
 
   it("closes the socket on unmount", () => {
