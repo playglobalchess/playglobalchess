@@ -194,11 +194,17 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithStore(t, game.NewMemStore())
+}
+
+// newHarnessWithStore is newHarness over a caller-supplied store (fault
+// injection tests wrap a MemStore).
+func newHarnessWithStore(t *testing.T, store game.EventStore) *harness {
+	t.Helper()
 	o, err := engine.New()
 	if err != nil {
 		t.Fatalf("engine.New: %v", err)
 	}
-	store := game.NewMemStore()
 	mm := matchmaking.New(newFakePool(), store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	reg := NewRegistry(ctx, store, o, ConventionResolver{})

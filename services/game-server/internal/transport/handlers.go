@@ -450,6 +450,11 @@ func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
 	}
 	sp, err := snap.StateSnapshot(ctx)
 	if err != nil || !sp.Ended {
+		// Not (yet) verifiably ended: release the one-shot claim so a later
+		// caller (a re-ack or the flag ticker after reconcile) can still deliver
+		// GAME_END. (Claim stays FIRST so a caller racing a completed broadcast
+		// + drop finds the game gone, never sends twice.)
+		s.releaseGameEnd(gameID)
 		return
 	}
 	rv, term := s.endingResult(ctx, gameID, sp)
@@ -475,6 +480,13 @@ func (s *Server) claimGameEnd(gameID string) bool {
 	}
 	s.endBroadcast[gameID] = true
 	return true
+}
+
+// releaseGameEnd undoes a claim whose game turned out not to be ended yet.
+func (s *Server) releaseGameEnd(gameID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.endBroadcast, gameID)
 }
 
 // dropGame removes a finished game's live session and ALL its transport state:

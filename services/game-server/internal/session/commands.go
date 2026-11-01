@@ -54,10 +54,10 @@ type submitCmd struct {
 
 func (c *submitCmd) apply(ctx context.Context, s *Session) {
 	defer close(c.done)
-	if s.ended {
-		c.out = game.MoveOutcome{Rejected: true, Reason: game.RejectGameOver, PlyExpected: s.ply}
-		return
-	}
+	// No early ended-reject here: the pipeline decides, so a resend of the FINAL
+	// persisted ply is re-acked even after the game ended (its ack may have been
+	// lost), and anything else is rejected GAME_OVER. A stale projection was
+	// already re-synced by the actor before this apply (see applyRecovered).
 	// Server-authoritative timing: stamp BOTH the think-time measurement and the
 	// persisted MovePlayed.ServerTS from the session's own clock, captured once.
 	// This keeps them consistent so a later reconnect/failover rebuild recovers
@@ -81,9 +81,14 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 	}
 	out, err := s.pipe.SubmitMove(ctx, intent)
 	if err != nil {
-		// Persist/engine I/O failure: do NOT advance any projection (NFR-7 — the
-		// move did not happen). Surface the error for the transport.
+		// Failure: do NOT advance any projection (NFR-7). A DURABLE-APPEND
+		// failure may be ambiguous (the store committed and then errored), so mark
+		// the projection stale; the actor re-syncs it from the stream before the
+		// next command. Load/fold/legality errors wrote nothing and do not mark.
 		c.err = err
+		if errors.Is(err, game.ErrPersist) {
+			s.stale = true
+		}
 		return
 	}
 	c.out = out
@@ -100,6 +105,25 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		// returned as-is for the transport to re-emit MOVE_ACCEPTED, with no
 		// projection change.
 		switch {
+		case out.Ply > s.ply && out.NewFEN == "":
+			// Re-ack of a ply the projection has not seen: the move landed via
+			// ANOTHER writer or an earlier ambiguous commit. Accepted with no
+			// NewFEN / Zobrist / Terminal, so advancing would blank curFEN and miss
+			// a committed GameEnded. Re-sync from the stream instead (the same
+			// reconcile the actor runs) and return the re-ack.
+			s.stale = true
+			if err := s.reconcileIfStale(ctx); err != nil {
+				c.out = game.MoveOutcome{}
+				c.err = err
+				return
+			}
+			if out.Ply > s.ply {
+				c.out = game.MoveOutcome{}
+				c.err = fmt.Errorf("session: re-ack ply %d still ahead of reconciled ply %d — stream desync", out.Ply, s.ply)
+				return
+			}
+			c.out.Terminal = s.endedTerminal()
+			return
 		case out.Ply == s.ply+1:
 			// Genuine new move — fall through to advance the projection below.
 		case out.Ply <= s.ply:
@@ -114,6 +138,11 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 			// draw offer made AFTER the original move must NOT be killed by a mere
 			// transport duplicate of that already-counted move. A genuine new move
 			// (the case above) does clear it.
+			//
+			// If the game is over (the pipeline only re-acks the FINAL ply then),
+			// report its ending in Terminal so the transport delivers GAME_END: the
+			// original attempt may have failed ambiguously and never broadcast it.
+			c.out.Terminal = s.endedTerminal()
 			return
 		default:
 			// out.Ply > s.ply+1: the pipeline accepted a move that skips a ply.
@@ -121,10 +150,12 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 			// silently treating it as a re-ack would freeze the projection while
 			// the stream advanced (every later move then validates a stale FEN).
 			// Surface it as an error so the transport fails loudly rather than
-			// corrupting the game.
+			// corrupting the game, and mark stale so the next command re-syncs the
+			// projection to the stream (which now holds that move).
 			c.out = game.MoveOutcome{}
 			c.err = fmt.Errorf("session: pipeline accepted ply %d but session is at %d (expected %d) — stream desync",
 				out.Ply, s.ply, s.ply+1)
+			s.stale = true
 			return
 		}
 		s.curFEN = out.NewFEN
@@ -146,11 +177,9 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		s.drawOfferBy = nil
 		if out.Terminal != nil {
 			// Engine-detected terminal (mate / stalemate / insufficient /
-			// automatic draw). Append GameEnded; the game is over.
-			if err := s.appendGameEnded(ctx, *out.Terminal, winnerFromMover(c.seat, *out.Terminal, s.seatCount)); err != nil {
-				c.err = err
-				return
-			}
+			// automatic draw). The pipeline already committed MovePlayed +
+			// GameEnded in ONE AppendBatch (issue #67), so the stream is complete;
+			// just mark the live session ended.
 			s.endGame(*out.Terminal)
 		}
 	case out.Flagged:
@@ -172,7 +201,9 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 // (Q-GS3C — the session does not own a ticker). It charges elapsed-since-last-
 // move against the side to move; if that flags, it ends the game. It never
 // moves, so there is no double-charge with SubmitMove's per-move pipeline
-// charge. Returns whether the game ended on this tick.
+// charge. Returns whether the game is over: it ended on this tick, or it was
+// already over (e.g. discovered by reconcile after an ambiguous ending write),
+// so the driver delivers GAME_END and stops.
 func (s *Session) TickFlagCheck(ctx context.Context) (ended bool, err error) {
 	c := &tickCmd{done: make(chan struct{})}
 	if e := s.dispatch(ctx, c, c.done); e != nil {
@@ -190,6 +221,10 @@ type tickCmd struct {
 func (c *tickCmd) apply(ctx context.Context, s *Session) {
 	defer close(c.done)
 	if s.ended {
+		// Already over (possibly discovered by the actor's reconcile after an
+		// ambiguous ending write). Report it so the driver delivers GAME_END and
+		// stops; the transport's end-broadcast latch dedups repeats.
+		c.ended = true
 		return
 	}
 	elapsedMs := s.now().Sub(s.lastMoveAt).Milliseconds()
@@ -227,11 +262,12 @@ func (s *Session) StateSnapshot(ctx context.Context) (Snapshot, error) {
 	if err := s.dispatch(ctx, c, c.done); err != nil {
 		return Snapshot{}, err
 	}
-	return c.snap, nil
+	return c.snap, c.err
 }
 
 type snapCmd struct {
 	snap Snapshot
+	err  error
 	done chan struct{}
 }
 
@@ -313,20 +349,6 @@ func (s *Session) endGame(term game.Termination) {
 	s.phase = game.PhaseEnded
 }
 
-func (s *Session) appendGameEnded(ctx context.Context, term game.Termination, rv []game.Result) error {
-	// GameEnded is an ending append (not the per-move hot path). appendBatchAtHead
-	// derives the seq from a fresh Load and retries on a cross-node conflict, so
-	// it stays correct regardless of recurring-ply quirks on the move path (e.g.
-	// after a takeback) that make a tracked counter fragile.
-	if err := s.appendBatchAtHead(ctx, []game.Event{{
-		Type:      game.EvGameEnded,
-		GameEnded: &game.GameEnded{ResultVector: rv, Termination: term},
-	}}); err != nil {
-		return fmt.Errorf("session: append GameEnded: %w", err)
-	}
-	return nil
-}
-
 // streamLen returns the current stream length (= the next free seq). Used by the
 // session's own batch/ending appends to set expectedSeq correctly; these are
 // off the per-move hot path (endings, takebacks), so the extra Load is fine.
@@ -356,6 +378,11 @@ func (s *Session) appendBatchAtHead(ctx context.Context, evs []game.Event) error
 			return nil
 		}
 		if !errors.Is(err, game.ErrSeqConflict) || attempt >= maxRetries {
+			// The append may have committed despite the error (ambiguous), or
+			// other writers moved the head: the projection is unverified. The
+			// actor re-syncs it before the next command (single stale mark for
+			// every ending/takeback path).
+			s.stale = true
 			return err
 		}
 		// lost the seq to a concurrent writer — reload head and retry.
@@ -443,16 +470,5 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 // is a win for the mover; stalemate / insufficient / the draw terminals are a
 // draw for all seats.
 func winnerFromMover(mover uint8, term game.Termination, seatCount int) []game.Result {
-	rv := make([]game.Result, seatCount)
-	if term == game.TermMate {
-		for i := range rv {
-			rv[i] = game.ResultLoss
-		}
-		rv[mover] = game.ResultWin
-		return rv
-	}
-	for i := range rv {
-		rv[i] = game.ResultDraw
-	}
-	return rv
+	return game.MoverResultVector(mover, term, seatCount)
 }

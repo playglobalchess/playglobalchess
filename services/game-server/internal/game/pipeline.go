@@ -170,9 +170,6 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 	}
 
 	// (2) authorize.
-	if st.Phase != PhaseLive {
-		return reject(RejectGameOver, st.Ply), nil
-	}
 	if int(in.SeatIdx) >= st.seatCount() {
 		return reject(RejectNotYourSeat, st.Ply), nil
 	}
@@ -183,6 +180,14 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 			if mv.SeatIdx != in.SeatIdx {
 				return reject(RejectNotYourSeat, st.Ply), nil
 			}
+			// On a game that is no longer live, re-ack ONLY the final move (the
+			// one whose ack may have been lost when the game ended with it) and
+			// only for the same uci; any other ply or a different uci is GAME_OVER.
+			// A live game keeps the §4A v1.2 rule: re-ack the persisted move, even
+			// if the retry carries a different uci.
+			if st.Phase != PhaseLive && (in.PlyExpected != st.Ply || in.UCI != mv.UCI) {
+				return reject(RejectGameOver, st.Ply), nil
+			}
 			return MoveOutcome{
 				Accepted:     true,
 				AppliedSeq:   mvSeq, // the move's REAL seq, not 0
@@ -191,6 +196,13 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 				ClockAfterMs: mv.ClockAfterMs,
 			}, nil
 		}
+	}
+	// Not a re-ack of a persisted ply: a game that is no longer live accepts no
+	// new move. (The idempotent re-ack above runs FIRST so a resend of the final
+	// already-persisted move, e.g. a mating move whose GameEnded committed with
+	// it in one batch, is re-acked rather than rejected GAME_OVER.)
+	if st.Phase != PhaseLive {
+		return reject(RejectGameOver, st.Ply), nil
 	}
 	if in.SeatIdx != st.TurnIdx {
 		return reject(RejectNotYourTurn, st.Ply), nil
@@ -248,18 +260,34 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 	// never dropped (NFR-2, §3.2). Single-writer-per-game makes a conflict rare
 	// today; the contract is in place for when multi-node writers land.
 	seq := uint32(len(events))
+	// A move that ends the game (mate / stalemate / insufficient / automatic
+	// draw) commits MovePlayed + GameEnded in ONE AppendBatch, so a crash or store
+	// outage cannot leave a half-terminal stream (issue #67; same atomicity as the
+	// flag path). A plain move keeps the single-event Append hot path.
+	var terminalBatch []Event
+	if verdict.Terminal != nil {
+		terminalBatch = []Event{ev, {Type: EvGameEnded, GameEnded: &GameEnded{
+			ResultVector: MoverResultVector(in.SeatIdx, *verdict.Terminal, st.seatCount()),
+			Termination:  *verdict.Terminal,
+		}}}
+	}
 	const maxSeqRetries = 8
 	for attempt := 0; ; attempt++ {
-		err := p.Store.Append(ctx, streamID, seq, ev)
+		var err error
+		if terminalBatch != nil {
+			err = p.Store.AppendBatch(ctx, streamID, seq, terminalBatch)
+		} else {
+			err = p.Store.Append(ctx, streamID, seq, ev)
+		}
 		if err == nil {
 			break
 		}
 		if !errors.Is(err, ErrSeqConflict) {
 			// A real persist failure after validation: do NOT ack (§5).
-			return MoveOutcome{}, fmt.Errorf("pipeline: persist: %w", err)
+			return MoveOutcome{}, fmt.Errorf("pipeline: persist: %w: %w", ErrPersist, err)
 		}
 		if attempt >= maxSeqRetries {
-			return MoveOutcome{}, fmt.Errorf("pipeline: persist: seq contention unresolved after %d retries: %w", maxSeqRetries, err)
+			return MoveOutcome{}, fmt.Errorf("pipeline: persist: seq contention unresolved after %d retries: %w: %w", maxSeqRetries, ErrPersist, err)
 		}
 		// Seq conflict — reconcile against the current head.
 		events, err = p.Store.Load(ctx, streamID)
@@ -305,6 +333,24 @@ func (p *Pipeline) SubmitMove(ctx context.Context, in MoveIntent) (MoveOutcome, 
 		NewZobrist:   verdict.NewZobrist,
 		Terminal:     verdict.Terminal,
 	}, nil
+}
+
+// MoverResultVector builds the result vector for a move-produced terminal. A
+// mate is a win for the mover; stalemate / insufficient / the automatic-draw
+// terminals are a draw for all seats.
+func MoverResultVector(mover uint8, term Termination, seatCount int) []Result {
+	rv := make([]Result, seatCount)
+	if term == TermMate {
+		for i := range rv {
+			rv[i] = ResultLoss
+		}
+		rv[mover] = ResultWin
+		return rv
+	}
+	for i := range rv {
+		rv[i] = ResultDraw
+	}
+	return rv
 }
 
 func reject(r RejectReason, serverPly uint32) MoveOutcome {

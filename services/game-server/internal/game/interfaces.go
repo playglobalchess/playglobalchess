@@ -18,6 +18,13 @@ import (
 // condition-check failure to this one sentinel.
 var ErrSeqConflict = errors.New("event store: seq already occupied")
 
+// ErrPersist marks a SubmitMove error that came from the durable append itself
+// (not from load, fold, or legality). Such a failure may be AMBIGUOUS: the store
+// can commit and still report an error (a timeout after the write), so a caller
+// holding a projection must treat its state as unverified and re-sync from the
+// stream. Wrapped alongside the store's own error.
+var ErrPersist = errors.New("pipeline: durable append failed (outcome may be ambiguous)")
+
 // This file defines the two external seams GS-1 depends on but does NOT
 // implement (SPEC-S2-GAME-SERVER §2c). Both are Go interfaces here; their real
 // implementations are later chunks. The move-pipeline decision logic (pipeline.go)

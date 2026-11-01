@@ -72,6 +72,12 @@ type Session struct {
 	// abortBeforePly is the exclusive ply ceiling under which Abort is allowed
 	// (GS-3b, Q-EG1); at or past it a quit is a resign, not an abort. Default 2.
 	abortBeforePly uint32
+	// stale is set when a durable-append failure may have left the projection
+	// behind the stream (an ambiguous commit), or a re-ack/desync shows the
+	// stream moved without us. The actor re-syncs (reconcileIfStale) before
+	// EVERY command; while that fails the command fails and nothing acts on the
+	// stale projection.
+	stale bool
 }
 
 // Config bundles a Session's dependencies. now may be nil (defaults to
@@ -170,6 +176,61 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 	return s, nil
 }
 
+// reconcileIfStale re-derives EVERY stream-derived projection field from the
+// durable stream with the same steps as NewSession (FoldWithEngine, then
+// finishIfHalfTerminal, then the lastMoveAt baseline from the last MovePlayed
+// ServerTS). It also clears a pending draw offer when the ply moved (any move
+// clears it on the live path). No-op when not stale; on error the session
+// stays stale and the caller must not act.
+//
+// Known divergence (same as NewSession): after a takeback the live path sets
+// lastMoveAt to now(), while a rebuild/reconcile takes the last MovePlayed's
+// ServerTS, which may belong to an undone move.
+func (s *Session) reconcileIfStale(ctx context.Context) error {
+	if !s.stale {
+		return nil
+	}
+	cfg := Config{GameID: s.gameID, Store: s.store, Oracle: s.oracle, Opts: s.opts}
+	events, err := s.store.Load(ctx, s.stream)
+	if err != nil {
+		return fmt.Errorf("session: reconcile load: %w", err)
+	}
+	st, err := game.FoldWithEngine(ctx, events, s.opts, s.oracle)
+	if err != nil {
+		return fmt.Errorf("session: reconcile fold: %w", err)
+	}
+	if st, err = finishIfHalfTerminal(ctx, cfg, events, st); err != nil {
+		return fmt.Errorf("session: reconcile half-terminal: %w", err)
+	}
+	if st.Ply != s.ply {
+		s.drawOfferBy = nil
+	}
+	s.curFEN = st.CurFEN
+	s.priorKeys = st.PriorKeys
+	s.clocks = st.Clock
+	s.phase = st.Phase
+	s.ply = st.Ply
+	s.turn = st.TurnIdx
+	s.ended = st.Phase == game.PhaseEnded
+	s.terminal = st.Termination
+	if ts, ok := lastMoveServerTS(events); ok {
+		s.lastMoveAt = time.UnixMilli(int64(ts))
+	}
+	s.stale = false
+	return nil
+}
+
+// endedTerminal returns the game's termination when it is over, else nil. A
+// re-ack carries it so the transport can deliver GAME_END for an ending whose
+// original broadcast may never have happened.
+func (s *Session) endedTerminal() *game.Termination {
+	if !s.ended {
+		return nil
+	}
+	t := s.terminal
+	return &t
+}
+
 // Run is the actor loop: it owns all Session state and serves commands until the
 // context is cancelled or Close() is called. Launch it in its own goroutine:
 //
@@ -213,6 +274,12 @@ func (s *Session) applyRecovered(ctx context.Context, cmd command) {
 			_ = r
 		}
 	}()
+	// Never act on a stale projection: re-sync it from the stream first. If that
+	// fails, fail the command (it stays stale; the next command retries).
+	if err := s.reconcileIfStale(ctx); err != nil {
+		cmd.fail(err)
+		return
+	}
 	cmd.apply(ctx, s)
 }
 
@@ -234,7 +301,19 @@ func (s *Session) Close() { s.closeOnce.Do(func() { close(s.quit) }) }
 // goroutine and may freely touch Session fields.
 type command interface {
 	apply(ctx context.Context, s *Session)
+	// fail completes the command WITHOUT running apply (the projection could not
+	// be re-synced): it records err and releases the waiting caller.
+	fail(err error)
 }
+
+func (c *submitCmd) fail(err error)     { c.err = err; close(c.done) }
+func (c *tickCmd) fail(err error)       { c.err = err; close(c.done) }
+func (c *snapCmd) fail(err error)       { c.err = err; close(c.done) }
+func (c *takebackCmd) fail(err error)   { c.err = err; close(c.done) }
+func (c *resignCmd) fail(err error)     { c.err = err; close(c.done) }
+func (c *abortCmd) fail(err error)      { c.err = err; close(c.done) }
+func (c *offerDrawCmd) fail(err error)  { c.err = err; close(c.done) }
+func (c *acceptDrawCmd) fail(err error) { c.err = err; close(c.done) }
 
 // dispatch sends a command to the actor and waits for it to run.
 //
