@@ -19,7 +19,7 @@ type Snapshot struct {
 	Ply         uint32
 	Turn        uint8
 	Phase       game.Phase
-	RemainingMs []int64 // per-seat clock remaining
+	RemainingMs []int64 // per-seat clock remaining AS OF the snapshot instant (side to move charged for think time, C9)
 	Ended       bool
 	Terminal    game.Termination // meaningful only when Ended
 }
@@ -239,6 +239,21 @@ func (c *snapCmd) apply(_ context.Context, s *Session) {
 	defer close(c.done)
 	rem := make([]int64, len(s.clocks.RemainingMs))
 	copy(rem, s.clocks.RemainingMs)
+	// SPEC-S4-WEB-F01 §3.3.1 C9: report the remaining time as of THIS instant,
+	// not as of the last move. The side to move is charged the think time since
+	// lastMoveAt (floored at 0); other seats are unchanged. Read-only: the real
+	// charge still happens on the next move or TickFlagCheck, so a snapshot never
+	// double-charges. Not after the game ended: time stops at GameEnded.
+	if !s.ended && int(s.turn) < len(rem) {
+		elapsedMs := s.now().Sub(s.lastMoveAt).Milliseconds()
+		if elapsedMs < 0 {
+			elapsedMs = 0
+		}
+		rem[s.turn] -= elapsedMs
+		if rem[s.turn] < 0 {
+			rem[s.turn] = 0
+		}
+	}
 	c.snap = Snapshot{
 		FEN:         s.curFEN,
 		Ply:         s.ply,
