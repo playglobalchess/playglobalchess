@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { GameSocket, type SocketLike } from "./GameSocket";
 import { encodeServerFrame, decodeClientFrame } from "../codec/seam";
 import type { ClientMsg, ServerMsg } from "../codec/messages";
@@ -110,8 +110,14 @@ describe("GameSocket (fake socket, real codec)", () => {
     const f = fakes[0]!;
     f.open();
     const before = received.length;
+    // Both ignored frames log a console.warn by design (GameSocket never lets a
+    // bad frame break the read loop); capture it so the expected trace does not
+    // pollute test output, and assert it really was logged.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     f.onmessage?.({ data: "not binary" }); // non-binary → ignored
     f.onmessage?.({ data: new Uint8Array([0xff]).buffer }); // garbage → decode throws → ignored
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
     expect(received.length).toBe(before);
     // The socket still works afterward.
     f.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
@@ -281,4 +287,48 @@ describe("GameSocket (fake socket, real codec)", () => {
     expect(sent.some((m) => "Authenticate" in m)).toBe(true); // AUTH re-sent
     expect(sent.some((m) => "Move" in m)).toBe(false); // stale MOVE dropped
   });
+
+  // --- reconnect() (SPEC-S4-WEB-F01 §3.4.1: the hook forces a fresh transport) ---
+
+  it("reconnect() drops the transport and reopens through the normal auth path", () => {
+    sock.connect();
+    const f1 = fakes[0]!;
+    f1.open();
+    sock.reconnect();
+    expect(fakes.length).toBe(2);
+    expect(f1.closed).toBe(true);
+    const f2 = fakes[1]!;
+    f2.open();
+    expect("Authenticate" in f2.decodeSent(0)).toBe(true); // re-AUTH, server then auto-pushes STATE
+    // The superseded transport can no longer call back into us.
+    const before = received.length;
+    f1.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+    expect(received.length).toBe(before);
+    f2.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+    expect(received.length).toBe(before + 1);
+  });
+
+  it("reconnect() while a backoff reconnect is pending opens exactly one transport", () => {
+    vi.useFakeTimers();
+    try {
+      sock.connect();
+      fakes[0]!.open();
+      fakes[0]!.onclose?.(); // drop -> backoff timer pending
+      sock.reconnect(); // opens now and cancels the pending timer
+      expect(fakes.length).toBe(2);
+      vi.advanceTimersByTime(60_000);
+      expect(fakes.length).toBe(2); // the cancelled backoff timer did not open a third
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconnect() after close() is a no-op", () => {
+    sock.connect();
+    fakes[0]!.open();
+    sock.close();
+    sock.reconnect();
+    expect(fakes.length).toBe(1);
+  });
 });
+

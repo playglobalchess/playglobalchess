@@ -71,7 +71,7 @@ export function parseFen(fen: string): Position {
 /**
  * Derive the authoritative half-move ply from a FEN. The server's STATE body
  * carries only {fen, turn, clocks} — NO ply — yet ply is exactly what a resync
- * must restore (SPEC-S4-WEB-F01 §3.4 / the needsResync seam). A FEN's 6th field
+ * must restore (SPEC-S4-WEB-F01 §3.4 / §3.4.1). A FEN's 6th field
  * is the full-move number (1-based, increments after Black's move); combined
  * with the side to move this fixes the half-move count:
  *
@@ -81,7 +81,9 @@ export function parseFen(fen: string): Position {
  * 1, White) ⇒ ply 0; after 1.e4 (fullmove 1, Black) ⇒ ply 1; after 1...e5
  * (fullmove 2, White) ⇒ ply 2. A missing/garbled move-number field falls back
  * to 1 (ply derived from side-to-move only) rather than throwing — a resync
- * should never crash the client.
+ * should never crash the client. That fallback can UNDER-restore ply, so callers
+ * that act on a server frame must check hasValidFullmove() and treat a false as
+ * "do not trust this ply" (the reducer raises trigger T5).
  */
 export function plyFromFen(fen: string): number {
   const parts = fen.split(/\s+/);
@@ -89,6 +91,13 @@ export function plyFromFen(fen: string): number {
   const fullmoveRaw = Number(parts[5]);
   const fullmove = Number.isFinite(fullmoveRaw) && fullmoveRaw >= 1 ? Math.floor(fullmoveRaw) : 1;
   return (fullmove - 1) * 2 + (turnField === "b" ? 1 : 0);
+}
+
+/** True when the FEN's 6th field is a well-formed full-move number (integer >= 1),
+ * i.e. plyFromFen did NOT have to fall back. */
+export function hasValidFullmove(fen: string): boolean {
+  const raw = fen.split(/\s+/)[5];
+  return raw != null && /^[1-9][0-9]*$/.test(raw);
 }
 
 /**

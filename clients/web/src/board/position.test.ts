@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseFen, applyUci, squareToIndex, plyFromFen } from "./position";
+import { parseFen, applyUci, squareToIndex, plyFromFen, hasValidFullmove } from "./position";
 
 function at(fen: string, uci: string, sq: string): string | null {
   const pos = applyUci(parseFen(fen), uci);
@@ -90,5 +90,15 @@ describe("plyFromFen (resync ply recovery — STATE carries no ply)", () => {
   it("a missing/garbled move-number field falls back to fullmove 1 (ply from side only)", () => {
     expect(plyFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b")).toBe(1);
     expect(plyFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w")).toBe(0);
+  });
+  it("hasValidFullmove flags the fallback cases (#71.4)", () => {
+    const base = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -";
+    expect(hasValidFullmove(`${base} 0 1`)).toBe(true);
+    expect(hasValidFullmove(`${base} 2 57`)).toBe(true);
+    expect(hasValidFullmove(base)).toBe(false); // field absent
+    expect(hasValidFullmove(`${base} 0 x`)).toBe(false); // garbled
+    expect(hasValidFullmove(`${base} 0 0`)).toBe(false); // < 1
+    expect(hasValidFullmove(`${base} 0 -3`)).toBe(false);
+    expect(hasValidFullmove(`${base} 0 1.5`)).toBe(false);
   });
 });

@@ -10,7 +10,8 @@
 // resync). The one exception is the OPTIMISTIC local move, which is immediately
 // REVERTED if the server rejects it (§3.3).
 
-import { type Position, parseFen, applyUci, plyFromFen } from "../board/position";
+import { type Position, parseFen, applyUci, plyFromFen, hasValidFullmove } from "../board/position";
+import { SYNC_MAX_ATTEMPTS, SYNC_MAX_CYCLES } from "./recovery";
 import {
   type ServerMsg,
   type ReasonCode,
@@ -31,6 +32,33 @@ export interface DrawOffer {
   by: number;
 }
 
+/** Recovery phase (SPEC-S4-WEB-F01 §3.4.1 table S). */
+export type SyncPhase = "IN_SYNC" | "SYNCING" | "RECONNECTING" | "FAILED";
+
+/** Which detection trigger started the current recovery episode (§3.4.1 T1-T5). */
+export type SyncTrigger = "T1_GAP" | "T2_MISMATCH" | "T3_UNAPPLIABLE" | "T4_STALE" | "T5_INCONSISTENT";
+
+/** Recovery state. OWNER: the reducer holds and transitions it (pure); useGame
+ * reads it to drive every timer and every send. */
+export interface SyncState {
+  phase: SyncPhase;
+  /** SYNCING attempt n, 1..N (0 while IN_SYNC). */
+  attempt: number;
+  /** RECONNECTING cycle k, 1..K (0 outside RECONNECTING/FAILED). */
+  cycle: number;
+  /** Raise sequence: bumps on every episode start and every new attempt/cycle.
+   * useGame keys its once-per-attempt RESYNC guard on (socket, gameId, seq). */
+  seq: number;
+  /** "await_reply": the current attempt waits for a STATE (useGame arms T_reply
+   * while connected). "backoff": the attempt failed; useGame waits B*2^(n-1)
+   * and then dispatches syncBackoffElapsed. */
+  step: "await_reply" | "backoff";
+  /** The trigger that started the episode (kept in FAILED for the error log). */
+  trigger: SyncTrigger | null;
+}
+
+export const IN_SYNC: SyncState = { phase: "IN_SYNC", attempt: 0, cycle: 0, seq: 0, step: "await_reply", trigger: null };
+
 export interface GameState {
   phase: Phase;
   gameId: string | null;
@@ -49,9 +77,9 @@ export interface GameState {
   result: { termination: TerminationCode; resultVector: number[] } | null;
   /** Last MOVE_REJECTED reason, for the UI to surface; cleared on the next accepted move. */
   lastReject: ReasonCode | null;
-  /** Set when the reducer detects a ply gap (a MOVE_ACCEPTED skipped ahead): the
-   * GameSocket reads this and sends RESYNC to pull a fresh STATE. Cleared by STATE. */
-  needsResync: boolean;
+  /** Consistency/recovery state (§3.4.1). The reducer detects and transitions;
+   * useGame owns the timers and the RESYNC/reconnect sends. */
+  sync: SyncState;
   /** A protocol/transport Error the UI must surface (e.g. UNSUPPORTED_VERSION →
    * "please refresh"). null when there is no active error. */
   error: ErrorCodeValue | null;
@@ -72,7 +100,7 @@ export const initialState: GameState = {
   drawOffer: null,
   result: null,
   lastReject: null,
-  needsResync: false,
+  sync: IN_SYNC,
   error: null,
   lastMove: null,
 };
@@ -80,18 +108,65 @@ export const initialState: GameState = {
 export type Action =
   | { kind: "seek" } // user clicked Play
   | { kind: "localMove"; uci: string } // user made a board move (optimistic)
-  | { kind: "server"; msg: ServerMsg }; // a decoded ServerMsg arrived
+  | { kind: "server"; msg: ServerMsg } // a decoded ServerMsg arrived
+  // Timer-driven recovery actions. useGame owns the timers; the reducer only
+  // transitions. Each carries the raise seq it was armed for so a stale timer
+  // (one that raced a STATE or a newer attempt) is a no-op.
+  | { kind: "syncReplyTimeout"; seq: number } // T_reply elapsed with no STATE
+  | { kind: "syncBackoffElapsed"; seq: number }; // backoff after a failed attempt elapsed
+
+/** A server FEN frame is trustworthy only if its side-to-move agrees with the
+ * wire turn (u8, 0 = white) and its move-number is well-formed (T5). */
+function frameConsistent(fen: string, wireTurn: number, position: Position): boolean {
+  return position.turn === (wireTurn === 0 ? "w" : "b") && hasValidFullmove(fen);
+}
+
+/** Start a recovery episode (T1-T5). Only for a live game, only from IN_SYNC:
+ * a trigger during SYNCING/RECONNECTING is coalesced (recovery is already in
+ * progress) and FAILED is terminal. */
+function raise(state: GameState, trigger: SyncTrigger): GameState {
+  if (state.phase !== "playing" || state.sync.phase !== "IN_SYNC") return state;
+  return {
+    ...state,
+    sync: { phase: "SYNCING", attempt: 1, cycle: 0, seq: state.sync.seq + 1, step: "await_reply", trigger },
+  };
+}
+
+/** The current attempt/cycle got no consistent STATE (timeout or inconsistent
+ * reply). SYNCING(n<N) -> backoff; SYNCING(N) -> RECONNECTING(1);
+ * RECONNECTING(k<K) -> RECONNECTING(k+1); RECONNECTING(K) -> FAILED. */
+function failAttempt(sync: SyncState): SyncState {
+  if (sync.phase === "SYNCING") {
+    if (sync.attempt < SYNC_MAX_ATTEMPTS) return { ...sync, step: "backoff" };
+    return { ...sync, phase: "RECONNECTING", cycle: 1, seq: sync.seq + 1, step: "await_reply" };
+  }
+  if (sync.phase === "RECONNECTING") {
+    if (sync.cycle < SYNC_MAX_CYCLES) return { ...sync, cycle: sync.cycle + 1, seq: sync.seq + 1, step: "await_reply" };
+    return { ...sync, phase: "FAILED" };
+  }
+  return sync;
+}
+
+function recovering(sync: SyncState): boolean {
+  return sync.phase === "SYNCING" || sync.phase === "RECONNECTING";
+}
 
 /** Pure reducer. */
 export function reduce(state: GameState, action: Action): GameState {
   switch (action.kind) {
     case "seek":
-      return { ...initialState, phase: "seeking" };
+      return { ...initialState, sync: { ...IN_SYNC, seq: state.sync.seq }, phase: "seeking" };
 
     case "localMove": {
       // Optimistic: show the move now, remember how to revert. Only legal while
       // playing, it's our turn, and no move is already pending.
-      if (state.phase !== "playing" || state.position == null || state.pendingMove != null) {
+      // Also read-only while recovering (§3.4.1): the board is not trustworthy.
+      if (
+        state.phase !== "playing" ||
+        state.position == null ||
+        state.pendingMove != null ||
+        state.sync.phase !== "IN_SYNC"
+      ) {
         return state;
       }
       // Defense in depth: only apply optimistically on OUR turn. seat 0 = white,
@@ -124,6 +199,17 @@ export function reduce(state: GameState, action: Action): GameState {
 
     case "server":
       return reduceServer(state, action.msg);
+
+    case "syncReplyTimeout":
+      if (!recovering(state.sync) || state.sync.step !== "await_reply" || action.seq !== state.sync.seq) return state;
+      return { ...state, sync: failAttempt(state.sync) };
+
+    case "syncBackoffElapsed":
+      if (state.sync.phase !== "SYNCING" || state.sync.step !== "backoff" || action.seq !== state.sync.seq) return state;
+      return {
+        ...state,
+        sync: { ...state.sync, attempt: state.sync.attempt + 1, seq: state.sync.seq + 1, step: "await_reply" },
+      };
   }
 }
 
@@ -132,22 +218,33 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
   switch (tag) {
     case "Matched": {
       const m = (msg as { Matched: { game_id: string; seat_idx: number; opponent: string; start_state: { fen: string; turn: number; clocks: number[] } } }).Matched;
-      return {
+      const startPos = parseFen(m.start_state.fen);
+      // §3.4.1: MATCHED for a different game resets recovery to IN_SYNC; T5 then
+      // applies to its start_state. (Same game id: recovery state is kept.)
+      const sync = m.game_id === state.gameId ? state.sync : { ...IN_SYNC, seq: state.sync.seq };
+      const next: GameState = {
         ...initialState,
+        sync,
         phase: "playing",
         gameId: m.game_id,
         mySeat: m.seat_idx,
         opponent: m.opponent,
-        position: parseFen(m.start_state.fen),
+        position: startPos,
         ply: plyFromFen(m.start_state.fen),
         clocks: m.start_state.clocks.slice(),
       };
+      return frameConsistent(m.start_state.fen, m.start_state.turn, startPos) ? next : raise(next, "T5_INCONSISTENT");
     }
 
     case "MoveAccepted": {
       const a = (msg as { MoveAccepted: { game_id: string; ply: number; uci: string; clock_after_ms: number } }).MoveAccepted;
       // §4A v1.2: carries the authoritative uci and is sent to BOTH seats.
       if (state.position == null) return state;
+
+      // §3.4.1: while SYNCING/RECONNECTING (or FAILED) a MOVE_ACCEPTED that
+      // arrives before the awaited STATE is not applied: the stream is ordered
+      // and that STATE already folds it. Frames after the STATE apply normally.
+      if (state.sync.phase !== "IN_SYNC") return state;
 
       // BASE = the board BEFORE any optimistic move. We always reconcile against
       // the server from this base, never on top of an un-confirmed optimistic
@@ -157,19 +254,13 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       const base = state.pendingMove != null ? state.pendingMove.prevPosition : state.position;
       const basePly = state.pendingMove != null ? state.pendingMove.prevPly : state.ply;
 
-      // Ply-contiguity / idempotency guard. a.ply is the ply AFTER the move, so
-      // a fresh move advances basePly by exactly one. Anything else is a
-      // duplicate (replay / at-least-once delivery) or an out-of-order/gap frame
-      // — do NOT apply it a second time (that corrupts the board) and do NOT
-      // jump the ply. A gap flips needsResync so the socket can request STATE.
-      if (a.ply !== basePly + 1) {
-        // Clear a now-moot pending move (it was superseded or already applied),
-        // and ask for a resync when we are behind (a gap), not on a stale replay.
-        return {
-          ...state,
-          pendingMove: null,
-          needsResync: a.ply > basePly + 1 ? true : state.needsResync,
-        };
+      // T1 gap: the stream skipped ahead.
+      if (a.ply > basePly + 1) return raise(state, "T1_GAP");
+      // T2 mismatch: at or behind local. The ONE exact match (same ply AND the
+      // last applied move) is a duplicate and is ignored silently.
+      if (a.ply <= basePly) {
+        const duplicate = a.ply === basePly && state.lastMove != null && state.lastMove.uci === a.uci;
+        return duplicate ? state : raise(state, "T2_MISMATCH");
       }
 
       // Apply exactly ONE authoritative move onto the base position.
@@ -177,14 +268,13 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       try {
         position = applyUci(base, a.uci);
       } catch {
-        // A server-accepted move that we cannot apply mechanically should never
-        // happen; ask for a resync rather than show a wrong board.
-        return { ...state, pendingMove: null, needsResync: true };
+        // T3 unappliable: a server-accepted move the binding cannot apply.
+        return raise(state, "T3_UNAPPLIABLE");
       }
 
       // Mover seat from PLY PARITY (race-proof, independent of board state):
-      // ply 1 = white's first move, so odd ply ⇒ white (seat 0) just moved.
-      // Seat↔color: seat 0 = white, seat 1 = black (§4A.8 v1 2-seat).
+      // ply 1 = white's first move, so odd ply => white (seat 0) just moved.
+      // Seat/color: seat 0 = white, seat 1 = black (§4A.8 v1 2-seat).
       const clocks = state.clocks.slice();
       const moverSeat = a.ply % 2 === 1 ? 0 : 1;
       if (moverSeat < clocks.length) {
@@ -203,43 +293,52 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
 
     case "MoveRejected": {
       const r = (msg as { MoveRejected: { game_id: string; ply_expected: number; reason: ReasonCode } }).MoveRejected;
-      // A StalePly reject is precisely the signal that our ply is behind the
-      // server — raise needsResync so the hook pulls a fresh STATE (which
-      // restores ply). Without this, a reject with no pending move leaves us
-      // wedged at a stale ply with no recovery trigger.
-      const stale = r.reason === Reason.StalePly;
       // Revert the optimistic move if one is pending.
-      if (state.pendingMove != null) {
-        return {
-          ...state,
-          position: state.pendingMove.prevPosition,
-          ply: state.pendingMove.prevPly,
-          pendingMove: null,
-          lastReject: r.reason,
-          needsResync: stale ? true : state.needsResync,
-        };
-      }
-      return { ...state, lastReject: r.reason, needsResync: stale ? true : state.needsResync };
+      const reverted: GameState =
+        state.pendingMove != null
+          ? {
+              ...state,
+              position: state.pendingMove.prevPosition,
+              ply: state.pendingMove.prevPly,
+              pendingMove: null,
+              lastReject: r.reason,
+            }
+          : { ...state, lastReject: r.reason };
+      // T4 stale: STALE_PLY means our ply is behind the server.
+      return r.reason === Reason.StalePly ? raise(reverted, "T4_STALE") : reverted;
     }
 
     case "State": {
       // Authoritative resync: rebuild the board from the FEN fold. Drops any
       // optimistic/pending state — the server's STATE is the truth.
       const s = (msg as { State: { game_id: string; state: { fen: string; turn: number; clocks: number[] } } }).State;
+      const position = parseFen(s.state.fen);
+      if (!frameConsistent(s.state.fen, s.state.turn, position)) {
+        // T5: not trusted, never applied. From IN_SYNC it starts an episode;
+        // as the reply to an outstanding attempt it fails that attempt (the
+        // next one runs after backoff, or the next cycle). During backoff/FAILED
+        // there is no outstanding attempt, so it is simply dropped.
+        if (state.phase !== "playing") return state;
+        if (state.sync.phase === "IN_SYNC") return raise(state, "T5_INCONSISTENT");
+        if (recovering(state.sync) && state.sync.step === "await_reply") {
+          return { ...state, sync: failAttempt(state.sync) };
+        }
+        return state;
+      }
+      // A consistent STATE is ALWAYS authoritative — including a LOWER ply than
+      // local (Takeback: ply is not monotonic) and from FAILED. Resets counters.
       return {
         ...state,
         phase: state.phase === "game_over" ? "game_over" : "playing",
         gameId: s.game_id,
-        position: parseFen(s.state.fen),
+        position,
         // CRITICAL: restore ply from the FEN. StateBody carries no ply, but ply
         // is exactly what a gap desynchronized — if we leave it stale, the next
-        // MOVE sends ply_expected = stale+1 and the server rejects it StalePly
-        // forever (the resync would "succeed" visually yet wedge the player).
+        // MOVE sends ply_expected = stale+1 and the server rejects it StalePly.
         ply: plyFromFen(s.state.fen),
         clocks: s.state.clocks.slice(),
         pendingMove: null,
-        needsResync: false,
-        // A fresh authoritative STATE means the connection is healthy again.
+        sync: { ...IN_SYNC, seq: state.sync.seq },
         lastReject: null,
         // A fold has no meaningful "most recent move" — clear it so the
         // screen-reader announcement does not re-read a stale pre-resync move.
@@ -248,18 +347,21 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
     }
 
     case "DrawOffered": {
+      // Shown in every recovery phase (§3.4.1).
       const d = (msg as { DrawOffered: { game_id: string; by: number } }).DrawOffered;
       return { ...state, drawOffer: { by: d.by } };
     }
 
     case "GameEnd": {
+      // Applied immediately in every phase and ends recovery (§3.4.1): the
+      // result is authoritative and needs no position.
       const g = (msg as { GameEnd: { game_id: string; result_vector: number[]; termination: TerminationCode; rating_delta: number[] } }).GameEnd;
       return {
         ...state,
         phase: "game_over",
         pendingMove: null,
         drawOffer: null,
-        needsResync: false,
+        sync: { ...IN_SYNC, seq: state.sync.seq },
         lastReject: null,
         result: { termination: g.termination, resultVector: g.result_vector.slice() },
       };

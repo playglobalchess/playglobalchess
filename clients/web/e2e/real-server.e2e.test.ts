@@ -19,7 +19,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { GameSocket } from "../src/net/GameSocket";
+import { GameSocket, type ConnStatus, type SocketLike } from "../src/net/GameSocket";
+import { reduce, initialState, type GameState } from "../src/game/reducer";
 import type { ServerMsg } from "../src/codec/messages";
 import { DEV_POOL, DEV_TIME_CONTROL } from "../src/devConfig";
 
@@ -108,6 +109,46 @@ const isMatched = (m: ServerMsg): m is Extract<ServerMsg, { Matched: unknown }> 
 const isMoveAccepted = (m: ServerMsg): m is Extract<ServerMsg, { MoveAccepted: unknown }> =>
   "MoveAccepted" in m;
 const isGameEnd = (m: ServerMsg): m is Extract<ServerMsg, { GameEnd: unknown }> => "GameEnd" in m;
+
+/** A client that feeds the production GameSocket into the production reducer (as
+ * useGame does) and can drop its transport, to prove recovery against the real
+ * server (SPEC-S4-WEB-F01 §3.4.1 / §6). */
+class StatefulClient {
+  readonly sock: GameSocket;
+  state: GameState = initialState;
+  status: ConnStatus = "connecting";
+  private raw: SocketLike | null = null;
+  constructor(token: string) {
+    this.sock = new GameSocket({
+      url: WS_URL,
+      token,
+      factory: (url) => {
+        const ws = new WebSocket(url) as unknown as SocketLike;
+        this.raw = ws;
+        return ws;
+      },
+      onServerMsg: (msg) => {
+        this.state = reduce(this.state, { kind: "server", msg });
+      },
+      onStatus: (s) => {
+        this.status = s;
+      },
+    });
+  }
+  /** Drop the live transport as a network failure would (GameSocket reconnects). */
+  dropTransport(): void {
+    this.raw?.close();
+  }
+  async until(pred: (s: GameState, status: ConnStatus) => boolean, ms = 8000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!pred(this.state, this.status)) {
+      if (Date.now() > deadline) {
+        throw new Error(`timed out; ply=${this.state.ply} sync=${this.state.sync.phase} status=${this.status}`);
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+}
 
 d("real-server e2e (web client <-> Go game-server)", () => {
   beforeAll(async () => {
@@ -227,4 +268,51 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     white.close();
     black.close();
   }, 20_000);
+
+  it("a socket drop mid-game recovers to the server position and play continues (§3.4.1)", async () => {
+    const a = new StatefulClient("erin");
+    const b = new StatefulClient("frank");
+    a.sock.connect();
+    b.sock.connect();
+    a.sock.seek(DEV_POOL, DEV_TIME_CONTROL, false);
+    await new Promise((r) => setTimeout(r, 50));
+    b.sock.seek(DEV_POOL, DEV_TIME_CONTROL, false);
+    await a.until((s) => s.phase === "playing");
+    await b.until((s) => s.phase === "playing");
+    const gameId = a.state.gameId!;
+    expect(b.state.gameId).toBe(gameId);
+    expect(seenGameIds.has(gameId)).toBe(false);
+    seenGameIds.add(gameId);
+
+    const white = a.state.mySeat === 0 ? a : b;
+    const black = white === a ? b : a;
+
+    white.sock.move(gameId, 1, "e2e4");
+    await white.until((s) => s.ply === 1);
+    await black.until((s) => s.ply === 1);
+
+    // White's transport drops. While it is down Black plays ply 2, which White
+    // therefore misses; only the server's auto-STATE on re-AUTH can repair that.
+    white.dropTransport();
+    await white.until((_s, status) => status === "disconnected");
+    black.sock.move(gameId, 2, "e7e5");
+    await black.until((s) => s.ply === 2);
+
+    // GameSocket reconnects + re-AUTHs; the server pushes STATE (Option A).
+    await white.until((s, status) => status === "connected" && s.ply === 2);
+    expect(white.state.sync.phase).toBe("IN_SYNC");
+    expect(white.state.position?.board).toEqual(black.state.position?.board);
+    expect(white.state.position?.turn).toBe(black.state.position?.turn);
+
+    // Play continues from the recovered position.
+    white.sock.move(gameId, 3, "g1f3");
+    await white.until((s) => s.ply === 3);
+    await black.until((s) => s.ply === 3);
+    expect(white.state.position?.board).toEqual(black.state.position?.board);
+    expect(white.state.sync.phase).toBe("IN_SYNC");
+    expect(black.state.sync.phase).toBe("IN_SYNC");
+
+    white.sock.close();
+    black.sock.close();
+  }, 25_000);
 });

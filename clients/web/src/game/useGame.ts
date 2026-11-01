@@ -2,33 +2,41 @@
 // (truth), and nothing else. It is the ONE place the two load-bearing units
 // meet, so it is deliberately thin and side-effect-disciplined:
 //
-//   • It owns the reducer state via useReducer(reduce, initialState).
-//   • It constructs ONE GameSocket whose onServerMsg dispatches {kind:"server"}
+//   • It owns the reducer state as a synchronously-updated store: every action
+//     goes through apply(), which runs the pure reduce() on a ref-held state
+//     and publishes the result to React. The ref is therefore never behind the
+//     reducer, so a decision made from it (move gating) cannot lag a render.
+//   • It constructs ONE GameSocket whose onServerMsg applies {kind:"server"}
 //     into the reducer — the socket feeds the reducer, never the other way.
-//   • It wires the step-4 DEFERRED seam: when the reducer sets needsResync
-//     (a ply gap it detected), this hook calls sock.resync(gameId). GameSocket
-//     never observes reducer output itself (§ its own doc); that observation
-//     lives here, because only this layer sees both the state and the socket.
+//   • It OWNS the recovery policy's I/O (SPEC-S4-WEB-F01 §3.4.1): every timer
+//     (T_reply, backoff), every RESYNC send, the forced GameSocket.reconnect(),
+//     and the terminal error log. The reducer (pure) detects triggers and holds
+//     sync.phase/attempt/cycle/seq; GameSocket is transport only. This hook is
+//     the ONLY layer that sends RESYNC.
 //   • It exposes a small command surface (connect/seek/move/resign/offerDraw/
 //     acceptDraw) the UI calls — each of which is a socket send plus, for a
-//     local move, the optimistic reducer dispatch.
+//     local move, the optimistic reducer action.
 //
 // Correctness notes that an independent reviewer should check:
 //   - The GameSocket is created ONCE (useRef + an effect that connects on mount
-//     and close()s on unmount), NOT re-created per render — a per-render socket
-//     would reconnect-storm. React 19 StrictMode double-invokes effects in dev;
-//     the effect's cleanup close() + GameSocket.connect()'s own teardown make
-//     the double-mount safe.
-//   - needsResync is consumed exactly once per raised edge: after calling
-//     resync() we must not call it again until the reducer clears the flag
-//     (STATE clears it). We dispatch nothing to clear it from here — STATE does
-//     — so we guard on the flag transition with a ref, not on every render.
-//   - move() applies the optimistic reducer dispatch BEFORE the socket send is
-//     irrelevant to ordering (both are local), but we send with ply+1 computed
-//     from the CURRENT reducer ply, read at call time, not from a stale closure.
+//     and close()s on unmount), NOT re-created per render.
+//   - T_reply is armed only while the React `status` is "connected" and is
+//     cleared by that effect's cleanup whenever status or the connection epoch
+//     changes, so an outage (including the new transport opened by reconnect())
+//     pauses it. A timer armed in the one commit where `status` still lags is
+//     cleared by the very next render.
+//   - move() asks the REDUCER (not a mirror, not its own copy of the rules)
+//     whether the move is accepted: it runs reduce(localMove) and sends only if
+//     that produced a pending optimistic move. A trigger and a move in the same
+//     commit therefore cannot both win: the trigger is applied first, the
+//     reducer then refuses the move while recovering (§3.4.1).
+//   - The once-per-attempt RESYNC is keyed by the effect's own dependencies:
+//     (connection epoch, game id, raise seq). The epoch bumps on every
+//     (re)connect, so a drop and reconnect inside one React batch still re-sends.
 
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { reduce, initialState, type GameState } from "./reducer";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { reduce, initialState, type Action, type GameState } from "./reducer";
+import { SYNC_REPLY_TIMEOUT_MS, syncBackoffMs } from "./recovery";
 import {
   GameSocket,
   type ConnStatus,
@@ -63,29 +71,24 @@ export interface UseGameResult {
  * Connects on mount, closes on unmount.
  */
 export function useGame(opts: UseGameOptions): UseGameResult {
-  const [state, dispatch] = useReducer(reduce, initialState);
+  // The synchronous store (see header). stateRef is the single source of truth;
+  // React state only republishes it for rendering.
+  const [state, setState] = useState<GameState>(initialState);
+  const stateRef = useRef<GameState>(initialState);
+  const apply = useCallback((action: Action): GameState => {
+    const next = reduce(stateRef.current, action);
+    stateRef.current = next;
+    setState(next);
+    return next;
+  }, []);
 
   // The socket is a stable instance across renders. useRef (not useState) so
-  // mutating it never triggers a render; it is created lazily on first mount.
+  // mutating it never triggers a render.
   const sockRef = useRef<GameSocket | null>(null);
-  // A plain React state slot for the connection status line.
   const [status, setStatus] = useStatus();
-
-  // Keep the latest reducer state readable from stable callbacks WITHOUT
-  // re-creating them each render (which would re-run the connect effect). The
-  // ref mirrors `state` after each commit (in an effect, never during render —
-  // reading/writing a ref during render is a React anti-pattern); callbacks
-  // read sockRef/stateRef, so their identity is stable and the mount effect
-  // runs exactly once.
-  const stateRef = useRef(state);
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
-
-  // Guards the once-per-edge resync: true while we have already asked for a
-  // resync and are waiting for the clearing STATE. Prevents re-sending RESYNC
-  // on every render while needsResync is still set.
-  const resyncInFlight = useRef(false);
+  // Bumps on every transition to "connected": part of the RESYNC key, so a new
+  // connection is a new key space even if React batches away the status change.
+  const [connEpoch, setConnEpoch] = useState(0);
 
   // --- construct + connect the socket exactly once (mount) -----------------
   useEffect(() => {
@@ -95,8 +98,11 @@ export function useGame(opts: UseGameOptions): UseGameResult {
       // Only include `factory` when provided — exactOptionalPropertyTypes
       // forbids passing an explicit `undefined` to an optional field.
       ...(opts.factory != null ? { factory: opts.factory } : {}),
-      onServerMsg: (msg: ServerMsg) => dispatch({ kind: "server", msg }),
-      onStatus: (s) => setStatus(s),
+      onServerMsg: (msg: ServerMsg) => apply({ kind: "server", msg }),
+      onStatus: (s) => {
+        if (s === "connected") setConnEpoch((n) => n + 1);
+        setStatus(s);
+      },
     });
     sockRef.current = sock;
     // DEFER the connect by a tick in the REAL-WebSocket path. React StrictMode
@@ -127,54 +133,76 @@ export function useGame(opts: UseGameOptions): UseGameResult {
       sockRef.current = null;
     };
     // url/token/factory identify the connection; changing them re-connects.
-  }, [opts.url, opts.token, opts.factory, setStatus]);
+  }, [opts.url, opts.token, opts.factory, setStatus, apply]);
 
-  // --- wire the deferred needsResync → resync seam -------------------------
-  // When the reducer raises needsResync (a ply gap), ask the server for a fresh
-  // STATE exactly once. STATE clears needsResync, which drops resyncInFlight so
-  // a LATER gap can resync again.
+  // --- recovery driver (§3.4.1) ---------------------------------------------
+  // OWNER: this hook (timers + sends). The reducer only transitions.
+  const { phase: syncPhase, step: syncStep, attempt: syncAttempt, seq: syncSeq } = state.sync;
+  const gameId = state.gameId;
+  const recovering = syncPhase === "SYNCING" || syncPhase === "RECONNECTING";
+
+  // RECONNECTING(k): force a fresh transport once per cycle (this effect re-runs
+  // only when phase/step/seq change, and seq is new for every cycle).
   useEffect(() => {
-    const sock = sockRef.current;
-    if (state.needsResync && state.gameId != null && sock != null) {
-      if (!resyncInFlight.current) {
-        resyncInFlight.current = true;
-        sock.resync(state.gameId);
-      }
-    } else if (!state.needsResync) {
-      // Flag cleared (by STATE) — re-arm for the next gap.
-      resyncInFlight.current = false;
-    }
-  }, [state.needsResync, state.gameId]);
+    if (syncPhase !== "RECONNECTING" || syncStep !== "await_reply") return;
+    sockRef.current?.reconnect();
+  }, [syncPhase, syncStep, syncSeq]);
+
+  // await_reply: T_reply runs ONLY while connected (an outage pauses recovery
+  // and consumes neither N nor K). In SYNCING send exactly one RESYNC per
+  // attempt per connection; in RECONNECTING the server's auto-STATE after
+  // re-AUTH is the reply, so nothing is sent.
+  useEffect(() => {
+    if (!recovering || syncStep !== "await_reply" || gameId == null) return;
+    if (status !== "connected") return;
+    // The key (epoch, game, seq) is this effect's dependency list: it runs once
+    // per attempt per connection. Leaving "connected" only runs the cleanup and
+    // returns above, so the next connection (new epoch) sends again (#69).
+    if (syncPhase === "SYNCING") sockRef.current?.resync(gameId);
+    const timer = setTimeout(
+      () => apply({ kind: "syncReplyTimeout", seq: syncSeq }),
+      SYNC_REPLY_TIMEOUT_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [recovering, syncPhase, syncStep, syncSeq, gameId, status, connEpoch, apply]);
+
+  // backoff after a failed SYNCING attempt n: B * 2^(n-1), then the next attempt.
+  useEffect(() => {
+    if (syncPhase !== "SYNCING" || syncStep !== "backoff") return;
+    const timer = setTimeout(
+      () => apply({ kind: "syncBackoffElapsed", seq: syncSeq }),
+      syncBackoffMs(syncAttempt),
+    );
+    return () => clearTimeout(timer);
+  }, [syncPhase, syncStep, syncAttempt, syncSeq, apply]);
+
+  // FAILED: send nothing more; log ONE client error with the game id and the
+  // trigger that started the episode (console until the X-14 sink exists).
+  const failedTrigger = state.sync.trigger;
+  useEffect(() => {
+    if (syncPhase !== "FAILED") return;
+    console.error("web: game recovery exhausted (FAILED)", { gameId, trigger: failedTrigger });
+  }, [syncPhase, gameId, failedTrigger]);
 
   // --- command surface the UI calls ----------------------------------------
   const seek = useCallback((poolId: string, timeControl: string, rated: boolean) => {
     sockRef.current?.seek(poolId, timeControl, rated);
-    dispatch({ kind: "seek" });
-  }, []);
+    apply({ kind: "seek" });
+  }, [apply]);
 
   const move = useCallback((uci: string) => {
-    const s = stateRef.current;
-    if (s.phase !== "playing" || s.gameId == null || s.position == null) return;
-    // Enforce the reducer's OWN preconditions here, not just in the view: a MOVE
-    // frame must never go to the wire without a corresponding optimistic apply.
-    //  - a move is already pending (awaiting accept/reject) → the reducer would
-    //    drop the localMove, so sending another frame risks two frames with the
-    //    same ply_expected. Refuse.
-    //  - it is not our turn → the reducer drops the localMove; a send would only
-    //    earn a NOT_YOUR_TURN reject. Refuse.
-    // This closes the double-send/off-turn window the view's board gate also
-    // guards, so a direct commands.move() cannot bypass the contract.
-    if (s.pendingMove != null) return;
-    const myTurn =
-      (s.mySeat === 0 && s.position.turn === "w") ||
-      (s.mySeat === 1 && s.position.turn === "b");
-    if (!myTurn) return;
-    // Optimistic local apply, then the send with ply+1 from the CURRENT reducer
-    // ply (read at call time — move() runs in a click handler, after the mirror
-    // effect has committed the latest state).
-    dispatch({ kind: "localMove", uci });
-    sockRef.current?.move(s.gameId, s.ply + 1, uci);
-  }, []);
+    // The REDUCER decides (§3.4.1 clarification): run the local move through it
+    // and send only if it produced a pending optimistic move. Its guards cover
+    // phase, pending move, turn, malformed uci and recovery (SYNCING,
+    // RECONNECTING, FAILED). stateRef is updated synchronously by apply(), so a
+    // trigger earlier in the same commit has already been applied here.
+    const before = stateRef.current;
+    if (before.gameId == null) return;
+    const after = apply({ kind: "localMove", uci });
+    // The reducer returns the SAME state object when it refuses a move.
+    if (after === before || after.pendingMove == null) return;
+    sockRef.current?.move(before.gameId, after.pendingMove.prevPly + 1, uci);
+  }, [apply]);
 
   const resign = useCallback(() => {
     const s = stateRef.current;

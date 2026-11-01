@@ -10,12 +10,10 @@
 //
 // Reconnection (§3.4): on close, it reconnects, re-sends AUTHENTICATE (the
 // server auto-pushes STATE, Option A), and re-sends SEEK only if we had not yet
-// matched. GameSocket exposes resync() but does NOT itself observe the reducer's
-// needsResync flag — it never reads reducer output. Wiring "reducer flags a ply
-// gap → call sock.resync(gameId)" belongs to the React layer (step 5), which
-// owns both the dispatch into the reducer and the resulting state. The primary
-// resync path (auto-STATE on re-AUTHENTICATE) is handled here; resync() is the
-// secondary on-demand path the UI layer drives.
+// matched. GameSocket exposes resync() and reconnect() but never decides to
+// call them and never reads reducer output: the recovery policy (§3.4.1) is
+// detected in the reducer and driven, timers and sends included, by useGame.
+// The primary resync path (auto-STATE on re-AUTHENTICATE) is handled here.
 
 import { encode, decode } from "../codec/seam";
 import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
@@ -234,13 +232,30 @@ export class GameSocket {
   offerDraw(gameId: string): void {
     this.sendMsg({ OfferDraw: { game_id: gameId } });
   }
-  /** Force a fresh STATE (§4A v1.1 RESYNC). Called by the React layer when the
-   * reducer's needsResync flag is set (GameSocket does not observe it itself). */
+  /** Force a fresh STATE (§4A v1.1 RESYNC). Called only by useGame (the one
+   * owner of every RESYNC send, §3.4.1). */
   resync(gameId: string): void {
     this.sendMsg({ Resync: { game_id: gameId } });
   }
   ping(t: bigint): void {
     this.sendMsg({ Ping: { t } });
+  }
+
+  /** Drop the current transport and reopen through the normal open/auth path
+   * (SPEC-S4-WEB-F01 §3.4.1). OWNER: transport — it only swaps the transport;
+   * it never decides to resync. The caller (useGame) invokes it when RESYNC
+   * attempts are exhausted; the server's auto-STATE after re-AUTHENTICATE is
+   * the reply. A no-op after close() / UNSUPPORTED_VERSION (closedByUs). Safe
+   * while already reconnecting: it cancels the pending backoff timer and opens
+   * now, so there is never more than one live transport or timer. */
+  reconnect(): void {
+    if (this.closedByUs || this.sock == null) return;
+    if (this.timer != null) clearTimeout(this.timer);
+    this.timer = null;
+    this.attempt = 0;
+    const old = this.sock;
+    this.open(); // detaches `old` (its handlers can no longer call back) and opens anew
+    old.close();
   }
 
   /** Close the socket deliberately (no reconnect). */

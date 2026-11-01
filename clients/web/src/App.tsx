@@ -126,7 +126,9 @@ function GameView({ token }: { token: string }): React.JSX.Element {
         </button>
       ) : null}
 
-      {state.needsResync ? <p role="status">{t("game.resync")}</p> : null}
+      {state.sync.phase === "SYNCING" || state.sync.phase === "RECONNECTING" ? (
+        <p role="status">{t("game.resync")}</p>
+      ) : null}
 
       {state.position != null ? (
         <>
