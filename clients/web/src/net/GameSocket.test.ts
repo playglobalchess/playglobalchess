@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { GameSocket, type SocketLike } from "./GameSocket";
+import { GameSocket, isReconnectSafe, type SocketLike } from "./GameSocket";
 import { encodeServerFrame, decodeClientFrame } from "../codec/seam";
 import type { ClientMsg, ServerMsg } from "../codec/messages";
 
@@ -268,6 +268,12 @@ describe("GameSocket (fake socket, real codec)", () => {
     const seeks = sent.filter((m) => "Seek" in m);
     expect(seeks.length).toBe(1);
     expect("Authenticate" in sent[0]!).toBe(true); // AUTH is still first
+  });
+
+  it("isReconnectSafe admits AUTHENTICATE only; SEEK is never outbox-eligible (#71.3)", () => {
+    expect(isReconnectSafe({ Authenticate: { token: "t" } })).toBe(true);
+    expect(isReconnectSafe({ Seek: { pool_id: "p", time_control: "tc", rated: false } })).toBe(false);
+    expect(isReconnectSafe({ Resync: { game_id: GID } })).toBe(false);
   });
 
   it("F1: a game frame (move) sent while NOT open is dropped, not replayed on reconnect", () => {

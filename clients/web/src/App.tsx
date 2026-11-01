@@ -8,6 +8,8 @@ import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
 import { codecProtocolVersion } from "./codec/seam";
 import { useGame } from "./game/useGame";
+import { announcementKey } from "./game/announcementKey";
+import { boardInteractive } from "./game/boardInteractive";
 import { Board } from "./game/Board";
 import { Reason, ErrorCode, type ReasonCode } from "./codec/messages";
 import { DEV_POOL, DEV_TIME_CONTROL } from "./devConfig";
@@ -66,7 +68,10 @@ function GameView({ token }: { token: string }): React.JSX.Element {
     state.phase === "seeking"
       ? t("status.seeking")
       : state.phase === "playing"
-        ? t("status.in_game")
+        ? // §3.4.1: an in-game outage must not hide behind "Game in progress".
+          status === "connected"
+          ? t("status.in_game")
+          : t("status.reconnecting")
         : state.phase === "game_over"
           ? t("status.game_over")
           : status === "connected"
@@ -83,9 +88,10 @@ function GameView({ token }: { token: string }): React.JSX.Element {
 
   // Screen-reader announcement (NFR-8): the latest move / offer / result,
   // rendered into an aria-live region so assistive tech reads it aloud. Gated
-  // on a change key (ply / draw offer / result / error) so an UNRELATED
-  // re-render (a clock tick, a status change) does not re-emit the same text
-  // and make the screen reader read a move or result twice.
+  // on a change key (ply / draw offer / result; NOT errors, so clearing one
+  // does not re-read the last move) so an UNRELATED re-render (a clock tick, a
+  // status change) does not re-emit the same text and make the screen reader
+  // read a move or result twice.
   const announcement = useGatedAnnouncement(state, Boolean(myTurn));
 
   return (
@@ -126,8 +132,20 @@ function GameView({ token }: { token: string }): React.JSX.Element {
         </button>
       ) : null}
 
+      {/* §3.4.1 recovery UX. OWNER: App renders; the reducer holds sync.phase.
+          SYNCING/RECONNECTING: the polite status line only — no button, no
+          modal, no focus move; the board below stays visible but read-only. */}
       {state.sync.phase === "SYNCING" || state.sync.phase === "RECONNECTING" ? (
         <p role="status">{t("game.resync")}</p>
+      ) : null}
+      {/* FAILED (terminal): one action, Refresh (reload rebuilds from the server). */}
+      {state.sync.phase === "FAILED" ? (
+        <div role="alert">
+          <span>{t("game.sync.failed")}</span>
+          <button type="button" onClick={() => window.location.reload()}>
+            {t("game.sync.refresh")}
+          </button>
+        </div>
       ) : null}
 
       {state.position != null ? (
@@ -137,7 +155,7 @@ function GameView({ token }: { token: string }): React.JSX.Element {
           <Board
             position={state.position}
             mySeat={state.mySeat}
-            interactive={Boolean(myTurn) && state.pendingMove == null}
+            interactive={boardInteractive(state, Boolean(myTurn))}
             onMove={(uci) => commands.move(uci)}
           />
           {state.lastReject != null ? (
@@ -197,7 +215,7 @@ function buildAnnouncement(
 }
 
 /** Gate buildAnnouncement so the aria-live region only changes when a NEW event
- * occurs (a new ply, a draw offer, a result, or an error) — not on every
+ * occurs (a new ply, a draw offer, or a result) — not on every
  * re-render. On an unrelated render it keeps the region empty so assistive tech
  * is not made to re-read the previous move/result. */
 function useGatedAnnouncement(
@@ -208,12 +226,11 @@ function useGatedAnnouncement(
     lastMove: { uci: string; moverSeat: number } | null;
     drawOffer: { by: number } | null;
     result: unknown;
-    error: number | null;
   },
   myTurn: boolean,
 ): string {
   // Key the announcement to the discrete events worth reading aloud.
-  const key = `${state.phase}|${state.ply}|${state.drawOffer != null ? state.drawOffer.by : "-"}|${state.result != null ? "end" : "-"}|${state.error ?? "-"}`;
+  const key = announcementKey(state);
   const [text, setText] = useState("");
   const lastKey = useRef<string | null>(null);
   useEffect(() => {

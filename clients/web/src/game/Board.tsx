@@ -78,6 +78,17 @@ export function Board(props: BoardProps): React.JSX.Element {
   // Roving focus cursor (a board index). Starts at a sensible home square.
   const [cursor, setCursor] = useState<number>(() => (mySeat === 1 ? 0 : 56)); // a1-ish for white
   const gridRef = useRef<HTMLDivElement | null>(null);
+  // The cursor cell is ALWAYS the one Tab stop (NFR-8: a keyboard/SR user can
+  // read the position off-turn); only activate()/commitMove are gated on
+  // `interactive`. Track grid focus so the focus ring shows off-turn too.
+  const [hasFocus, setHasFocus] = useState(false);
+  // Drop a stale selection when the board stops being interactive (turn passed):
+  // adjust-state-during-render, not an effect (react-hooks/set-state-in-effect).
+  const [wasInteractive, setWasInteractive] = useState(interactive);
+  if (wasInteractive !== interactive) {
+    setWasInteractive(interactive);
+    if (!interactive) setSelected(null);
+  }
 
   // Visual order: white sees a8..h1 (index 0..63); black sees it flipped.
   const flipped = mySeat === 1;
@@ -182,6 +193,11 @@ export function Board(props: BoardProps): React.JSX.Element {
       role="grid"
       aria-label={t("board.aria")}
       onKeyDown={onKeyDown}
+      onFocus={() => setHasFocus(true)}
+      onBlur={(e) => {
+        // Focus moving to another cell inside the grid is not a blur of the grid.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setHasFocus(false);
+      }}
       style={{
         display: "grid",
         gridTemplateRows: "repeat(8, 1fr)",
@@ -216,7 +232,7 @@ export function Board(props: BoardProps): React.JSX.Element {
                 data-idx={idx}
                 aria-label={squareLabel(idx, piece)}
                 aria-selected={isSel}
-                tabIndex={interactive && isCursor ? 0 : -1}
+                tabIndex={isCursor ? 0 : -1}
                 onClick={() => activate(idx)}
                 onFocus={() => setCursor(idx)}
                 style={{
@@ -229,7 +245,7 @@ export function Board(props: BoardProps): React.JSX.Element {
                   fontSize: "clamp(18px, 7vmin, 44px)",
                   cursor: interactive ? "pointer" : "default",
                   userSelect: "none",
-                  outline: isCursor && interactive ? "3px solid var(--board-focus, #3b82f6)" : "none",
+                  outline: isCursor && (interactive || hasFocus) ? "3px solid var(--board-focus, #3b82f6)" : "none",
                   outlineOffset: "-3px",
                 }}
               >

@@ -163,6 +163,70 @@ describe("Board", () => {
     expect(moves).toEqual(["e2e4"]);
   });
 
+  it("off-turn (non-interactive): cursor cell is still the Tab stop, arrows move it, Enter never moves (#71.1 / NFR-8)", () => {
+    const moves: string[] = [];
+    mount(
+      <Board position={parseFen(START)} mySeat={0} interactive={false} onMove={(u) => moves.push(u)} />,
+    );
+    const stops = Array.from(container!.querySelectorAll<HTMLElement>('[role="gridcell"]')).filter(
+      (c) => c.tabIndex === 0,
+    );
+    expect(stops.length).toBe(1); // exactly one roving Tab stop
+    expect((stops[0]!.getAttribute("aria-label") ?? "").startsWith("a1,")).toBe(true);
+    const grid = container!.querySelector('[role="grid"]')!;
+    const key = (k: string): void => {
+      act(() => grid.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true })));
+    };
+    key("ArrowRight"); key("ArrowUp");
+    const stop2 = Array.from(container!.querySelectorAll<HTMLElement>('[role="gridcell"]')).filter(
+      (c) => c.tabIndex === 0,
+    );
+    expect(stop2.length).toBe(1);
+    expect((stop2[0]!.getAttribute("aria-label") ?? "").startsWith("b2,")).toBe(true);
+    key("Enter"); // would select/play if interactive
+    key("ArrowUp"); key("Enter");
+    expect(moves).toEqual([]);
+    expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(0);
+  });
+
+  it("off-turn: the focus ring shows while the grid has focus, survives an inner focus move, and clears on leaving the grid (#71.1)", () => {
+    mount(<Board position={parseFen(START)} mySeat={0} interactive={false} onMove={() => {}} />);
+    const cells = Array.from(container!.querySelectorAll<HTMLElement>('[role="gridcell"]'));
+    const cursorCell = (): HTMLElement => cells.find((c) => c.tabIndex === 0)!;
+    const ringOn = (): boolean => cursorCell().style.outline !== "none" && cursorCell().style.outline !== "";
+    expect(ringOn()).toBe(false); // no focus yet, not interactive: no ring
+    act(() => cursorCell().focus());
+    expect(ringOn()).toBe(true);
+    // Focus leaving for ANOTHER CELL inside the grid is not a blur of the grid.
+    const other = cells.find((c) => c !== cursorCell())!;
+    act(() => {
+      cursorCell().dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: other }));
+    });
+    expect(ringOn()).toBe(true);
+    // Focus leaving the grid entirely clears the ring.
+    act(() => {
+      cursorCell().dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: document.body }));
+    });
+    expect(ringOn()).toBe(false);
+  });
+
+  it("drops a stale selection when the board stops being interactive (and stays dropped)", () => {
+    const pos = parseFen(START);
+    const noop = (): void => {};
+    mount(<Board position={pos} mySeat={0} interactive onMove={noop} />);
+    clickSquare("e2");
+    expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(1);
+    const rerender = (interactive: boolean): void => {
+      act(() => {
+        root!.render(<Board position={pos} mySeat={0} interactive={interactive} onMove={noop} />);
+      });
+    };
+    rerender(false);
+    expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(0);
+    rerender(true);
+    expect(container!.querySelectorAll('[aria-selected="true"]').length).toBe(0); // no resurrection
+  });
+
   it("Escape cancels a keyboard selection", () => {
     const moves: string[] = [];
     mount(<Board position={parseFen(START)} mySeat={0} interactive onMove={(u) => moves.push(u)} />);

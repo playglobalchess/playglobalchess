@@ -305,11 +305,14 @@ export class GameSocket {
  * structural shape (a numeric byteLength + a slice/ArrayBuffer.isView view).
  * A real browser has one realm so instanceof would also work there; this just
  * never misclassifies a genuine binary frame as "non-binary" and drops it. */
-/** Only AUTHENTICATE and SEEK may sit in the pre-open outbox: both are re-sent
- * on every (re)open by design, so buffering them is safe and idempotent. Every
- * other frame is game-mutating and must not be replayed across a reconnect. */
-function isReconnectSafe(msg: ClientMsg): boolean {
-  return "Authenticate" in msg || "Seek" in msg;
+/** Only AUTHENTICATE may sit in the pre-open outbox: it is re-sent on every
+ * (re)open by design, so buffering it is safe and idempotent. SEEK is excluded
+ * on purpose: seek() records pendingSeek and onopen is its single (re)send path,
+ * so admitting it here would re-introduce the double-SEEK. Enforced by code, not
+ * comment. Every other frame is game-mutating and must not be replayed across a
+ * reconnect. */
+export function isReconnectSafe(msg: ClientMsg): boolean {
+  return "Authenticate" in msg;
 }
 
 function toBytes(data: unknown): Uint8Array | null {
