@@ -4,7 +4,7 @@
 |---|---|
 | Spec ID | SPEC-S4-WEB-F01 (first slice of the S4 Web Client stream; implements F-01 on web) |
 | Owner | S4 Web |
-| Status | RATIFIED — v1.1 owner-approved 2026-11-01 (§3.4.1 client consistency & recovery policy; Q-S4f and Q-S4g decided; Q-S4h deferred to an S2 protocol issue). v1.0 owner-approved 2026-10-16 (Q-S4a–e decided). |
+| Status | RATIFIED — v1.1 owner-approved 2026-11-01: §3.3.1 clock display (Q-S4i deferred to issue #82, Q-S4j decided) and §3.4.1 consistency & recovery policy (Q-S4f, Q-S4g decided; Q-S4h deferred to issue #81; clarifications approved). v1.0 owner-approved 2026-10-16 (Q-S4a–e decided). |
 | Version | 1.1 |
 | Last updated | 2026-11-01 |
 | Implements (master IDs) | F-01 (Play Online, Standard 2-seat), X-2 (via the GS-6 WS edge), X-1 (engine, via the shared codec/wasm), NFR-5 (one codec — the client binds it, never re-implements §4A), NFR-8 (accessibility), NFR-11 (i18n), ADR-9 (web = TypeScript + React), ADR-14 (one shared binary codec), §4A v1.1 (RESYNC/DRAW_OFFERED, ADR-17) |
@@ -119,6 +119,83 @@ board + both clocks from `start_state`.
   `DRAW_OFFERED{by}` shows an accept/decline affordance (accept = send
   `OFFER_DRAW`, the mutual-offer agreement); `GAME_END` shows the result.
 
+### 3.3.1 Clock display (v1.1 amendment — RATIFIED 2026-11-01)
+
+v1.0 required "clocks shown and ticking" but never defined ticking. The shipped
+client only showed the last value the server sent. This section defines it. The
+server stays authoritative for time and is the ONLY party that decides a flag
+(GS-3 §3.4). The client clock is a display.
+
+**Server facts this relies on** (GS-3 §3.4, `internal/clock`):
+- The server charges the side to move from `lastMoveAt`.
+- A new game's baseline is its creation instant, so White's clock runs from
+  `MATCHED`. There is no first-move grace.
+- Fischer increment is added after a non-flagging move, so `clock_after_ms`
+  already includes it.
+- Live presets have no per-move delay; delay is used only by `daily-*`
+  controls, which are out of this slice.
+
+**C1 — values.** The client takes clock values from three places:
+- `MATCHED.start_state.clocks` and `STATE.clocks`, for every seat;
+- `MOVE_ACCEPTED.clock_after_ms`, for the seat that just moved.
+
+**C2 — which clock runs.** Exactly one clock runs while `phase = playing`: the
+side to move of the current authoritative position. No clock runs before
+`MATCHED` or after `GAME_END`.
+
+**C3 — countdown.**
+- Displayed value = last value − (`performance.now()` − anchor), floored at 0.
+  The anchor is the local receipt time of the frame that set the value.
+- The value is derived from timestamps on every render and never decremented
+  per tick. That way it does not drift, and a throttled background tab shows
+  the right value when it wakes.
+
+**C4 — own optimistic move.**
+- When the player makes a move, their clock freezes at its displayed value and
+  the opponent's clock starts.
+- On `MOVE_ACCEPTED`, the player's clock becomes `clock_after_ms`.
+- On `MOVE_REJECTED`, the player's clock resumes as if it had never stopped:
+  the value at the original anchor minus all elapsed time. The opponent's clock
+  returns to its prior value.
+
+**C5 — opponent move.** On `MOVE_ACCEPTED` for the other seat:
+- their clock becomes `clock_after_ms` and stops;
+- the player's clock starts from its last value, anchored at receipt.
+
+**C6 — zero.** The display stops at `0:00.0`. The client never declares or
+sends a flag; it waits for the server's `GAME_END`.
+
+**C7 — game end.** On `GAME_END`, every clock stops at its displayed value.
+
+**C8 — recovery and outage.** Clocks keep running during `SYNCING`,
+`RECONNECTING` and a socket outage, per C2 and C3, because the server's clock
+keeps running too. The next `STATE` overrides every value.
+
+**C9 — server-side requirement (game-server change, no wire change).**
+- `STATE.clocks` MUST be the remaining time as of the instant the `STATE` is
+  built.
+- For the side to move, that is `RemainingMs[turn] − (now − lastMoveAt)`,
+  floored at 0. Other seats are unchanged.
+- Today the snapshot copies `RemainingMs` as of the last move. A client that
+  reconnects mid-think would then show the side to move with too much time.
+- The wire shape is unchanged; this pins the meaning of an existing field.
+
+**C10 — rendering and format.**
+- The clock updates in its own component, so the board does not re-render on
+  ticks.
+- It refreshes at 10 Hz below 10 s and once per second otherwise.
+- Format: `h:mm:ss` at or above 1 h; `m:ss` otherwise; `m:ss.t` below 10 s.
+  Tenths in the final seconds match common competitor practice.
+
+**C11 — accessibility (NFR-8).**
+- The clock region is not a live region; ticks are not announced.
+- Each seat's clock exposes its current value through its accessible name when
+  focused or queried.
+- Low-time announcements are out of this slice.
+
+**Out of this slice:** lag compensation (the server charges the mover's network
+latency, Q-S4i, issue #82), low-time sounds and colours, and `daily-*` controls.
+
 ### 3.4 Reconnection
 
 On socket close, reconnect + re-AUTHENTICATE; the server auto-pushes `STATE`
@@ -196,6 +273,19 @@ constants, not tuned at runtime.
   `DRAW_OFFERED` is shown in every phase.
 - **New game:** `MATCHED` for a different game resets recovery to `IN_SYNC`
   (then T5 applies to its `start_state`).
+- **Clarifications (owner-approved 2026-11-01):**
+  - **No backoff before reconnects:** there is none between `SYNCING(N)` and
+    `RECONNECTING(1)`, or between reconnect cycles. The reconnect itself is the
+    delay, and lichess reloads immediately.
+  - **Game over:** triggers after the game ends do not start recovery, and an
+    inconsistent `STATE` after `GAME_END` is ignored, because the server's
+    result is final.
+  - **Inconsistent `MATCHED` start position:** shown read-only while
+    `SYNCING`, like any other sync.
+  - **`MATCHED` for the same game id:** keeps the current recovery state.
+  - **Moves while recovering:** `move()` is gated on the reducer's own decision
+    for that move, never on a mirror that can lag a render. No move is sent
+    while recovering, even in the same commit as a trigger.
 - **A consistent `STATE` is always authoritative**, including one with a LOWER
   ply than local (ply is not monotonic under Takeback, GS-3 §3.2; see the
   ordering note below). It resets all counters.
@@ -205,6 +295,10 @@ constants, not tuned at runtime.
   initiation by pointer, keyboard or `move()`.
 - The existing polite status line (`role="status"`, string `game.resync`) shows
   "Syncing game…".
+- While `phase = playing` and the socket is not `connected`, the connection
+  status shows "Reconnecting…" (new string `status.reconnecting`) instead of
+  "Game in progress". Before this amendment the in-game status hid outages
+  entirely.
 - Clocks keep counting down from the last authoritative values, and the next
   `STATE` corrects them.
 - Resign and draw remain available.
@@ -303,6 +397,28 @@ hard-coded strings.
     the `FAILED` alert has exactly one action; recovery never moves focus.
   - e2e (real server, the existing `web-e2e` job): drop the socket mid-game and
     assert the board recovers to the server position and play continues.
+- **Clock display (§3.3.1)** — one test per rule C1–C11, each shown
+  non-vacuous. Use a fake `performance.now()` and fake timers.
+  - Only the side to move runs, and nothing runs outside `playing`.
+  - White runs from `MATCHED`.
+  - The countdown is derived from the anchor (it stays correct after a jump of
+    the fake clock); the floor is 0.
+  - Own move freezes own and starts the opponent's; an accept sets
+    `clock_after_ms`; a reject resumes as if never stopped.
+  - An opponent move sets their value and starts ours.
+  - `GAME_END` stops all.
+  - Clocks run during `SYNCING`/`RECONNECTING`/outage, and `STATE` overrides.
+  - Format boundaries at 10 s and 1 h.
+  - The board does not re-render on a tick.
+  - The clock region is not `aria-live`.
+- **Server (C9):** a game-server session test with a fake `now`. After the
+  side to move has thought for X ms, `StateSnapshot` reports `RemainingMs[turn]`
+  minus X, floored at 0, and the other seat is unchanged. The test must fail
+  against the old snapshot.
+- **e2e:** after a move, the opponent's displayed clock decreases over about 1 s
+  of real time.
+- **Reconnecting status:** with `phase = playing` and the socket down, the
+  status line reads "Reconnecting…".
 - Accessibility: automated axe checks on the board; keyboard-only move entry
   test, including Tab into the board while it is NOT the player's turn (#71.1).
 - `npm run build` + typecheck (strict) + lint clean; CI job added
@@ -318,6 +434,9 @@ hard-coded strings.
 - [ ] Board renders from FEN, legal-move UX via the engine binding (no rules
       re-impl), clocks shown and ticking.
 - [ ] Reconnection: STATE resync (auto + RESYNC); DRAW_OFFERED accept/decline UI.
+- [ ] §3.3.1 clock display implemented (C1–C11) including the C9 game-server
+      snapshot change; owner has watched both clocks tick and switch in a real
+      browser.
 - [ ] §3.4.1 consistency & recovery policy implemented with the layer ownership
       stated there; every §6 recovery test green and shown non-vacuous; owner
       has checked the recovery UX in a real browser (socket drop → "Syncing
@@ -359,6 +478,27 @@ hard-coded strings.
   T_reply=1000 ms, B=250 ms). Q-S4g is **DECIDED: prompt with one "Refresh"
   action**, no auto-reload. Q-S4h is **DEFERRED** to an S2 protocol issue,
   outside this slice. It is tracked as GitHub issue #81.
+
+### Open questions — §3.3.1 clock display (DECIDED, owner-approved 2026-11-01)
+
+- **Decisions:** Q-S4i is **DEFERRED** to issue #82, a separate S2 design with
+  S6 fair-play review. Q-S4j is **DECIDED: include the C9 snapshot fix in this
+  PR.**
+
+
+- **Q-S4i — lag compensation.** The server times a move from its own receipt of
+  the previous move to its receipt of this one, so each mover is charged their
+  network latency. Lichess compensates server-side for measured lag.
+  **Recommendation:** out of this slice. It is a game-server and fairness design
+  (anti-cheat interacts with it, ADR-2), and it needs its own S2 spec. File it as
+  an issue.
+- **Q-S4j — the C9 snapshot fix in this PR.** It is a few lines in
+  `services/game-server/internal/session` plus a test, and the wire is
+  unchanged. Without it the reconnect clock is wrong by the length of the
+  current think.
+  **Recommendation:** include it in this PR, because the client countdown is
+  only correct with it. It touches the same session file as the separate
+  game-server work on #67, so that branch will need a rebase.
 
 
 - **Q-S4f — recovery bounds.** Proposed: N = 3 resyncs, K = 2 reconnect cycles,
