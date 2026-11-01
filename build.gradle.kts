@@ -21,6 +21,8 @@ buildscript {
             classpath("org.bouncycastle:bcutil-jdk18on:1.85")
             classpath("org.bitbucket.b_c:jose4j:0.9.6")
             classpath("org.jdom:jdom2:2.0.6.1")
+            classpath("com.google.guava:guava:33.7.2-jre")
+            classpath("org.apache.commons:commons-lang3:3.18.0")
             // TEMPORARY BRIDGE: remove this line once a stable AGP bundles
             // Kotlin >= 2.4.20 natively. AGP 9.4.1 (newest stable at the time)
             // bundles Kotlin 2.2.10, which is below the GHSA-r937-wjx7-w2jp fix
@@ -33,4 +35,31 @@ buildscript {
 
 plugins {
     id("com.android.library") version "9.4.1" apply false
+}
+
+// The buildscript constraints above only cover the plugin classpath. AGP also
+// resolves the Android lint tool (com.android.tools.lint:lint-gradle) into a
+// per-module "androidLintTool" configuration, which still pulls older
+// bouncycastle, guava, commons-lang3 and httpclient and is what the GitHub
+// dependency graph reports. Pin those to patched versions here too. Build-time
+// only; nothing ships in an APK. Drop entries as AGP's bundled lint catches up
+// (check with ./gradlew :engine-parity:dependencies --configuration androidLintTool).
+val lintToolPins = mapOf(
+    "org.bouncycastle:bcprov-jdk18on" to "1.85",
+    "org.bouncycastle:bcpkix-jdk18on" to "1.85",
+    "org.bouncycastle:bcutil-jdk18on" to "1.85",
+    "com.google.guava:guava" to "33.7.2-jre",
+    "org.apache.commons:commons-lang3" to "3.18.0",
+    "org.apache.httpcomponents:httpclient" to "4.5.14",
+)
+
+subprojects {
+    configurations.matching { it.name == "androidLintTool" }.configureEach {
+        resolutionStrategy.eachDependency {
+            lintToolPins["${requested.group}:${requested.name}"]?.let {
+                useVersion(it)
+                because("Dependabot: patched version for the lint tool classpath")
+            }
+        }
+    }
 }
