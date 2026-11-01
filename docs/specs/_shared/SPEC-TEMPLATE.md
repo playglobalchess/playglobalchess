@@ -27,6 +27,8 @@ APIs exposed/consumed, events emitted/subscribed, schemas. If this changes a sha
 ## 5. Edge cases & failure modes
 The non-happy paths. For rules/engine work, enumerate the correctness edge cases (MASTER §X.1).
 
+**Consistency & recovery (MANDATORY for any real-time or client-server spec).** Answer all eight items of FEATURE-SPEC-TEMPLATE §7.1 (detection triggers, single owner of the recovery action, bounds and time budget, escalation, terminal state, recovery of the recovery, UX while recovering incl. competitor comparison, ordering/identity assumptions), each with a matching test-plan row (§8). A spec missing them is not ready for review.
+
 ## 6. Non-functional handling
 How this meets its NFR budgets (latency IX.1, capacity IX.2, availability, etc.). State the numbers.
 
