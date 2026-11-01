@@ -9,9 +9,10 @@
 //
 // minSdk 24 matches the Rust aarch64-linux-android24 build (platform/mobile).
 
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
 }
 
 android {
@@ -24,15 +25,17 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
-    // src/main/jniLibs/arm64-v8a/libpgc_protocol_ffi.so — placed by build_codec_mobile.sh.
-    sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
-
+    // The codec .so is placed at the default src/main/jniLibs/<abi>/ by
+    // platform/mobile/build_codec_mobile.sh (libpgc_protocol_ffi.so).
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_17
     }
 }
 

@@ -43,7 +43,7 @@ jobs:
             protocol: ['protocol/**', 'platform/mobile/*[Cc]odec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**']
             services: ['services/**']
             web: ['clients/web/**']
-            mobile: ['clients/ios/**', 'clients/android/**']
+            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradlew', 'gradle/**']
             platform: ['platform/**']
 
   engine:
@@ -388,8 +388,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build + test iOS/Android (shared Rust core — ADR-9)
-        run: echo "::notice::clients/{ios,android}/ stub — native build + shared-core FFI tests."
+      - name: iOS (shared Rust core — ADR-9)
+        run: echo "::notice::clients/ios/ stub — native build + shared-core FFI tests."
+      # Real Android gate: resolves the AGP/Kotlin buildscript graph and compiles
+      # both parity modules, so toolchain bumps (and the Dependabot buildscript
+      # constraints in build.gradle.kts) are verified by CI, not just locally.
+      # Emulator/device parity stays manual (platform/mobile/README-codec.md).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Android Gradle build (assembleRelease, both parity modules)
+        run: ./gradlew --no-daemon :engine-parity:assembleRelease :codec-parity:assembleRelease
 
   platform:
     needs: changes
