@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
@@ -195,8 +196,22 @@ func TestRedis_ReadPoolPrunesClaimedExpiredMember(t *testing.T) {
 func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	p := redisPool(t)
 	ctx := context.Background()
-	pool := "it-mutual-" + t.Name()
-	defer p.Remove(ctx, pool, "ma", "mb")
+	// Hermetic (issue #76): seek/claim keys are GLOBAL (not pool-scoped) and
+	// Enqueue never clears a leftover claim, so fixed SeekIDs could inherit a
+	// stale claim from a previous or killed run (within the TTL) and silently
+	// pair with nobody. Unique ids + pool per run, and a cleanup that CHECKS
+	// errors and deletes claim keys too.
+	run := uuid.NewString()
+	pool := "it-mutual-" + run
+	idA, idB := "ma-"+run, "mb-"+run
+	t.Cleanup(func() {
+		if err := p.Remove(ctx, pool, idA, idB); err != nil {
+			t.Errorf("cleanup Remove: %v", err)
+		}
+		if err := p.Release(ctx, idA, idB); err != nil {
+			t.Errorf("cleanup Release: %v", err)
+		}
+	})
 
 	store := game.NewMemStore()
 	m := New(p, store, SeedRatingSource{})
@@ -205,8 +220,8 @@ func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	var wg sync.WaitGroup
 	matches := make([]bool, 2)
 	seekers := []Seeker{
-		{SeekID: "ma", UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
-		{SeekID: "mb", UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: idA, UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: idB, UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
 	}
 	for i, s := range seekers {
 		wg.Add(1)
