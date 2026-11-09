@@ -8,8 +8,15 @@ Checks:
      has a 'Status' header with a valid lifecycle value.
   2. Master-ID references (F-xx / X-x / ADR-xx / G-x / NFR-x) that look malformed.
   3. Relative markdown links point at files that exist.
+  4. WS message type codes: SPEC-S2-PROTOCOL §4A.2 (docs/specs/S2-realtime/
+     PROTOCOL.md) lists exactly the codes the codec defines in
+     protocol/codec/src/message.rs (client_code / server_code), with the same
+     direction and value (#106). This check READS CODEC SOURCE: a codec-side
+     change can fail docs-check. It fails closed: a missing file, a missing
+     module or section, an unparseable const, or a duplicate name is an error.
 
 Exit non-zero on any failure. Zero external dependencies (stdlib only).
+Unit tests: platform/ci/test_check_docs.py (run in the ci.yml platform job).
 """
 from __future__ import annotations
 import re
@@ -81,57 +88,108 @@ def check_id_shapes() -> None:
 CODEC_MESSAGES = REPO / "protocol" / "codec" / "src" / "message.rs"
 PROTOCOL_SPEC = DOCS / "specs" / "S2-realtime" / "PROTOCOL.md"
 
+# Codes are keyed by (direction, NAME) so the same name in both directions can
+# never overwrite one another.
+Codes = dict[tuple[str, str], int]
 
-def read_codec_type_codes() -> dict[str, tuple[str, int]]:
-    """Return {NAME: (direction, code)} from the codec's client_code/server_code modules."""
-    text = CODEC_MESSAGES.read_text(encoding="utf-8")
-    codes: dict[str, tuple[str, int]] = {}
+_CONST_RE = re.compile(r"pub\s+const\s+([A-Za-z0-9_]+)\s*:\s*u8\s*=\s*0x([0-9A-Fa-f]{2})\s*;")
+_ANY_CONST_RE = re.compile(r"\bpub\s+const\b")
+_ROW_RE = re.compile(r"\|\s*(0x[0-9A-Fa-f]{2})\s*\|\s*([CS])\s*\|\s*([A-Za-z0-9_]+)\s*\|")
+
+
+def parse_codec_type_codes(text: str) -> tuple[Codes, list[str]]:
+    """Parse client_code/server_code modules. Returns (codes, problems).
+
+    Fails closed: a missing module, an empty module, or any `pub const` line the
+    strict pattern does not understand (e.g. a decimal literal or a non-u8 type)
+    is a problem, never silently skipped.
+    """
+    codes: Codes = {}
+    problems: list[str] = []
     for module, direction in (("client_code", "C"), ("server_code", "S")):
-        m = re.search(r"pub mod " + module + r"\s*\{(.*?)\n\}", text, re.S)
+        m = re.search(r"pub\s+mod\s+" + module + r"\s*\{(.*?)\n\}", text, re.S)
         if not m:
-            errors.append(f"{CODEC_MESSAGES.relative_to(REPO)}: module '{module}' not found")
+            problems.append(f"module '{module}' not found")
             continue
-        for name, value in re.findall(r"pub const ([A-Z_]+): u8 = (0x[0-9A-Fa-f]{2});", m.group(1)):
-            codes[name] = (direction, int(value, 16))
-    return codes
+        body = m.group(1)
+        parsed = _CONST_RE.findall(body)
+        declared = len(_ANY_CONST_RE.findall(body))
+        if declared == 0:
+            problems.append(f"module '{module}' declares no constants")
+        if len(parsed) != declared:
+            problems.append(
+                f"module '{module}': {declared} pub const line(s) but only {len(parsed)} match "
+                f"'pub const NAME: u8 = 0xNN;' (update the parser, do not skip)"
+            )
+        for name, value in parsed:
+            key = (direction, name)
+            if key in codes:
+                problems.append(f"duplicate {direction} constant {name}")
+            codes[key] = int(value, 16)
+    return codes, problems
 
 
-def read_spec_type_codes() -> dict[str, tuple[str, int]]:
-    """Return {NAME: (direction, code)} from the PROTOCOL.md §4A.2 table rows."""
-    text = PROTOCOL_SPEC.read_text(encoding="utf-8")
+def parse_spec_type_codes(text: str) -> tuple[Codes, list[str]]:
+    """Parse the PROTOCOL.md §4A.2 table rows. Returns (codes, problems)."""
+    problems: list[str] = []
     m = re.search(r"### 4A\.2 .*?\n(.*?)\n### 4A\.3", text, re.S)
     if not m:
-        errors.append(f"{PROTOCOL_SPEC.relative_to(REPO)}: section 4A.2 not found")
-        return {}
-    codes: dict[str, tuple[str, int]] = {}
-    for value, direction, name in re.findall(
-        r"\|\s*(0x[0-9A-Fa-f]{2})\s*\|\s*([CS])\s*\|\s*([A-Z_]+)\s*\|", m.group(1)
-    ):
-        codes[name] = (direction, int(value, 16))
-    return codes
+        return {}, ["section 4A.2 not found"]
+    codes: Codes = {}
+    for value, direction, name in _ROW_RE.findall(m.group(1)):
+        key = (direction, name)
+        if key in codes:
+            problems.append(f"duplicate {direction} row {name}")
+        codes[key] = int(value, 16)
+    if not codes:
+        problems.append("section 4A.2 contains no type-code rows")
+    return codes, problems
+
+
+def compare_type_codes(codec: Codes, spec: Codes) -> list[str]:
+    """Return mismatches between the codec and the spec (empty = in sync)."""
+    out: list[str] = []
+    for (direction, name), code in sorted(codec.items()):
+        if (direction, name) not in spec:
+            out.append(f"§4A.2 is missing {direction} 0x{code:02X} {name} (present in the codec)")
+        elif spec[(direction, name)] != code:
+            out.append(
+                f"§4A.2 lists {direction} {name} as 0x{spec[(direction, name)]:02X}, codec has 0x{code:02X}"
+            )
+    for (direction, name), code in sorted(spec.items()):
+        if (direction, name) not in codec:
+            out.append(f"§4A.2 lists {direction} 0x{code:02X} {name}, which the codec does not define")
+    # Same code value used twice in one direction is also drift.
+    for direction in ("C", "S"):
+        seen: dict[int, str] = {}
+        for (d, name), code in sorted(spec.items()):
+            if d == direction:
+                if code in seen:
+                    out.append(f"§4A.2 assigns {direction} 0x{code:02X} to both {seen[code]} and {name}")
+                seen[code] = name
+    return out
 
 
 def check_ws_type_codes() -> None:
-    # #106: PROTOCOL.md §4A.2 must list exactly the codec's message type codes,
-    # with the same direction and value. Field lists are not compared (that needs
-    # a parser for §4A.3); the golden vectors remain the byte-level truth.
-    if not CODEC_MESSAGES.exists() or not PROTOCOL_SPEC.exists():
-        warnings.append("codec message.rs or PROTOCOL.md missing: WS type-code check skipped")
-        return
-    codec = read_codec_type_codes()
-    spec = read_spec_type_codes()
-    rel = PROTOCOL_SPEC.relative_to(REPO)
-    for name, (direction, code) in sorted(codec.items()):
-        if name not in spec:
-            errors.append(f"{rel}: §4A.2 is missing {direction} 0x{code:02X} {name} (present in the codec)")
-        elif spec[name] != (direction, code):
-            d, c = spec[name]
+    # #106. Fails closed: if either input is missing, the check errors rather than
+    # skipping, so moving or renaming message.rs cannot turn it into a green no-op.
+    for path in (CODEC_MESSAGES, PROTOCOL_SPEC):
+        if not path.exists():
             errors.append(
-                f"{rel}: §4A.2 lists {name} as {d} 0x{c:02X}, codec has {direction} 0x{code:02X}"
+                f"{path.relative_to(REPO)} not found: WS type-code check cannot run "
+                f"(update CODEC_MESSAGES/PROTOCOL_SPEC in check_docs.py and the docs-check.yml paths)"
             )
-    for name, (direction, code) in sorted(spec.items()):
-        if name not in codec:
-            errors.append(f"{rel}: §4A.2 lists {direction} 0x{code:02X} {name}, which the codec does not define")
+            return
+    codec, codec_problems = parse_codec_type_codes(CODEC_MESSAGES.read_text(encoding="utf-8"))
+    spec, spec_problems = parse_spec_type_codes(PROTOCOL_SPEC.read_text(encoding="utf-8"))
+    for msg in codec_problems:
+        errors.append(f"{CODEC_MESSAGES.relative_to(REPO)}: {msg}")
+    for msg in spec_problems:
+        errors.append(f"{PROTOCOL_SPEC.relative_to(REPO)}: {msg}")
+    if codec_problems or spec_problems:
+        return
+    for msg in compare_type_codes(codec, spec):
+        errors.append(f"{PROTOCOL_SPEC.relative_to(REPO)}: {msg}")
 
 
 def main() -> int:

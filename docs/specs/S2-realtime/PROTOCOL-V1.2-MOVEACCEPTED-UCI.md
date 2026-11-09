@@ -92,10 +92,11 @@ not the request's `p.UCI`. This is a Go-side addition (no wire effect beyond the
     pipeline outcome).
   This mirrors the GS-3 `AppliedSeq` lesson exactly (all paths report the REAL
   value from the authoritative source, not a request field or a blank).
-- `handleMove`, on `out.Accepted` and NOT terminal: build `MOVE_ACCEPTED` with
-  `uci = out.UCI` (NOT `p.UCI`) and send it to **both seats** (the mover and the
-  opponent via `connFor(gameID, otherSeat)`), replacing the mover-only
-  `s.send(ctx, c, …)`. The terminal path still broadcasts GAME_END. Reading
+- `handleMove`, on every `out.Accepted` (terminal or not): build `MOVE_ACCEPTED`
+  with `uci = out.UCI` (NOT `p.UCI`) and send it to **both seats** (the mover and
+  the opponent via `connFor(gameID, otherSeat)`), replacing the mover-only
+  `s.send(ctx, c, …)`. If that move ended the game (`out.Terminal != nil`), the
+  handler then also broadcasts GAME_END, after the MOVE_ACCEPTED. Reading
   `out.UCI` (not `p.UCI`) is what makes the fresh and re-ack paths identical: a
   retry that carries a different/garbled `uci` for an already-persisted ply gets
   the PERSISTED move echoed back (server-authoritative), never the retry's.

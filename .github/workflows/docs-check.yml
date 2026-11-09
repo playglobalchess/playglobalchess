@@ -3,9 +3,9 @@ name: docs-check
 on:
   push:
     branches: [main]
-    paths: ["docs/**", "protocol/codec/src/message.rs", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
+    paths: ["docs/**", "protocol/codec/src/**", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
   pull_request:
-    paths: ["docs/**", "protocol/codec/src/message.rs", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
+    paths: ["docs/**", "protocol/codec/src/**", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
 
 jobs:
   validate-docs:
