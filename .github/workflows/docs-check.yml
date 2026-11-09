@@ -3,9 +3,9 @@ name: docs-check
 on:
   push:
     branches: [main]
-    paths: ["docs/**", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
+    paths: ["docs/**", "protocol/codec/src/message.rs", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
   pull_request:
-    paths: ["docs/**", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
+    paths: ["docs/**", "protocol/codec/src/message.rs", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
 
 jobs:
   validate-docs:
@@ -15,5 +15,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Validate spec Status headers, ID references, and links
+      - name: Validate spec Status headers, ID references, links, and WS type codes vs the codec
         run: python3 platform/ci/check_docs.py

@@ -78,6 +78,62 @@ def check_id_shapes() -> None:
                 warnings.append(f"{p.relative_to(REPO)}:{i}: possibly malformed ID reference")
 
 
+CODEC_MESSAGES = REPO / "protocol" / "codec" / "src" / "message.rs"
+PROTOCOL_SPEC = DOCS / "specs" / "S2-realtime" / "PROTOCOL.md"
+
+
+def read_codec_type_codes() -> dict[str, tuple[str, int]]:
+    """Return {NAME: (direction, code)} from the codec's client_code/server_code modules."""
+    text = CODEC_MESSAGES.read_text(encoding="utf-8")
+    codes: dict[str, tuple[str, int]] = {}
+    for module, direction in (("client_code", "C"), ("server_code", "S")):
+        m = re.search(r"pub mod " + module + r"\s*\{(.*?)\n\}", text, re.S)
+        if not m:
+            errors.append(f"{CODEC_MESSAGES.relative_to(REPO)}: module '{module}' not found")
+            continue
+        for name, value in re.findall(r"pub const ([A-Z_]+): u8 = (0x[0-9A-Fa-f]{2});", m.group(1)):
+            codes[name] = (direction, int(value, 16))
+    return codes
+
+
+def read_spec_type_codes() -> dict[str, tuple[str, int]]:
+    """Return {NAME: (direction, code)} from the PROTOCOL.md §4A.2 table rows."""
+    text = PROTOCOL_SPEC.read_text(encoding="utf-8")
+    m = re.search(r"### 4A\.2 .*?\n(.*?)\n### 4A\.3", text, re.S)
+    if not m:
+        errors.append(f"{PROTOCOL_SPEC.relative_to(REPO)}: section 4A.2 not found")
+        return {}
+    codes: dict[str, tuple[str, int]] = {}
+    for value, direction, name in re.findall(
+        r"\|\s*(0x[0-9A-Fa-f]{2})\s*\|\s*([CS])\s*\|\s*([A-Z_]+)\s*\|", m.group(1)
+    ):
+        codes[name] = (direction, int(value, 16))
+    return codes
+
+
+def check_ws_type_codes() -> None:
+    # #106: PROTOCOL.md §4A.2 must list exactly the codec's message type codes,
+    # with the same direction and value. Field lists are not compared (that needs
+    # a parser for §4A.3); the golden vectors remain the byte-level truth.
+    if not CODEC_MESSAGES.exists() or not PROTOCOL_SPEC.exists():
+        warnings.append("codec message.rs or PROTOCOL.md missing: WS type-code check skipped")
+        return
+    codec = read_codec_type_codes()
+    spec = read_spec_type_codes()
+    rel = PROTOCOL_SPEC.relative_to(REPO)
+    for name, (direction, code) in sorted(codec.items()):
+        if name not in spec:
+            errors.append(f"{rel}: §4A.2 is missing {direction} 0x{code:02X} {name} (present in the codec)")
+        elif spec[name] != (direction, code):
+            d, c = spec[name]
+            errors.append(
+                f"{rel}: §4A.2 lists {name} as {d} 0x{c:02X}, codec has {direction} 0x{code:02X}"
+            )
+    for name, (direction, code) in sorted(spec.items()):
+        if name not in codec:
+            errors.append(f"{rel}: §4A.2 lists {direction} 0x{code:02X} {name}, which the codec does not define")
+
+
 def main() -> int:
     if not DOCS.exists():
         print("docs/ not found — nothing to check", file=sys.stderr)
@@ -85,6 +141,7 @@ def main() -> int:
     check_status_headers()
     check_relative_links()
     check_id_shapes()
+    check_ws_type_codes()
 
     for w in warnings:
         print(f"::warning::{w}")

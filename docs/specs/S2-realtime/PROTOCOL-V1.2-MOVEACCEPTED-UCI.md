@@ -25,11 +25,12 @@
 ## 1. Goal
 
 End-to-end: `MOVE_ACCEPTED` carries the `uci` of the move just applied, and an
-accepted non-terminal move is delivered to BOTH seats. Done =
+accepted move is delivered to BOTH seats (a move that ends the game is then
+followed by `GAME_END`). Done =
 - the codec `ServerMsg::MoveAccepted` gains `uci`, round-trips byte-identically
   through the real seam (Rust + cgo + wasm), with the regenerated golden vector;
-- the GS-6 transport broadcasts `MOVE_ACCEPTED` to both seats on an accepted
-  non-terminal move;
+- the GS-6 transport broadcasts `MOVE_ACCEPTED` to both seats on every accepted
+  move, terminal or not;
 - a regression test proves the OPPONENT receives the move (the gap this closes);
 - the web client (SPEC-S4-WEB-F01) can apply the authoritative UCI to its board.
 
@@ -128,8 +129,8 @@ not the request's `p.UCI`. This is a Go-side addition (no wire effect beyond the
 - [x] `ServerMsg::MoveAccepted` carries `uci`; round-trips through the real
       Rust/cgo/wasm seam; golden corpus regenerated with exactly one changed
       vector (`server/move_accepted`), freeze test green.
-- [x] GS-6 broadcasts MOVE_ACCEPTED (with `uci`) to both seats on an accepted
-      non-terminal move; terminal + re-ack + disconnected-opponent paths correct.
+- [x] GS-6 broadcasts MOVE_ACCEPTED (with `uci`) to both seats on every accepted
+      move (terminal moves then also get GAME_END); terminal + re-ack + disconnected-opponent paths correct.
 - [x] `game.MoveOutcome` carries `UCI`, set from the authoritative source on BOTH
       paths (fresh = `in.UCI`, re-ack = persisted `mv.UCI`); the transport reads
       `out.UCI`, never `p.UCI`. A retry with a different uci for a persisted ply
