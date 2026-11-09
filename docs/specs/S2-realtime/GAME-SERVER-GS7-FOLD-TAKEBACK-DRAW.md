@@ -4,8 +4,8 @@
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS7 (amends GS-3 live session, GS-3b endgame commands, PROTOCOL §4A, §5, §7) |
 | Owner | S2 Real-time |
-| Status | REVIEW |
-| Version | 0.7 |
+| Status | RATIFIED |
+| Version | 1.0 |
 | Last updated | 2026-11-09 |
 | Fixes (issues) | #84, #85 (blockers); #94, #67, #89, #122, #107, #101, #123 (directly); enables #95, #88, #97, #98, #111 (see §10) |
 | Depends on | GS-3, GS-3b, GS-4 (atomic `appendBatchAtHead`), PROTOCOL §4A / v1.1 / v1.2 |
@@ -35,7 +35,16 @@ review returned **RATIFY-WITH-CHANGES** (no blocker, 7 should-fix); v0.4 applied
 them; a confirmation review of v0.4 returned **RATIFY-WITH-CHANGES** (no blocker,
 3 should-fix), applied in v0.5. v0.6 records the owner's answers to Q-V1, Q-V2
 and Q-V3 (2026-11-09) and adds the #101 `STATE` fields; a focused review of that addition returned
-**RATIFY-WITH-CHANGES** (no blocker, 7 should-fix), applied in v0.7. Mapping in §13. No S2/PE/architecture sign-off is recorded (§14).
+**RATIFY-WITH-CHANGES** (no blocker, 7 should-fix), applied in v0.7. Mapping in §13.
+
+**Ratified 2026-11-09 (v1.0).** The owner attests that S2, S4, Platform-Eng, S6
+and the architecture group reviewed and approved this spec, ADR-19 and the v1.3
+amendment in a team review held outside GitHub (no GitHub review is attached to
+PR #156). The owner also kept the single bundled plan after a PR review finding
+that the blocker fix could ship without the protocol change; that tradeoff is
+recorded in §13. Sign-offs are recorded by stream name in §14. **Nothing is
+implemented yet**: ratifying approves the design and the v1.3 contract text, and
+the build follows §12.
 
 ## 1. Goal and scope
 
@@ -468,14 +477,14 @@ null`, `myTakebackSent: {atPly} | null`. Transitions:
 - `GAME_END`: clear all four.
 Reducer tests cover each transition.
 
-## 7. Protocol amendment (PROPOSED v1.3, ADR-19)
+## 7. Protocol amendment (v1.3, ADR-19)
 
 ### 7.0 Governance
 
 The canonical event set is "exactly MASTER §VIII.3" (`MASTER-PLAN.md`, and
 `event.rs` says "no additions"), and §7.4 mutates frozen frames. This slice
 therefore needs **ADR-19** plus a MASTER §VIII.3/§VIII.4 amendment. Both are
-drafted in `docs/MASTER-PLAN.md` (ADR-19 status PROPOSED). The exact contract
+recorded in `docs/MASTER-PLAN.md` (ADR-19 DECIDED 2026-11-09). The exact contract
 text to fold into `PROTOCOL.md` is [PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md](PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md). Required reviewers per
 PROTOCOL §4.2: S2, S4 (S5 for P2 clients), PE, S6 (fair-play veto: takeback) and
 the architecture group.
@@ -723,15 +732,16 @@ session is dropped). Not touched: #124.
 | Q-TB4 | Clock rule | Resolved by source reading, confirmed by the independent reviewer (§5.4). |
 | Q-DR1 | Draw decline and cooldown | Resolved (§6.3). Owner may veto. |
 | Q-DR2 | Which move declines an offer | Resolved: responder's only (§6.3). |
-| Q-V1 | Clients ignore unknown server types (§7.6) | **Decided by owner, 2026-11-09: yes.** PE review of the rule text still pending. |
+| Q-V1 | Clients ignore unknown server types (§7.6) | **Decided by owner, 2026-11-09: yes.** Rule text approved in the 2026-11-09 team review (PE included). |
 | Q-V2 | Ship the rest of #101 in the same v1.3 amendment (§7.4) | **Decided by owner, 2026-11-09: yes.** Field set taken from #101's acceptance criteria. |
 | Q-V3 | Pre-GS-7 streams unsupported (§5.1) | **Confirmed by owner, 2026-11-09:** no production data exists. |
 
 ## 12. Definition of Done
 
-- [ ] This spec re-reviewed (context-free) with no BLOCKER, then RATIFIED.
-- [ ] ADR-19 + MASTER §VIII.3/§VIII.4 amendment + protocol v1.3, reviewed by S2,
-      S4, PE, S6 and the architecture group, merged first.
+- [x] This spec re-reviewed (context-free) with no BLOCKER, then RATIFIED (2026-11-09).
+- [x] ADR-19 + MASTER §VIII.3/§VIII.4 amendment + protocol v1.3 reviewed by S2,
+      S4, PE, S6 and the architecture group (2026-11-09, owner attestation).
+- [ ] Those documents merged to `main` before any implementation PR.
 - [ ] Invariant harness merged and failing on `main` before the fix.
 - [ ] Refactor merged; repro tests pass; `-race` clean.
 - [ ] All codec consumers (§7.5) pass parity, including the v1.3 `STATE`/`MATCHED`.
@@ -784,14 +794,22 @@ session is dropped). Not touched: #124.
 | R5 F6 push sites | §7.4 one `stateFor`, five sites, `broadcastState` per seat |
 | R5 F7 unknown vs malformed | §7.6 "any undecodable frame", matches current web behaviour; stuck-old-client consequence |
 | R5 F8 documents | §7.5 |
+| **PR review** (#156): blocker fix bundled with v1.3 scope | Owner kept the bundled plan, 2026-11-09. Reason: no production games exist, so the blockers do no harm before the plan ships. Accepted cost: the #84/#85 fix is complete only after the v1.3 codec lands in every consumer, and takeback stays unconsented (#107) until then. Mitigation: implementation still lands as separate PRs in the §12 order, each independently reviewed |
+| **PR review** (#156): v1.1/v1.2 drift rows mixed into the ADR-19 hunk | Moved to PR #155; this PR is stacked on it and carries only ADR-19 rows |
 | R3 nits | §6.3 signed arithmetic; §5.2 [dev] responder TAKEBACK no-op and error mapping; §3.2 evolve 2-seat guard; §3.1 PlyEntry seq; §4 NOT_YOUR_TURN and GAME_OVER rows; §3.1 HalfTerminal flag-only; §7.4 seam claim and at_ply 0; §5.4 increment-farming note |
 
-## 14. Sign-off (not yet recorded)
+## 14. Sign-off
+
+Recorded on the owner's attestation of a team review held 2026-11-09 outside
+GitHub. Attributed by stream name, as the owner has chosen for earlier
+ratifications; no individual reviewer names are recorded.
 
 | Role | Name | Date | Verdict |
 |---|---|---|---|
-| Owner (design direction, chat) | Ashish Kumar | 2026-11-09 | Direction approved for v0.1; Q-V1, Q-V2, Q-V3 decided; v0.7 text not yet reviewed |
-| S2 Real-time | | | pending |
-| Platform-Eng (protocol) | | | pending |
-| Architecture | | | pending |
+| Owner | Ashish Kumar | 2026-11-09 | Approved (design direction, Q-V1, Q-V2, Q-V3, bundled plan, v1.0 text) |
+| S2 Real-time | S2 stream | 2026-11-09 | Approved |
+| S4 Web | S4 stream | 2026-11-09 | Approved |
+| Platform-Eng (protocol) | PE stream | 2026-11-09 | Approved |
+| S6 Trust & Safety (fair-play veto) | S6 stream | 2026-11-09 | Approved |
+| Architecture | Architecture group | 2026-11-09 | Approved |
 | Independent context-free review | | 2026-11-09 | v0.1: BLOCK. v0.2: BLOCK. v0.3: RATIFY-WITH-CHANGES (applied in v0.4). v0.4: RATIFY-WITH-CHANGES (applied in v0.5). v0.6 focused: RATIFY-WITH-CHANGES (applied in v0.7) |

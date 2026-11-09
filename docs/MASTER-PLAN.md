@@ -809,16 +809,17 @@ when one broadcast MOVE_ACCEPTED carrying `uci` serves both identically.
 broadcasting to both seats + the mobile parity re-run) and the S4 web client's
 reducer/move path (SPEC-S4-WEB-F01 §3.3), currently blocked on it.
 
-## ADR-19 (new) · §4A protocol v1.3 — takeback with consent, draw decline, `ClockStarted`, and a full resync `STATE` · **PROPOSED (owner direction approved 2026-11-09; awaiting S2 + S4 + PE + S6 + architecture review)**
+## ADR-19 (new) · §4A protocol v1.3 — takeback with consent, draw decline, `ClockStarted`, and a full resync `STATE` · **DECIDED (2026-11-09; reviewed and approved by S2, S4, PE, S6 and the architecture group, owner-attested; owner kept the bundled plan)**
 
 > Amends the frozen SPEC-S2-PROTOCOL §4A and MASTER §VIII.3/§VIII.4. Driven by
 > SPEC-S2-GAME-SERVER-GS7 (`docs/specs/S2-realtime/GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md`),
 > which fixes the two reproduced blockers #84 and #85. Per PROTOCOL §4.2 a
 > post-G-D wire change is a new protocol version and needs review by the affected
 > streams (S2, S4; S5 for the P2 clients), the architecture group, and S6 (fair-play
-> veto: takeback changes what a player can undo). **PROPOSED: not implemented
-> until those reviews are recorded.** The owner's chat approval covers design
-> direction and Q-V1/Q-V2/Q-V3 only; it is not a stream sign-off.
+> veto: takeback changes what a player can undo). **DECIDED 2026-11-09:** those
+> streams and the architecture group approved it in a team review the owner
+> attests to (recorded by stream name in SPEC-S2-GAME-SERVER-GS7 §14). Decided is
+> not implemented: the shipped codec is still v1.2.
 
 **Context.** Four defects share one cause, and the frozen protocol cannot express
 the fix:
@@ -833,7 +834,7 @@ the fix:
    learn its seat, the ply, whether the game is over, the result, the last move,
    pending prompts, or which clock is running (#101, #123).
 
-**Decision (proposed).** §4A v1.3 (major `ver` stays `0x01`):
+**Decision.** §4A v1.3 (major `ver` stays `0x01`):
 
 *Events, additive.* `0x0D TakebackProposed{seat_idx}`, `0x0E TakebackRewound{seat_idx,
 to_ply:u32, server_ts:u64}`, `0x0F TakebackDeclined{seat_idx}`, `0x10
@@ -933,7 +934,7 @@ lands here).
 | ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
 | ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **DECIDED** | S2 + Architecture |
 | ADR-18 | new | §4A protocol v1.2 — MOVE_ACCEPTED carries `uci` + broadcast to BOTH seats; mutates a frozen frame (safe pre-first-client) | **DECIDED** | S2 + S4 + Architecture |
-| ADR-19 | new | §4A protocol v1.3 — takeback consent + draw decline (additive events/messages), `ClockStarted`, full resync STATE (mutates STATE/MATCHED, safe pre-first-client), no-MOVE-resend and drop-undecodable client rules | **PROPOSED** | S2 + S4 + S6 + PE + Architecture |
+| ADR-19 | new | §4A protocol v1.3 — takeback consent + draw decline (additive events/messages), `ClockStarted`, full resync STATE (mutates STATE/MATCHED, safe pre-first-client), no-MOVE-resend and drop-undecodable client rules | **DECIDED** | S2 + S4 + S6 + PE + Architecture |
 
 ---
 

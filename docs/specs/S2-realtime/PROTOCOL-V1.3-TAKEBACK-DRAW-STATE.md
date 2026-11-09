@@ -4,11 +4,11 @@
 |---|---|
 | Spec ID | SPEC-S2-PROTOCOL-V1.3 (amends SPEC-S2-PROTOCOL §3.1, §3.2, §4A, §5; implements ADR-19) |
 | Owner | S2 Real-time + Architecture |
-| Status | REVIEW |
-| Version | 0.1 |
+| Status | RATIFIED |
+| Version | 1.0 |
 | Last updated | 2026-11-09 |
 | Implements (master IDs) | X-2, X-13, ADR-14, ADR-19, NFR-2, NFR-5, NFR-10 |
-| Depends on | ADR-19 (PROPOSED: nothing here is implemented until ADR-19 is reviewed by S2, S4, PE, S6 and the architecture group); SPEC-S2-GAME-SERVER-GS7 (the server behaviour these frames carry); PROTOCOL.md at text version 1.2 (#106) |
+| Depends on | ADR-19 (DECIDED 2026-11-09 after review by S2, S4, PE, S6 and the architecture group; owner attestation); SPEC-S2-GAME-SERVER-GS7 (the server behaviour these frames carry); PROTOCOL.md at text version 1.2 (#106) |
 | Gates it feeds | Re-runs the G-D freeze corpus. Required by GS-7 (fixes #84, #85, #101, #107, #123). |
 
 > **Why this document exists.** It is the exact contract text that will be folded
@@ -18,6 +18,9 @@
 > (`docs/MASTER-PLAN.md`); server behaviour is in
 > [GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md](GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md).
 > This document pins only bytes, codes, tables and client rules.
+>
+> **Ratified, not implemented.** Approved 2026-11-09. The shipped codec is still
+> v1.2; this text is folded into `PROTOCOL.md` only by the PR that implements it.
 
 ## 1. Summary of changes
 
@@ -148,7 +151,7 @@ the new codes are in `PROTOCOL.md` §4A.2.
 
 ## 10. Acceptance criteria
 
-- [ ] ADR-19 reviewed by S2, S4, PE, S6 and the architecture group; this document RATIFIED.
+- [x] ADR-19 reviewed by S2, S4, PE, S6 and the architecture group; this document RATIFIED (2026-11-09).
 - [ ] Codec, all bindings and the Go seams implement §2–§6; decode invariants enforced in each.
 - [ ] Golden corpus per §8; all consumers byte-identical; v1.2 vectors other than `state`/`matched` unchanged.
 - [ ] Client rules (§7) covered by client contract tests (web now; iOS/Android in P2).
