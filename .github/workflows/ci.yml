@@ -413,3 +413,5 @@ jobs:
           python-version: "3.12"
       - name: Lint CI tooling
         run: python3 -c "import py_compile,glob,sys; [py_compile.compile(f,doraise=True) for f in glob.glob('platform/ci/*.py')]; print('platform/ci python compiles clean')"
+      - name: Unit-test CI tooling
+        run: python3 -m unittest discover -s platform/ci -p 'test_*.py' -v

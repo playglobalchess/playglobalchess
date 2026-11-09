@@ -1042,13 +1042,12 @@ S  ERROR          {code, msg}
 ```
 `start_state` is the same body as `STATE` (Q-P4). Client rules (ADR-19): never
 resend a `MOVE` already sent; drop and log any undecodable server frame.
-
-> **Drift correction (not part of ADR-19).** Before this amendment §VIII.4 still
-> showed the v1.0 table: it never recorded ADR-17's `RESYNC`/`DRAW_OFFERED` or
-> ADR-18's `uci` on `MOVE_ACCEPTED`. Those rows are brought current here so the
-> table matches the shipped codec; they record decisions already ratified and are
-> not new. Related: #106 (`PROTOCOL.md` never amended for v1.1/v1.2).
 Reconnect: client re-auths, sends last known `ply`, server replies `STATE` to resync (NFR-2 no-game-loss).
+
+> **Drift correction (#106).** This table had not recorded ADR-17's `RESYNC` and
+> `DRAW_OFFERED` or ADR-18's `uci` on `MOVE_ACCEPTED`. Those rows are added here
+> so it matches the shipped codec and SPEC-S2-PROTOCOL. They record decisions
+> already ratified; no new decision is made.
 
 ## VIII.5 REST/JSON surface (non-realtime) — representative, not exhaustive
 ```

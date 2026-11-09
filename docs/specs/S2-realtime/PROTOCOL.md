@@ -5,8 +5,8 @@
 | Spec ID | SPEC-S2-PROTOCOL |
 | Owner | S2 Real-time (stream lead — fill in); co-reviewed by S3 Platform + PE Platform-Eng + Architecture group |
 | Status | RATIFIED |
-| Version | 1.0 |
-| Last updated | 2026-10-12 (owner-approved; ADR-14 DECIDED) |
+| Version | 1.2 |
+| Last updated | 2026-11-09 (text brought current with the shipped codec: §4A v1.1 per ADR-17, §4A v1.2 per ADR-18, postcard payload framing per ADR-14; issue #106. No new protocol decision.) |
 | Implements (master IDs) | X-2, X-13, ADR-10, NFR-5, NFR-7, NFR-10; MASTER §VIII (VIII.1–VIII.4), §IX.1 |
 | Depends on | SPEC-S1-ENGINE-CORE (G-A, GREEN) — the server validates intents via the engine |
 | Gates it feeds | **G-D** (API/protocol contract frozen v1). Per owner decision Q-P1=(b), G-D is green only when **this spec AND `PE/API-CONTRACT.md` (REST surface, X-13) are frozen together** — this is the realtime half of the v1 surface, not the whole gate. |
@@ -71,18 +71,20 @@ This spec covers exactly **three artifacts**, matching the `protocol/` folder's 
 | `0x07` | C | TAKEBACK | `game_id` |
 | `0x08` | C | REMATCH | `game_id` |
 | `0x09` | C | PING | `t: u64` (client monotonic ms) |
+| `0x0A` | C | RESYNC | `game_id` (v1.1, ADR-17: ask for a fresh STATE) |
 | `0x81` | S | MATCHED | `game_id, seat_idx: u8, opponent, start_state` |
-| `0x82` | S | MOVE_ACCEPTED | `game_id, ply: u32, clock_after_ms: u32` |
+| `0x82` | S | MOVE_ACCEPTED | `game_id, ply: u32, uci: str, clock_after_ms: u32` (v1.2, ADR-18: carries `uci`, sent to both seats) |
 | `0x83` | S | MOVE_REJECTED | `game_id, ply_expected: u32, reason: enum` |
-| `0x84` | S | STATE | `game_id, fen: str, clocks, turn: u8` (full resync) |
+| `0x84` | S | STATE | `game_id, fen: str, turn: u8, clocks` (full resync) |
 | `0x85` | S | GAME_END | `game_id, result_vector, termination: enum, rating_delta` |
 | `0x86` | S | PONG | `t: u64, server_t: u64` (clock sync, NFR-1 drift budget) |
+| `0x87` | S | DRAW_OFFERED | `game_id, by: u8` (v1.1, ADR-17: pushed to the opponent on a new offer) |
 | `0x8F` | S | ERROR | `code: enum, msg: str` |
 
-> **DECISION NEEDED — payload encoding (Q-P2).** MASTER mandates "compact binary" but not *which*. Candidates: (a) a hand-rolled fixed-layout binary codec, (b) a schema codec (Protobuf / FlatBuffers / bare `bincode`/`postcard` from the Rust core). The leading recommendation is **a single schema-defined binary codec compiled into the shared Rust core (ADR-9)** so web/iOS/Android encode/decode *identically* (NFR-10) with no per-platform hand-rolling drift. This is a shared-contract + ADR-adjacent choice → architecture-group decision before RATIFIED. §3.1.1 is written against that recommendation but is the one part gated on Q-P2.
+**Payload encoding — DECIDED (ADR-14).** One schema-defined binary codec in the shared Rust core (`protocol/codec`), bound into every client and the Go server. Payloads are **postcard**-encoded; the two header bytes are written raw (§4A.1). The concrete byte rules are in §4A.
 
-#### 3.1.1 Payload encoding (recommended, pending Q-P2)
-- One schema (the codec's IDL) defines every payload; the shared Rust core (ADR-9) exposes `encode(msg) -> bytes` / `decode(bytes) -> msg` and is the single codec all three clients + the Go server call (the Go server calls it across the ADR-12 FFI/gRPC boundary — it does **not** re-implement the codec, per NFR-5's spirit).
+#### 3.1.1 Payload encoding (ADR-14)
+- One schema (the Rust types in `protocol/codec`) defines every payload; the shared Rust core (ADR-9) exposes `encode(msg) -> bytes` / `decode(bytes) -> msg` and is the single codec all three clients + the Go server call. Web uses the wasm binding (`protocol/codec-wasm`), iOS/Android the UniFFI binding (`protocol/codec-ffi`), and the Go server the in-process cgo C-ABI (`protocol/codec-cgo`, ADR-15). No consumer re-implements the codec.
 - `uci`: ASCII move string (`e2e4`, `e7e8q`), ≤ 5 bytes; validated by the engine, not the codec.
 - `fen` only appears in `STATE` (resync), never on the per-move hot path (§6).
 - `result_vector`: per-seat result (win/loss/draw) indexed by `seat_idx`, sized for N-seat (ADR-3) but v1 carries 2 seats.
@@ -116,6 +118,7 @@ A game is the stream `game/{id}`: an ordered, append-only sequence of immutable 
 - `seq`: 0-based position in the stream; strictly increasing, no gaps; the ordering authority (distinct from chess `ply`, since non-move events have no ply).
 - `schema_ver`: per-event schema version for forward evolution (§5).
 - `ts`: server-assigned persist time.
+- Byte order on disk (§4A.8): `stream_id`, `seq`, `type` (one raw byte), `schema_ver`, `ts`, then the body.
 
 **Durability contract (NFR-7).** The server MUST durably persist `MovePlayed` (envelope committed to the event store) **before** emitting the `S MOVE_ACCEPTED` wire ack. Ack-before-persist is a correctness bug. RPO ≤ 5 s / RTO ≤ 15 min (NFR-7, §XIII) are the store's targets, cited not defined here.
 
@@ -146,7 +149,14 @@ This spec **is** a shared cross-stream contract (CONVENTIONS "Cross-stream contr
 
 ## 4A. Appendix — frozen byte layout & enum tables (v1)
 
-Written against the ADR-14 codec (one schema-defined binary codec in the shared Rust core). Primitive conventions: integers **little-endian, unsigned** unless noted; `strN` = a length-prefixed UTF-8 string (`u16` byte-length prefix, then bytes); `enum8` = `u8` from the tables below; booleans = `u8` ∈ {0,1}. The codec library's framing (e.g. `postcard` varint vs fixed) is the one item locked at RATIFIED once ADR-14 is DECIDED; the field **order, types, and widths** below are fixed now.
+Encoded by the ADR-14 codec (`protocol/codec`). **Physical encoding:** the frame header bytes `ver` and `type` are single raw bytes; the payload is the postcard encoding of the fields below, in the listed order. Postcard rules that matter for implementers:
+- `u8` and `bool` are one byte (`bool` ∈ {0,1}); `enum8` is a `u8` from the tables below.
+- `u16`, `u32`, `u64` are **varints** (LEB128-style), not fixed-width little-endian.
+- `str` (and `strN`) is a varint byte-length prefix followed by UTF-8 bytes; `N` is a maximum length the codec enforces, not a fixed width.
+- `[T; seat_count]` and other sequences are a varint element count followed by the elements.
+- A payload must be consumed exactly: trailing bytes are a decode error.
+
+The tables give field **order and logical type**; the byte-level truth is the golden-vector corpus in `protocol/vectors/`, which every consumer must reproduce byte-for-byte (§8).
 
 ### 4A.1 Frame envelope
 | Offset | Field | Type | Notes |
@@ -155,7 +165,7 @@ Written against the ADR-14 codec (one schema-defined binary codec in the shared 
 | 1 | `type` | u8 | message type code (§4A.2) |
 | 2.. | `payload` | per type | §4A.3 field order |
 
-Max frame size (v1): **4 KB** (a resync `STATE` with a long FEN is the largest; the move hot path is ≤ ~40 B). Over-size → `ERROR{code=PROTOCOL_VIOLATION}`.
+Max frame size (v1): **4 KB** (`MAX_FRAME_BYTES = 4096` in the codec; a resync `STATE` with a long FEN is the largest; the move hot path is ≤ ~40 B). Over-size → `ERROR{code=PROTOCOL_VIOLATION}`. Note: the game-server's WebSocket read limit is currently 16 KiB, above this cap (tracked in #104).
 
 ### 4A.2 Message type codes (u8) — frozen
 Client→server `0x01–0x7F`; server→client `0x80–0xFF` (high bit = direction, a cheap wrong-direction check).
@@ -169,8 +179,11 @@ Client→server `0x01–0x7F`; server→client `0x80–0xFF` (high bit = directi
 | 0x05 | C | RESIGN | | 0x85 | S | GAME_END |
 | 0x06 | C | ABORT | | 0x86 | S | PONG |
 | 0x07 | C | TAKEBACK | | 0x8F | S | ERROR |
-| 0x08 | C | REMATCH | | | | |
+| 0x08 | C | REMATCH | | 0x87 | S | DRAW_OFFERED |
 | 0x09 | C | PING | | | | |
+| 0x0A | C | RESYNC | | | | |
+
+v1.1 (ADR-17) added `0x0A RESYNC` and `0x87 DRAW_OFFERED` in reserved slots; no existing code moved.
 
 ### 4A.3 Payload field layouts (field order fixed)
 `game_id` = `str36` (UUID text); `uci` = `str5` max; `token` = `str` (≤ 4096); `time_control` = `str` id (Q-A4); `fen` = `str` (≤ 90).
@@ -179,16 +192,18 @@ Client→server `0x01–0x7F`; server→client `0x80–0xFF` (high bit = directi
 AUTHENTICATE   token:str
 SEEK           pool_id:str, time_control:str, rated:bool
 MOVE           game_id:str36, ply_expected:u32, uci:str5
-OFFER_DRAW/RESIGN/ABORT/TAKEBACK/REMATCH   game_id:str36
+OFFER_DRAW/RESIGN/ABORT/TAKEBACK/REMATCH/RESYNC   game_id:str36
 PING           t:u64
 MATCHED        game_id:str36, seat_idx:u8, opponent:str(handle), start_state:STATE-body(§4A.6)
-MOVE_ACCEPTED  game_id:str36, ply:u32, clock_after_ms:u32
+MOVE_ACCEPTED  game_id:str36, ply:u32, uci:str5, clock_after_ms:u32
 MOVE_REJECTED  game_id:str36, ply_expected:u32, reason:enum8(§4A.4)
 STATE          game_id:str36, fen:str, turn:u8, clocks:[u32; seat_count]
 GAME_END       game_id:str36, result_vector:[u8; seat_count], termination:enum8(§4A.5), rating_delta:[i16; seat_count]
 PONG           t:u64, server_t:u64
+DRAW_OFFERED   game_id:str36, by:u8
 ERROR          code:enum8(§4A.7), msg:str
 ```
+`MOVE_ACCEPTED.uci` (v1.2, ADR-18) is the move just applied, in the same position as in the `MovePlayed` event body; the server sends it to BOTH seats for every accepted move (and then `GAME_END` if that move ended the game). On a duplicate `MOVE` it echoes the persisted move's `uci`. `RESYNC` shares the bare `game_id` payload with the ending commands.
 `result_vector` entry: `0=loss, 1=draw, 2=win` (per seat_idx). `rating_delta` is `i16` signed.
 
 ### 4A.4 `reason` enum (MOVE_REJECTED) — u8, frozen
@@ -234,12 +249,12 @@ All enum spaces leave unused codes reserved for v1-additive events/variants (§5
 | **Stale/racing move** (`ply_expected` ≠ server ply) | `S MOVE_REJECTED {ply_expected = server's current, reason=STALE_PLY}`. `ply_expected` on the `C MOVE` is the race guard (MASTER §VIII.4). |
 | **Illegal move** | Engine rejects → `MOVE_REJECTED {reason=ILLEGAL}`. No event appended. |
 | **Move arrives after game ended** | `MOVE_REJECTED {reason=GAME_OVER}`. |
-| **Reconnect** | Client re-auths, sends last known `ply`; server replies `S STATE {fen, clocks, turn}` to resync (NFR-2 no game loss). STATE is a fold of the event stream, authoritative. |
-| **Duplicate MOVE (client retry)** | Idempotent on `(game_id, ply_expected)`: if that ply is already persisted, re-send `MOVE_ACCEPTED` for it rather than appending a second event. (Protects the NFR-7 persist-before-ack window on a flaky socket.) |
+| **Reconnect** | Client re-auths; the server pushes `S STATE {fen, turn, clocks}` for the user's live game after `AUTHENTICATE` (NFR-2 no game loss). A client can also ask with `C RESYNC` (v1.1). STATE is a fold of the event stream, authoritative. |
+| **Duplicate MOVE (client retry)** | Idempotent on `(game_id, ply_expected)`: if that ply is already persisted, re-send `MOVE_ACCEPTED` for it (echoing the persisted `uci`, v1.2) rather than appending a second event. (Protects the NFR-7 persist-before-ack window on a flaky socket.) |
 | **Unknown/zero `game_id`** | `ERROR {code=UNKNOWN_GAME}`. |
 | **Unsupported protocol version** | `ERROR {code=UNSUPPORTED_VERSION}`, socket closed. |
 | **Wrong-direction / malformed frame** | `ERROR {code=PROTOCOL_VIOLATION}`. |
-| **Event schema evolution** | Readers tolerate unknown higher `schema_ver` of a known event type by schema rules; a *new event type* or a breaking field change bumps the stream's compatibility and is a G-D-versioned change (§4.2). |
+| **Event schema evolution** | Readers tolerate unknown higher `schema_ver` of a known event type by schema rules; a *new event type* or a breaking field change bumps the stream's compatibility and is a G-D-versioned change (§4.2). **Implementation gap (not a contract change):** today the codec reads `schema_ver` but no reader branches on it, and the event store rejects any encoding version other than its current one, so this tolerance rule is not implemented or tested (#150). |
 | **Extensibility (future variants)** | Frame `type` code space and event `type` set are open-ended; v1 reserves Standard/2-seat codes and leaves room for variant/N-seat events (MASTER §VIII.6) without reusing a v1 code. |
 
 ## 6. Non-functional handling
@@ -277,7 +292,7 @@ Frozen = **G-D for live play**. A reviewer can call this DONE when:
 
 - [x] §4A enum tables and field widths enumerated with concrete frozen u8 values **in this spec** (resolves Q-P3); codec-library framing locks at RATIFIED with ADR-14.
 - [x] `MATCHED.start_state` shape pinned (reuse `STATE` body, §4A.6) (resolves Q-P4).
-- [x] Codec written as **ADR-14** in MASTER-PLAN (PROPOSED); §3.1.1 cites it (resolves Q-P2 drafting). RATIFIED still requires owner to move ADR-14 PROPOSED → DECIDED.
+- [x] Codec written as **ADR-14** in MASTER-PLAN, now **DECIDED** (postcard payloads, raw header bytes); §3.1.1 cites it (resolves Q-P2).
 - [ ] Q-P1 is DECIDED (b): `../PE-platform-eng/API-CONTRACT.md` (REST surface, X-13) exists and freezes **together with** this spec — G-D is not green on this spec alone. ✓ exists.
 - [ ] The codec is implemented in the shared Rust core and bound into all three clients.
 - [ ] The §8 golden-vector corpus exists under `protocol/` and passes on Rust + web + iOS + Android (NFR-10).
@@ -291,9 +306,20 @@ Frozen = **G-D for live play**. A reviewer can call this DONE when:
 Owner directive (2026-10-12): **correctness and highest quality over speed.** The resolutions below are set to the no-compromise reading accordingly.
 
 - **Q-P1 — G-D scope / ownership boundary — DECIDED (b), owner, 2026-10-12.** G-D (API/protocol contract frozen v1) is green only when **both** this realtime contract (WS frame + event store + entity shape) **and** a PE `API-CONTRACT.md` (the REST/JSON surface, MASTER §VIII.5, X-13) are frozen together as one coherent v1 client-facing surface. Rationale: clients bind both halves; freezing one and declaring the gate green would let the two drift — the exact compromise the owner ruled out. Matches MASTER §V.2's own wording ("X-13 API contract frozen (v1)"). **Consequence:** a sibling spec `PE/API-CONTRACT.md` is a required, parallel P0 artifact; this spec is the realtime half and does not freeze alone. This spec stays scoped to the three realtime artifacts.
-- **Q-P2 — binary payload codec — ROUTED TO ADR-14 (PROPOSED).** Written as **ADR-14** in MASTER-PLAN (not ADR-13, which is reserved for the held magic-bitboards skip): one schema-defined binary codec in the shared Rust core, bound into all three clients. §3.1.1 and the §4.3 appendix below are written against that proposal. **Blocks RATIFIED until the owner moves ADR-14 PROPOSED → DECIDED.**
-- **Q-P3 — exact byte values & enum tables — RESOLVED (Appendix 4A).** Concrete u8 codes for `type`, `reason` (§4A.4), `termination` (§4A.5), `error code` (§4A.7), event `type` (§4A.9), the frame envelope + payload field layouts (§4A.1–4A.3), and the event-store envelope (§4A.8) are all pinned in-spec. The one item locked at RATIFIED is the ADR-14 codec library's framing (varint vs fixed) — field order/types/widths are fixed now. `time_control` is a str id (Q-A4), not an enum.
+- **Q-P2 — binary payload codec — DECIDED (ADR-14).** One schema-defined binary codec in the shared Rust core, bound into all three clients and the Go server; payloads are postcard, header bytes raw (§4A). (ADR-13 is the held magic-bitboards skip, unrelated.)
+- **Q-P3 — exact byte values & enum tables — RESOLVED (Appendix 4A).** Concrete u8 codes for `type`, `reason` (§4A.4), `termination` (§4A.5), `error code` (§4A.7), event `type` (§4A.9), the frame envelope + payload field layouts (§4A.1–4A.3), and the event-store envelope (§4A.8) are all pinned in-spec. The codec framing is now locked: postcard varints and length prefixes (§4A); field order and logical types are as tabled. `time_control` is a str id (Q-A4), not an enum.
 - **Q-P4 — `start_state` payload of `MATCHED` — RESOLVED (§4A.6).** `MATCHED.start_state` is exactly the `STATE` body from `fen` onward — one state format, no second encoding.
+
+## 11. Version history
+
+| Version | Date | Change | Decision |
+|---|---|---|---|
+| 1.0 | 2026-10-12 | Initial frozen contract | ADR-10, ADR-14 |
+| 1.1 | 2026-10-16 | `C RESYNC 0x0A`, `S DRAW_OFFERED 0x87` (additive) | ADR-17; slice `PROTOCOL-V1.1-RESYNC-DRAWOFFERED.md`, merged #56 |
+| 1.2 | 2026-10-16 | `MOVE_ACCEPTED` gains `uci` and goes to both seats (mutates a frozen frame) | ADR-18; slice `PROTOCOL-V1.2-MOVEACCEPTED-UCI.md`, merged #61 |
+| text | 2026-11-09 | v1.1/v1.2 folded into this document; §4A physical encoding corrected to postcard; stale Q-P2/ADR-14 PROPOSED text removed (#106). No wire change. | none (doc correction) |
+
+The major `ver` byte stays `0x01` for v1.x. Version numbers here are document versions of the v1 wire.
 
 ---
 
