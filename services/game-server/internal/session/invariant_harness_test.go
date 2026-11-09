@@ -229,8 +229,15 @@ func (h *harness) check() *violation {
 		return brk("harness", "rebuild internal: %v", err)
 	}
 	parts, texts := snapshotDiff(live, rbSnap)
-	p2, t2 := internalDiff(liveIn, rbIn)
+	p2, t2 := internalDiff(liveIn, rbIn, h.pendingOffer)
 	parts, texts = append(parts, p2...), append(texts, t2...)
+	// The live offer must match the harness's model of today's offer rules.
+	// This compares live against the RULES, not against a rebuild, so it is
+	// never excusable: it is what catches offer-clearing bugs while #159 is open.
+	if liveIn.drawOfferBy != h.pendingOffer {
+		parts = append(parts, "offerModel")
+		texts = append(texts, fmt.Sprintf("live drawOfferBy %d but the offer rules say %d", liveIn.drawOfferBy, h.pendingOffer))
+	}
 	if len(parts) == 0 {
 		return nil
 	}
@@ -266,13 +273,21 @@ func snapshotDiff(a, b Snapshot) (parts, texts []string) {
 	return parts, texts
 }
 
-func internalDiff(a, b internalView) (parts, texts []string) {
+// internalDiff compares live (a) with a rebuild (b). model is the harness's
+// expected live offer. A pending offer the rebuild lost while live holds exactly
+// the expected offer is the known #159 gap and gets its own part name; any other
+// offer difference is the unowned part "drawOfferBy".
+func internalDiff(a, b internalView, model int) (parts, texts []string) {
 	if fmt.Sprint(a.priorKeys) != fmt.Sprint(b.priorKeys) {
 		parts = append(parts, "priorKeys")
 		texts = append(texts, fmt.Sprintf("priorKeys len %d vs %d", len(a.priorKeys), len(b.priorKeys)))
 	}
 	if a.drawOfferBy != b.drawOfferBy {
-		parts = append(parts, "drawOfferBy")
+		part := "drawOfferBy"
+		if b.drawOfferBy == -1 && a.drawOfferBy >= 0 && a.drawOfferBy == model {
+			part = "offerLostOnRebuild"
+		}
+		parts = append(parts, part)
 		texts = append(texts, fmt.Sprintf("drawOfferBy %d vs %d", a.drawOfferBy, b.drawOfferBy))
 	}
 	if a.lastMoveMs != b.lastMoveMs {
@@ -306,17 +321,26 @@ func partOwner(part, text string) string {
 		return "#157"
 	case "lastMoveAt":
 		return "#124"
-	case "drawOfferBy":
+	case "offerLostOnRebuild":
 		return "#159"
 	}
 	return ""
 }
+
+// neverExcused lists parts no known issue may explain: harness failures, a
+// failing rebuild, and a live offer that contradicts the offer rules.
+var neverExcused = map[string]bool{"harness": true, "rebuild": true, "offerModel": true}
 
 // excuse returns the known issues that together explain v, or nil if any part
 // is unexplained.
 func (h *harness) excuse(v *violation) []string {
 	if strictMode() || h.avoidKnown || v == nil {
 		return nil
+	}
+	for _, p := range v.parts {
+		if neverExcused[p] {
+			return nil
+		}
 	}
 	if h.triggers["#84"] && sig84(v) {
 		return []string{"#84"}
@@ -340,8 +364,9 @@ func (h *harness) triggered(issue string) bool {
 		snap, err := h.live.StateSnapshot(h.ctx)
 		return err == nil && snap.Ply == 0
 	case "#159":
-		in, err := readInternal(h.ctx, h.live)
-		return err == nil && in.drawOfferBy >= 0
+		// Fully encoded in the part itself (offerLostOnRebuild requires the
+		// rebuild to have lost exactly the offer the rules expect).
+		return true
 	}
 	return h.triggers[issue]
 }
@@ -557,6 +582,10 @@ func (h *harness) opOfferDraw(r *rand.Rand, cov *coverage) {
 	if h.avoidKnown {
 		return // any pending offer is the #159 state; a second one is #85
 	}
+	// Offer model (today's rules): a first offer sets it, a repeat by the same
+	// seat is a no-op, an offer by the other seat is mutual and ends the game;
+	// accepted new moves, takebacks, accepts and restarts clear it; resign and
+	// flag leave it.
 	by := uint8(r.Intn(2))
 	mutual := h.pendingOffer >= 0 && h.pendingOffer != int(by)
 	err := h.live.OfferDraw(h.ctx, by)
@@ -579,6 +608,9 @@ func (h *harness) opAcceptDraw(r *rand.Rand) {
 	by := uint8(r.Intn(2))
 	err := h.live.AcceptDraw(h.ctx, by)
 	h.note("accept draw by %d -> err=%v", by, err)
+	if err == nil && h.pendingOffer >= 0 && h.pendingOffer != int(by) {
+		h.pendingOffer = -1 // an accepted offer is cleared (endgame.go acceptDrawCmd)
+	}
 }
 
 func (h *harness) opRestart(cov *coverage) {
@@ -589,6 +621,9 @@ func (h *harness) opRestart(cov *coverage) {
 	}
 	h.stop()
 	h.live, h.stop = rb, cancel
+	// Today a rebuilt session holds no pending offer (that loss IS #159), so the
+	// offer model follows the code: after a restart nothing is pending.
+	h.pendingOffer = -1
 	h.note("restart: live session replaced by a rebuild from the store")
 	cov.restarts++
 }
@@ -656,7 +691,14 @@ func TestGS7InvariantHarness(t *testing.T) {
 				r := rand.New(rand.NewSource(seed))
 				for i := 0; i < harnessSteps; i++ {
 					cont := h.step(r, c)
-					if v := h.check(); v != nil {
+					v := h.check()
+					if v == nil {
+						// A clean check closes every operation trigger, so a
+						// takeback or flag earlier in the run cannot excuse a
+						// later, unrelated break.
+						h.triggers = map[string]bool{}
+					}
+					if v != nil {
 						if issues := h.excuse(v); issues != nil {
 							for _, is := range issues {
 								excused[is]++
@@ -824,5 +866,6 @@ func TestRepro159_PendingDrawOfferSurvivesRebuild(t *testing.T) {
 	if err := h.live.OfferDraw(h.ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
 	}
-	expectKnownFailure(t, "#159", h.check(), onlyPart("drawOfferBy"))
+	h.pendingOffer = 0 // the offer rules: white's first offer is now pending
+	expectKnownFailure(t, "#159", h.check(), onlyPart("offerLostOnRebuild"))
 }
