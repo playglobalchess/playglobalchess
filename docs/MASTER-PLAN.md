@@ -809,6 +809,108 @@ when one broadcast MOVE_ACCEPTED carrying `uci` serves both identically.
 broadcasting to both seats + the mobile parity re-run) and the S4 web client's
 reducer/move path (SPEC-S4-WEB-F01 §3.3), currently blocked on it.
 
+## ADR-19 (new) · §4A protocol v1.3 — takeback with consent, draw decline, `ClockStarted`, and a full resync `STATE` · **DECIDED (2026-11-09; reviewed and approved by S2, S4, PE, S6 and the architecture group, owner-attested; owner kept the bundled plan)**
+
+> Amends the frozen SPEC-S2-PROTOCOL §4A and MASTER §VIII.3/§VIII.4. Driven by
+> SPEC-S2-GAME-SERVER-GS7 (`docs/specs/S2-realtime/GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md`),
+> which fixes the two reproduced blockers #84 and #85. Per PROTOCOL §4.2 a
+> post-G-D wire change is a new protocol version and needs review by the affected
+> streams (S2, S4; S5 for the P2 clients), the architecture group, and S6 (fair-play
+> veto: takeback changes what a player can undo). **DECIDED 2026-11-09:** those
+> streams and the architecture group approved it in a team review the owner
+> attests to (recorded by stream name in SPEC-S2-GAME-SERVER-GS7 §14). Decided is
+> not implemented: the shipped codec is still v1.2.
+
+**Context.** Four defects share one cause, and the frozen protocol cannot express
+the fix:
+1. `TakebackAccepted{seat_idx}` does not record what was undone, so only the
+   session's special code applies it; the canonical fold ignores it and every
+   other reader disagrees (#84, reproduced on `main` ad0626d).
+2. The session writes the opponent's acceptance itself (#107): `TAKEBACK` has no
+   consent, decline or notification on the wire.
+3. Draw has no decline frame, and the mutual-offer stream GS-3b writes cannot be
+   folded (#85, reproduced).
+4. `STATE` is `fen, turn, clocks` only. A reconnecting or reloaded client cannot
+   learn its seat, the ply, whether the game is over, the result, the last move,
+   pending prompts, or which clock is running (#101, #123).
+
+**Decision.** §4A v1.3 (major `ver` stays `0x01`):
+
+*Events, additive.* `0x0D TakebackProposed{seat_idx}`, `0x0E TakebackRewound{seat_idx,
+to_ply:u32, server_ts:u64}`, `0x0F TakebackDeclined{seat_idx}`, `0x10
+DrawDeclined{seat_idx}`, `0x11 ClockStarted{server_ts:u64}`, appended after
+`RatingApplied` in the Rust `GameEvent` enum (the cgo seam uses variant indices).
+`TakebackReq 0x08` and `TakebackAccepted 0x09` stay decodable and are never written
+again. No existing event body changes, so Part XIII "event schema is
+additive-only" holds.
+
+*Client messages, additive.* `TAKEBACK 0x07` keeps its code and means "request"
+only. New: `0x0B TAKEBACK_ACCEPT{game_id, at_ply:u32}`, `0x0C TAKEBACK_DECLINE{game_id,
+at_ply:u32}`, `0x0D DECLINE_DRAW{game_id}`.
+
+*Server messages, additive.* `0x88 TAKEBACK_OFFERED{game_id, seat_idx:u8, at_ply:u32}`,
+`0x89 TAKEBACK_DECLINED{game_id, seat_idx:u8}`, `0x8A DRAW_DECLINED{game_id,
+seat_idx:u8}`, inserted before `Error` in the Rust and Go enums.
+
+*`STATE` body, MUTATED.* `fen, turn, clocks` gains, in order: `you_seat:u8`,
+`ply:u32`, `status:u8` (new frozen table §4A.10: `0x01 MATCHED`, `0x02 LIVE`,
+`0x03 ENDED`), `result_vector:[u8]`, `termination:u8`, `last_move_uci:str5`,
+`pending_draw_by:u8`, `takeback_by:u8`, `takeback_at_ply:u32`, `running_seat:u8`,
+`server_t:u64`. `0xFF` means "no seat". The body is built per recipient, and
+`clocks` are charged to `server_t`. The same body stays `MATCHED.start_state`
+(Q-P4: one state format). GS-7 §7.4 holds the decode invariants.
+
+*Client rules, frozen.* (a) A client MUST NOT retransmit a `MOVE` it has already
+sent; a lost ack is recovered by `RESYNC`/`STATE`. (b) A client MUST drop and log
+any server frame it cannot decode and keep the connection; only
+`ERROR{UNSUPPORTED_VERSION}` is fatal. Both are enforced by client contract tests,
+not by the server.
+
+*Server semantic change.* With takeback, a ply number can recur, so
+`(game_id, ply_expected)` no longer uniquely identifies a move. A resent `MOVE` is
+re-acked only if seat and UCI match the move live at that ply; a different UCI
+gets `STALE_PLY` (v1.2 re-acked the persisted move regardless). A resent move
+after the game ended is re-acked, not `GAME_OVER` (#122).
+
+**Why mutating `STATE`/`MATCHED` is acceptable now** (the ADR-18 test). All clients
+bind the one shared Rust codec (ADR-9/NFR-10) and upgrade with it. No client is
+deployed, and the owner confirmed on 2026-11-09 that no production game data
+exists. The `server/state` and `server/matched` golden vectors change. After the
+web client ships to players, a change like this would be a breaking change. Rule
+(b) does not protect an old client from this change: such a client drops the new
+`STATE` and stays stuck, so the v1.3 server and web client ship together.
+
+**Relation to ADR-17.** ADR-17 rejected carrying a pending-offer flag in `STATE`
+*instead of* a `DRAW_OFFERED` push. v1.3 keeps the push and also carries pending
+state in `STATE`, because a reconnecting or reloaded client never sees a push
+that was sent while it was away. ADR-17's decision stands; only its rejected
+alternative is partly adopted, as a supplement.
+
+**Scope / boundary.** Pins only the frames, events, enum, client rules and
+idempotency rule above. Does NOT change: `C MOVE`, `MOVE_ACCEPTED`, `GAME_END`,
+the `reason`/`termination`/`error` tables, the frame envelope or the event
+envelope. Does NOT decide: when the first clock should start or whether the join
+window drains a clock (#124), restart ownership across nodes (#98), result delivery
+after the session is dropped (#102), opponent identity in `STATE` (#131), takeback
+preferences or a decline cooldown (deferred). Not a `ver` major bump.
+
+**Alternatives rejected.** *Change the `TakebackReq`/`TakebackAccepted` bodies and
+bump `schema_ver`.* The codec ignores `schema_ver`, and the store hard-fails on
+any other encoding version, so every stored item would become undecodable; it also
+breaks additive-only. *A request-or-accept toggle on `TAKEBACK`.* A resent or late
+frame changes meaning (a lost-ack resend of an accept becomes a new proposal).
+*Optional fields in `STATE`.* The hand-rolled Go postcard seams have no `Option`
+support; sentinels follow the existing `Aborted.by = 0xFF` precedent. *Cut takeback
+from the alpha.* Offered to the owner, who chose to keep it with real consent.
+*Leave #101 for a later amendment.* `STATE` changes now anyway; the owner chose one
+amendment (Q-V2).
+
+**Unblocks.** The GS-7 implementation, in order: the invariant harness (failing on
+`main`), the v1.3 codec across every consumer (Rust, wasm, FFI, Go cgo seams, the
+TS mirror, vectors), then the session decide/evolve refactor and transport
+changes, then the web reducer. Also unblocks S4 #111 and #112 (the protocol half
+lands here).
+
 ### ADR summary
 
 
@@ -832,6 +934,7 @@ reducer/move path (SPEC-S4-WEB-F01 §3.3), currently blocked on it.
 | ADR-16 | new | Event-store product = DynamoDB (AWS), scoped to the game-event store only; AWS-as-platform NOT ratified | **DECIDED** | S2 + Architecture |
 | ADR-17 | new | §4A protocol v1.1 — additive RESYNC (C 0x0A) + DRAW_OFFERED (S 0x87); no existing code moves | **DECIDED** | S2 + Architecture |
 | ADR-18 | new | §4A protocol v1.2 — MOVE_ACCEPTED carries `uci` + broadcast to BOTH seats; mutates a frozen frame (safe pre-first-client) | **DECIDED** | S2 + S4 + Architecture |
+| ADR-19 | new | §4A protocol v1.3 — takeback consent + draw decline (additive events/messages), `ClockStarted`, full resync STATE (mutates STATE/MATCHED, safe pre-first-client), no-MOVE-resend and drop-undecodable client rules | **DECIDED** | S2 + S4 + S6 + PE + Architecture |
 
 ---
 
@@ -896,12 +999,20 @@ Every game is a stream `game/{id}` of ordered events. Minimum event set:
 ```
 GameCreated      {pool, rated, seats, start_fen, time_control}
 PlayerJoined     {seat_idx, user_id}
+ClockStarted     {server_ts}                                   -- v1.3 (ADR-19)
 MovePlayed       {ply, seat_idx, uci, clock_after_ms, server_ts}
-DrawOffered / DrawAccepted / Resigned / Aborted / TakebackReq / TakebackAccepted
+DrawOffered / DrawAccepted / DrawDeclined / Resigned / Aborted  -- DrawDeclined v1.3
+TakebackProposed {seat_idx}                                    -- v1.3 (ADR-19)
+TakebackRewound  {seat_idx, to_ply, server_ts}                 -- v1.3 (ADR-19)
+TakebackDeclined {seat_idx}                                    -- v1.3 (ADR-19)
+TakebackReq / TakebackAccepted                                 -- frozen, never written from v1.3
 ClockFlagged     {seat_idx}
 GameEnded        {result_vector, termination}
 RatingApplied    {pool, per-seat {before, after, rd, vol}}
 ```
+Undone `MovePlayed` events stay in the stream. Every reader MUST take board state,
+history and clocks from the one canonical fold, which applies `TakebackRewound`,
+never from scanning `MovePlayed` events (ADR-19; SPEC-S2-GAME-SERVER-GS7 §3).
 Board state, PGN, and the `Move` table are **projections** of this stream. Anti-cheat (ADR-2) subscribes to the same stream.
 
 ## VIII.4 Wire protocol — live play (WebSocket, binary)
@@ -910,18 +1021,28 @@ Message types (client→server `C`, server→client `S`), carried as a compact b
 C  AUTHENTICATE   {token}
 C  SEEK           {pool, time_control, rated}         -- enter matchmaking
 C  MOVE           {game_id, ply_expected, uci}        -- intent; ply_expected guards races
-C  OFFER_DRAW / RESIGN / ABORT / TAKEBACK / REMATCH   {game_id}
+C  OFFER_DRAW / RESIGN / ABORT / TAKEBACK / REMATCH   {game_id}   -- TAKEBACK = request only (v1.3)
 C  PING           {t}                                 -- clock sync
 C  RESYNC         {game_id}                           -- v1.1 (ADR-17)
+C  TAKEBACK_ACCEPT  {game_id, at_ply}                 -- v1.3 (ADR-19)
+C  TAKEBACK_DECLINE {game_id, at_ply}                 -- v1.3 (ADR-19)
+C  DECLINE_DRAW   {game_id}                           -- v1.3 (ADR-19)
 S  MATCHED        {game_id, seat_idx, opponent, start_state}
 S  MOVE_ACCEPTED  {game_id, ply, uci, clock_after_ms} -- authoritative; both seats (v1.2, ADR-18)
 S  MOVE_REJECTED  {game_id, ply_expected, reason}     -- illegal/stale
-S  STATE          {game_id, fen, clocks, turn}        -- full resync on reconnect
+S  STATE          {game_id, fen, turn, clocks, you_seat, ply, status, result_vector,
+                   termination, last_move_uci, pending_draw_by, takeback_by,
+                   takeback_at_ply, running_seat, server_t}  -- full resync; per recipient (v1.3)
 S  GAME_END       {game_id, result_vector, termination, rating_delta}
 S  PONG           {t, server_t}                        -- clock sync (NFR-1 drift budget)
 S  DRAW_OFFERED   {game_id, by}                        -- v1.1 (ADR-17)
+S  TAKEBACK_OFFERED  {game_id, seat_idx, at_ply}      -- v1.3 (ADR-19)
+S  TAKEBACK_DECLINED {game_id, seat_idx}              -- v1.3 (ADR-19)
+S  DRAW_DECLINED  {game_id, seat_idx}                  -- v1.3 (ADR-19)
 S  ERROR          {code, msg}
 ```
+`start_state` is the same body as `STATE` (Q-P4). Client rules (ADR-19): never
+resend a `MOVE` already sent; drop and log any undecodable server frame.
 Reconnect: client re-auths, sends last known `ply`, server replies `STATE` to resync (NFR-2 no-game-loss).
 
 > **Drift correction (#106).** This table had not recorded ADR-17's `RESYNC` and
