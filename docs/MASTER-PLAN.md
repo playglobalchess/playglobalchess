@@ -912,15 +912,22 @@ C  SEEK           {pool, time_control, rated}         -- enter matchmaking
 C  MOVE           {game_id, ply_expected, uci}        -- intent; ply_expected guards races
 C  OFFER_DRAW / RESIGN / ABORT / TAKEBACK / REMATCH   {game_id}
 C  PING           {t}                                 -- clock sync
+C  RESYNC         {game_id}                           -- v1.1 (ADR-17)
 S  MATCHED        {game_id, seat_idx, opponent, start_state}
-S  MOVE_ACCEPTED  {game_id, ply, clock_after_ms}      -- authoritative
+S  MOVE_ACCEPTED  {game_id, ply, uci, clock_after_ms} -- authoritative; both seats (v1.2, ADR-18)
 S  MOVE_REJECTED  {game_id, ply_expected, reason}     -- illegal/stale
 S  STATE          {game_id, fen, clocks, turn}        -- full resync on reconnect
 S  GAME_END       {game_id, result_vector, termination, rating_delta}
 S  PONG           {t, server_t}                        -- clock sync (NFR-1 drift budget)
+S  DRAW_OFFERED   {game_id, by}                        -- v1.1 (ADR-17)
 S  ERROR          {code, msg}
 ```
 Reconnect: client re-auths, sends last known `ply`, server replies `STATE` to resync (NFR-2 no-game-loss).
+
+> **Drift correction (#106).** This table had not recorded ADR-17's `RESYNC` and
+> `DRAW_OFFERED` or ADR-18's `uci` on `MOVE_ACCEPTED`. Those rows are added here
+> so it matches the shipped codec and SPEC-S2-PROTOCOL. They record decisions
+> already ratified; no new decision is made.
 
 ## VIII.5 REST/JSON surface (non-realtime) — representative, not exhaustive
 ```
