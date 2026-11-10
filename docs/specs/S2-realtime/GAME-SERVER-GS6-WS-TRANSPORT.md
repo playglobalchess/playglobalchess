@@ -103,6 +103,14 @@ WS). Teardown unbinds the seat; the game is untouched (it lives in the store).
 
 ### 3.2 Dispatch & matchmaking
 
+- `SEEK` is validated BEFORE enqueue (#93): `pool_id` must be in the pool
+  catalogue (interim: `transport.DefaultPools`, until `GET /v1/pools`, X-13; see
+  GS5 §3.1), `time_control` must equal that pool's, and the control must resolve.
+  Otherwise `ERROR{PROTOCOL_VIOLATION}` and nothing is enqueued, so a client can
+  never impose a clock on a waiting opponent, and a bad control can never create a
+  durable game that fails to start. The resolver bounds every component (base
+  ≤ 3 h, increment ≤ 3 min, daily ≤ 14 days, each checked before scaling to ms,
+  so no overflow) and runs `clock.TimeControl.Validate`.
 - `SEEK` → `matchmaker.Seek(ctx, seeker)`. On a `Match`, the transport delivers
   `MATCHED{start_state}` to BOTH seats by looking up each player's connection in
   a `userID → conn` map (bound at AUTHENTICATE) — NOT a seat→conn map, because
@@ -227,6 +235,7 @@ closed by) the §4A v1.1 amendment:
 | Persist fails (pipeline error) | NO ack; `ERROR{INTERNAL}` — the move did not happen (NFR-7). |
 | Disconnect mid-game | seat unbound, clock keeps running; reconnect → `STATE`; flag if the clock expires first. |
 | MATCHED seat never joins (ghost-claim) | join-timeout → abort the game (resolves the GS-5 residual). |
+| SEEK into an unknown pool, or with another pool's / an invalid time control | `ERROR{PROTOCOL_VIOLATION}`, no enqueue, no game (#93). |
 | Concurrent writes to one WS | serialized by the per-conn write pump. |
 | Reconnect to a different node | works — the Session folds from the durable stream (no node affinity). |
 | Oversized / malformed frame | the codec seam rejects it (typed error) → `ERROR{...}`, connection may be closed; never a panic (the seam's catch_unwind). |

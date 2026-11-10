@@ -50,6 +50,8 @@ type Server struct {
 	// each broadcast GAME_END to the clients. Set once by claimGameEnd; cleared by
 	// dropGame.
 	endBroadcast map[string]bool
+	// pools is the SEEK allow-list: pool id -> its time-control id (#93).
+	pools PoolCatalog
 }
 
 type gameSeAT struct {
@@ -69,6 +71,7 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 		userGames:    make(map[string]map[string]uint8),
 		joined:       make(map[string]chan struct{}),
 		endBroadcast: make(map[string]bool),
+		pools:        DefaultPools(),
 	}
 }
 

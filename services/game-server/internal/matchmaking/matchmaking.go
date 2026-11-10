@@ -84,7 +84,7 @@ func (w Window) widthFor(age time.Duration) int {
 //   - different seek (never self-pair);
 //   - same rated-ness (the pool already separates rated/unrated, so this is an
 //     invariant check, not a filter — a violation means a pool-routing bug);
-//   - same pool (same reasoning);
+//   - same pool and same time control (same reasoning; #93);
 //   - rating within the candidate's current widening window (uses the candidate's
 //     wait age, since the candidate is the one who has been waiting).
 //
@@ -98,8 +98,11 @@ func bestMatch(newSeeker Seeker, waiting []Seeker, w Window, now time.Time) (See
 		if c.SeekID == newSeeker.SeekID {
 			continue // never self-pair
 		}
-		if c.PoolID != newSeeker.PoolID || c.Rated != newSeeker.Rated {
-			continue // pool invariant (same pool_id ⇒ same rated-ness already)
+		if c.PoolID != newSeeker.PoolID || c.Rated != newSeeker.Rated || c.TimeControl != newSeeker.TimeControl {
+			// Pool invariant (same pool_id ⇒ same rated-ness and time control);
+			// the time-control check is a second line of defence behind the
+			// transport's pool catalogue (#93), so a mismatch never pairs.
+			continue
 		}
 		delta := newSeeker.Rating - c.Rating
 		if delta < 0 {

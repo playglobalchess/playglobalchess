@@ -50,8 +50,8 @@ func (p *MemoryPool) TryClaim(_ context.Context, newSeeker Seeker, _ Window, _ t
 		if id == newSeeker.SeekID || p.claimed[id] {
 			continue
 		}
-		if s.PoolID != newSeeker.PoolID {
-			continue
+		if s.PoolID != newSeeker.PoolID || s.TimeControl != newSeeker.TimeControl {
+			continue // never pair different clocks (#93)
 		}
 		p.claimed[id] = true
 		p.claimed[newSeeker.SeekID] = true

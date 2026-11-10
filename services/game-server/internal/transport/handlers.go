@@ -28,10 +28,27 @@ func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec
 		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "empty SEEK"))
 		return true
 	}
+	// The pool decides the clock, not the client (#93): refuse an unknown pool or
+	// a time_control other than the pool's, and check the control resolves,
+	// all BEFORE enqueue, so a bad value can never create a durable game.
+	tcID, known := s.pools[p.PoolID]
+	if !known {
+		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "unknown pool"))
+		return true
+	}
+	if p.TimeControl != tcID {
+		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "time_control does not match the pool"))
+		return true
+	}
+	if _, err := s.reg.resolver.Resolve(tcID); err != nil {
+		// A catalogue entry the resolver rejects is a server misconfiguration.
+		s.send(ctx, c, errorMsg(codec.ECInternal, "pool time control is invalid"))
+		return true
+	}
 	seeker := matchmaking.Seeker{
 		UserID:      st.userID,
 		PoolID:      p.PoolID,
-		TimeControl: p.TimeControl,
+		TimeControl: tcID,
 		Rated:       p.Rated,
 	}
 	match, paired, err := s.mm.Seek(ctx, seeker)

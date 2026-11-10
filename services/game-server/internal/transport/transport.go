@@ -94,9 +94,32 @@ type TimeControlResolver interface {
 // GET /v1/pools lands, a resolver backed by it replaces this.
 type ConventionResolver struct{}
 
-// Resolve expands an id per the conventions above. An unparseable id is an error
-// (the transport replies ERROR rather than guessing a clock).
-func (ConventionResolver) Resolve(id string) (clock.TimeControl, error) {
+// Bounds on a resolvable time control (#93). Each operand is checked BEFORE it
+// is scaled to milliseconds, so no id can overflow int64.
+const (
+	maxBaseMs      = 3 * 60 * 60 * 1000 // 3 h of base time
+	maxIncrementMs = 3 * 60 * 1000      // 3 min per-move increment
+	maxDailyDays   = 14
+)
+
+// Resolve expands an id per the conventions above. An unparseable,
+// out-of-range or invalid (clock.TimeControl.Validate) id is an error: the
+// transport replies ERROR rather than guessing a clock.
+func (r ConventionResolver) Resolve(id string) (clock.TimeControl, error) {
+	tc, err := r.parse(id)
+	if err != nil {
+		return clock.TimeControl{}, err
+	}
+	if tc.BaseMs > maxBaseMs || tc.IncrementMs > maxIncrementMs {
+		return clock.TimeControl{}, fmt.Errorf("transport: time control %q out of range", id)
+	}
+	if err := tc.Validate(); err != nil {
+		return clock.TimeControl{}, fmt.Errorf("transport: time control %q: %w", id, err)
+	}
+	return tc, nil
+}
+
+func (ConventionResolver) parse(id string) (clock.TimeControl, error) {
 	switch {
 	case strings.HasPrefix(id, "custom-"):
 		// custom-<base_ms>+<inc_ms> — raw milliseconds.
@@ -107,7 +130,7 @@ func (ConventionResolver) Resolve(id string) (clock.TimeControl, error) {
 		return clock.TimeControl{BaseMs: base, IncrementMs: inc}, nil
 	case strings.HasPrefix(id, "daily-"):
 		days, err := strconv.ParseInt(strings.TrimPrefix(id, "daily-"), 10, 64)
-		if err != nil || days <= 0 {
+		if err != nil || days <= 0 || days > maxDailyDays {
 			return clock.TimeControl{}, fmt.Errorf("transport: bad daily time control %q", id)
 		}
 		return clock.TimeControl{PerMoveMs: days * 24 * 60 * 60 * 1000}, nil
@@ -120,6 +143,9 @@ func (ConventionResolver) Resolve(id string) (clock.TimeControl, error) {
 		baseMin, incSec, err := splitPlus(id[dash+1:])
 		if err != nil {
 			return clock.TimeControl{}, fmt.Errorf("transport: unrecognized time control %q", id)
+		}
+		if baseMin > maxBaseMs/(60*1000) || incSec > maxIncrementMs/1000 {
+			return clock.TimeControl{}, fmt.Errorf("transport: time control %q out of range", id)
 		}
 		return clock.TimeControl{BaseMs: baseMin * 60 * 1000, IncrementMs: incSec * 1000}, nil
 	}
