@@ -77,6 +77,12 @@ class Client {
   move(gameId: string, ply: number, uci: string): void {
     this.sock.move(gameId, ply, uci);
   }
+  requestTakeback(gameId: string): void {
+    this.sock.requestTakeback(gameId);
+  }
+  acceptTakeback(gameId: string, atPly: number): void {
+    this.sock.acceptTakeback(gameId, atPly);
+  }
   close(): void {
     this.sock.close();
   }
@@ -108,6 +114,9 @@ const isMatched = (m: ServerMsg): m is Extract<ServerMsg, { Matched: unknown }> 
 const isMoveAccepted = (m: ServerMsg): m is Extract<ServerMsg, { MoveAccepted: unknown }> =>
   "MoveAccepted" in m;
 const isGameEnd = (m: ServerMsg): m is Extract<ServerMsg, { GameEnd: unknown }> => "GameEnd" in m;
+const isTakebackOffered = (m: ServerMsg): m is Extract<ServerMsg, { TakebackOffered: unknown }> =>
+  "TakebackOffered" in m;
+const isState = (m: ServerMsg): m is Extract<ServerMsg, { State: unknown }> => "State" in m;
 
 d("real-server e2e (web client <-> Go game-server)", () => {
   beforeAll(async () => {
@@ -224,6 +233,62 @@ d("real-server e2e (web client <-> Go game-server)", () => {
     expect(anyError(white)).toBe(false);
     expect(anyError(black)).toBe(false);
 
+    white.close();
+    black.close();
+  }, 20_000);
+
+  it("takeback with consent: request, offer, accept, rewound STATE to both, then a new move (#84, GS-7)", async () => {
+    const white = new Client("erin");
+    const black = new Client("frank");
+    white.connect();
+    black.connect();
+    white.seek();
+    await new Promise((r) => setTimeout(r, 50));
+    black.seek();
+
+    const wm = await white.waitFor(isMatched);
+    const bm = await black.waitFor(isMatched);
+    const gameId = wm.Matched.game_id;
+    expect(seenGameIds.has(gameId)).toBe(false);
+    seenGameIds.add(gameId);
+    const bySeat: Record<number, Client> = { [wm.Matched.seat_idx]: white, [bm.Matched.seat_idx]: black };
+    const w = bySeat[0]!;
+    const b = bySeat[1]!;
+
+    const script: Array<[Client, string]> = [[w, "e2e4"], [b, "e7e5"], [w, "g1f3"]];
+    for (let i = 0; i < script.length; i++) {
+      script[i]![0].move(gameId, i + 1, script[i]![1]);
+      await w.waitFor(isMoveAccepted);
+      await b.waitFor(isMoveAccepted);
+    }
+
+    // White asks to take back Nf3; only Black is told, with the request's ply.
+    w.requestTakeback(gameId);
+    const offer = await b.waitFor(isTakebackOffered);
+    expect(offer.TakebackOffered).toEqual({ game_id: gameId, seat_idx: 0, at_ply: 3 });
+
+    // Black accepts; BOTH seats get a STATE rewound to ply 2, each with its own seat.
+    b.acceptTakeback(gameId, 3);
+    const ws = await w.waitFor(isState);
+    const bs = await b.waitFor(isState);
+    for (const [st, seat] of [[ws, 0], [bs, 1]] as const) {
+      expect(st.State.state.ply).toBe(2);
+      expect(st.State.state.last_move_uci).toBe("e7e5");
+      expect(st.State.state.you_seat).toBe(seat);
+      expect(st.State.state.takeback_by).toBe(0xff);
+    }
+
+    // The #84 scenario: a DIFFERENT move at the recurring ply is a new move,
+    // acked as itself to both seats (it was re-acked as the undone Nf3 before).
+    w.move(gameId, 3, "b1c3");
+    const wa = await w.waitFor(isMoveAccepted);
+    const ba = await b.waitFor(isMoveAccepted);
+    expect(wa.MoveAccepted).toMatchObject({ ply: 3, uci: "b1c3" });
+    expect(ba.MoveAccepted).toMatchObject({ ply: 3, uci: "b1c3" });
+
+    const anyError = (c: Client): boolean => c.inbox.some((m) => "Error" in m);
+    expect(anyError(white)).toBe(false);
+    expect(anyError(black)).toBe(false);
     white.close();
     black.close();
   }, 20_000);

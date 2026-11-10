@@ -234,6 +234,20 @@ export class GameSocket {
   offerDraw(gameId: string): void {
     this.sendMsg({ OfferDraw: { game_id: gameId } });
   }
+  /** §4A v1.3: decline the opponent's draw offer, or withdraw our own. */
+  declineDraw(gameId: string): void {
+    this.sendMsg({ DeclineDraw: { game_id: gameId } });
+  }
+  /** §4A v1.3: TAKEBACK is a request only; the opponent must accept. */
+  requestTakeback(gameId: string): void {
+    this.sendMsg({ Takeback: { game_id: gameId } });
+  }
+  acceptTakeback(gameId: string, atPly: number): void {
+    this.sendMsg({ TakebackAccept: { game_id: gameId, at_ply: atPly } });
+  }
+  declineTakeback(gameId: string, atPly: number): void {
+    this.sendMsg({ TakebackDecline: { game_id: gameId, at_ply: atPly } });
+  }
   /** Force a fresh STATE (§4A v1.1 RESYNC). Called by the React layer when the
    * reducer's needsResync flag is set (GameSocket does not observe it itself). */
   resync(gameId: string): void {

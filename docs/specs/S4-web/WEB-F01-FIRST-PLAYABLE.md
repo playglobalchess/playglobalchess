@@ -116,7 +116,29 @@ board + both clocks from `start_state`.
 - Opponent `MOVE_ACCEPTED` (for the other seat) applies their move + clock.
 - `RESIGN`/`OFFER_DRAW` buttons send the client messages; a received
   `DRAW_OFFERED{by}` shows an accept/decline affordance (accept = send
-  `OFFER_DRAW`, the mutual-offer agreement); `GAME_END` shows the result.
+  `OFFER_DRAW`, the mutual-offer agreement; decline = `DECLINE_DRAW`, §4A v1.3);
+  `GAME_END` shows the result. While our own offer is pending, "Offer draw" is
+  disabled and a status line says the offer is waiting.
+- **Takeback (GS-7, §4A v1.3; added 2026-11-10, modelled on chess.com).** In an
+  UNRATED game a "Takeback" button sends `TAKEBACK` (a request). It is enabled
+  from ply 2 when no request is pending either way. The opponent sees "Opponent
+  asks to take back a move" with Accept (`TAKEBACK_ACCEPT{at_ply}`) and Decline
+  (`TAKEBACK_DECLINE{at_ply}`); the requester sees a waiting status line. An
+  accept rewinds both boards through the server's `STATE`. Either side's next
+  move declines a pending prompt (GS-7 §6.4). Deviation from chess.com: there is
+  no per-game "Allow Takebacks" setting; every unrated game allows requests (a
+  setting would need a SEEK and protocol change). The button is hidden when the
+  client does not know the game is unrated (after a reload, since neither
+  `MATCHED` nor `STATE` carries `rated`).
+- "Play" seeks `rated:false`, as §3.2 says (the client had sent `rated:true`).
+- "Offer draw" is enabled only when the server would accept a new offer (ply ≥ 2
+  and none of ours in the last 20 plies, GS-7 §6.3), so a click never shows a
+  "waiting" line the server then silently clears. The two decline buttons are
+  labelled "Decline draw" and "Decline takeback", and both prompts are announced
+  when both are pending.
+- On STATE the client clears the screen-reader `lastMove` instead of setting it
+  from `last_move_uci`, and does not yet store the clock anchor (see GS-7 §7.4
+  amendment; ticking clocks are #112).
 
 ### 3.4 Reconnection
 

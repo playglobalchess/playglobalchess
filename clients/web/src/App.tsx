@@ -7,7 +7,8 @@
 import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
 import { codecProtocolVersion } from "./codec/seam";
-import { useGame } from "./game/useGame";
+import { useGame, canRequestTakeback } from "./game/useGame";
+import { canOfferDraw } from "./game/reducer";
 import { Board } from "./game/Board";
 import { Reason, ErrorCode, type ReasonCode } from "./codec/messages";
 import { DEV_POOL, DEV_TIME_CONTROL } from "./devConfig";
@@ -120,7 +121,7 @@ function GameView({ token }: { token: string }): React.JSX.Element {
         <button
           type="button"
           disabled={state.phase === "seeking"}
-          onClick={() => commands.seek(DEV_POOL, DEV_TIME_CONTROL, true)}
+          onClick={() => commands.seek(DEV_POOL, DEV_TIME_CONTROL, false)}
         >
           {t("seek.action")}
         </button>
@@ -147,9 +148,22 @@ function GameView({ token }: { token: string }): React.JSX.Element {
               <button type="button" onClick={() => commands.resign()}>
                 {t("game.resign")}
               </button>
-              <button type="button" onClick={() => commands.offerDraw()}>
+              <button
+                type="button"
+                disabled={!canOfferDraw(state)}
+                onClick={() => commands.offerDraw()}
+              >
                 {t("game.offerDraw")}
               </button>
+              {state.rated === false ? (
+                <button
+                  type="button"
+                  disabled={!canRequestTakeback(state)}
+                  onClick={() => commands.requestTakeback()}
+                >
+                  {t("game.takeback")}
+                </button>
+              ) : null}
             </div>
           ) : null}
 
@@ -159,7 +173,28 @@ function GameView({ token }: { token: string }): React.JSX.Element {
               <button type="button" onClick={() => commands.acceptDraw()}>
                 {t("game.draw.accept")}
               </button>
+              <button type="button" onClick={() => commands.declineDraw()}>
+                {t("game.draw.decline")}
+              </button>
             </div>
+          ) : null}
+          {state.myDrawOffered && state.phase === "playing" ? (
+            <p role="status">{t("game.draw.sent")}</p>
+          ) : null}
+
+          {state.incomingTakeback != null && state.phase === "playing" ? (
+            <div role="alert">
+              <span>{t("game.takeback.requested")}</span>
+              <button type="button" onClick={() => commands.acceptTakeback()}>
+                {t("game.takeback.accept")}
+              </button>
+              <button type="button" onClick={() => commands.declineTakeback()}>
+                {t("game.takeback.decline")}
+              </button>
+            </div>
+          ) : null}
+          {state.myTakebackSent != null && state.phase === "playing" ? (
+            <p role="status">{t("game.takeback.sent")}</p>
           ) : null}
 
           {state.phase === "game_over" && state.result != null ? (
@@ -178,12 +213,18 @@ function buildAnnouncement(
     mySeat: number | null;
     lastMove: { uci: string; moverSeat: number } | null;
     drawOffer: { by: number } | null;
+    incomingTakeback: { by: number; atPly: number } | null;
     result: unknown;
   },
   myTurn: boolean,
 ): string {
   if (state.phase === "game_over") return t("announce.game_over");
-  if (state.drawOffer != null) return t("announce.draw_offered");
+  // Both prompts can be pending at once (STATE carries both): announce both.
+  const prompts = [
+    state.drawOffer != null ? t("announce.draw_offered") : "",
+    state.incomingTakeback != null ? t("announce.takeback_requested") : "",
+  ].filter((p) => p !== "");
+  if (prompts.length > 0) return prompts.join(" ");
   if (state.lastMove != null) {
     const mine = state.lastMove.moverSeat === state.mySeat;
     const who = mine ? t("announce.you_moved") : t("announce.opponent_moved");
@@ -205,13 +246,14 @@ function useGatedAnnouncement(
     mySeat: number | null;
     lastMove: { uci: string; moverSeat: number } | null;
     drawOffer: { by: number } | null;
+    incomingTakeback: { by: number; atPly: number } | null;
     result: unknown;
     error: number | null;
   },
   myTurn: boolean,
 ): string {
   // Key the announcement to the discrete events worth reading aloud.
-  const key = `${state.phase}|${state.ply}|${state.drawOffer != null ? state.drawOffer.by : "-"}|${state.result != null ? "end" : "-"}|${state.error ?? "-"}`;
+  const key = `${state.phase}|${state.ply}|${state.drawOffer != null ? state.drawOffer.by : "-"}|${state.incomingTakeback != null ? state.incomingTakeback.atPly : "-"}|${state.result != null ? "end" : "-"}|${state.error ?? "-"}`;
   const [text, setText] = useState("");
   const lastKey = useRef<string | null>(null);
   useEffect(() => {
