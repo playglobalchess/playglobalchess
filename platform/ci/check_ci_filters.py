@@ -1,53 +1,61 @@
 #!/usr/bin/env python3
 """
-check_ci_filters: every path-filtered CI gate must run when ANY file it reads
-changes (#86, #87).
+check_ci_filters: enforce the FAIL-SAFE path-filter policy of ci.yml (#86, #87).
 
-Runs in CI as its own UNFILTERED job (`ci-filter-audit`, no `if:`), so it runs on
-every PR and push: its own inputs (Makefiles, Go sources, Cargo.toml files,
-package.json, the workflow) live everywhere, and a filtered audit would itself be
-a hollow gate. Locally: `python3 platform/ci/check_ci_filters.py`.
+Runs in CI as the unconditional `ci-filter-audit` job, and locally:
+`python3 platform/ci/check_ci_filters.py`.
 
-Why: `.github/workflows/ci.yml` gates jobs with dorny/paths-filter. A filter
-that lists only the folder a job *owns* lets a change to a file the job *reads*
-merge green with the job skipped, so its check is hollow (#86: the REST audit
-read docs/ specs no filter covered; #87: the game-server and web builds read
-protocol/ and engine/ crates their filters did not cover).
+Background. A path filter that lists the folder a job OWNS, not the files it
+READS, lets a change to an input skip the job, so its green check is hollow
+(#86: the REST audit read docs/ specs no filter covered; #87: the game-server
+and web builds read protocol/ and engine/ crates their filters missed). An
+earlier version of this script tried to DERIVE every job's inputs from
+Makefiles, Go, Cargo, npm and shell. That fails open by design: any build-file
+shape the parser does not model drops an input silently, and three reviews in a
+row found new shapes. So the design was inverted.
 
-How: for EVERY job gated on `needs.changes.outputs.*`, its inputs are DERIVED,
-never hand-listed:
-  1. repo paths named in the job's own steps (run:, working-directory:), with
-     shell scripts they call scanned the same way, recursively;
-  2. for each Rust crate reached: its Cargo `path` dependencies, transitively
-     (parsed with tomllib: dependencies, dev-, build-, target.*, workspace);
-  3. `make -C <dir>`: every Makefile variable whose expanded value is a `../`
-     path (and that crate's Cargo deps);
-  4. Go sources under a reached Go module: relative string paths, filepath.Join
-     of literals, and `#cgo` -I/-L paths that point outside the module;
-  5. `npm` in clients/web: package.json local dependencies (file:, link:,
-     portal:, ./, ../) resolved to their crate;
-  6. `./gradlew`: the root Gradle files and every projectDir in settings.gradle.kts;
-  7. `python3 platform/ci/<x>.py`: every `NAME = REPO / "..."` the script reads;
-  8. the workflow file itself, so editing a job's steps runs that job.
-web-e2e additionally gets the union of the web and services inputs (it builds
-both). For each gated job, the union of the filter outputs in its `if:` must
-match every input.
+The policy (what this script enforces):
 
-Fails closed: a missing file, unparseable filter line or TOML, unsupported glob
-syntax (`!`, braces), a gate using `&&` or `!=`, an unexpanded Makefile variable,
-a non-literal path in filepath.Join, a local dependency outside the repo, or a
-REPO-based assignment it cannot read is an ERROR, never a silent pass.
+  P1  Cross-stream consumers (services, web, e2e) use EXCLUSION-style filters:
+      `'**'` followed only by `!` patterns from ALLOWED_EXCLUSIONS below. They
+      run on any change except paths they certainly do not read. Only docs and
+      OTHER applications may be excluded; shared libraries and anything new stay
+      included, so a new dependency can never make these gates hollow. Adding an
+      exclusion means editing this file, which is a reviewable decision.
+  P2  The paths-filter step is dorny/paths-filter@v4 with predicate-quantifier
+      'some-with-excludes' (without it, `!` patterns would not exclude).
+  P3  Each consumer job is gated ONLY on its own exclusion-style output.
+  P4  Leaf jobs (engine, protocol, mobile, platform, protocol-parity) keep owner
+      filters, which is safe only while the leaf reads nothing outside its
+      folder. Enforced structurally:
+        - every Cargo.toml under engine/ and protocol/ has path dependencies
+          (dependencies, dev-, build-, target.*, workspace, [patch], [replace])
+          only inside its own top-level folder, parsed with tomllib;
+        - every Gradle module is declared with a projectDir under clients/, no
+          Gradle build file references `../`, and the mobile filter lists every
+          root Gradle file that exists.
+  P5  Positive (leaf) filters contain no `!` patterns and include ci.yml.
+  P6  UNCONDITIONAL jobs (ci-filter-audit, rest-contract) really run on every
+      change: no job-level `if:`, no `needs:`, no `continue-on-error`, no
+      step-level `if:`, and their run lines are exactly the expected command.
+  P7  The workflow has no workflow-level `paths:` / `paths-ignore:` (those would
+      skip every job, including the unconditional ones).
+  P8  Every expected gated job exists, and gates are only
+      `needs.changes.outputs.X == 'true'` joined by `||`.
 
-Known limits (stated, not hidden): paths constructed at runtime in other ways
-(environment variables, string concatenation in Go, computed paths in shell)
-are not derived; jobs not gated on the changes outputs (schedule-only, or no
-`if:`) are not filtered and so not audited.
+Fails closed: a missing job, file, filter or step, or an unparseable filter line
+or Cargo.toml, is an error.
+
+Known limits (stated, not hidden): leaf jobs' own scripts (for example
+platform/mobile/run_codec_parity.sh for protocol-parity) are trusted to read only
+inside the folders their filter lists; the scheduled nightly runs every job and
+is the backstop. The unit tests include an acceptance matrix that simulates
+dorny's 'some-with-excludes' semantics for the #86 and #87 scenarios.
 
 Stdlib only (Python >= 3.11 for tomllib). Tests: platform/ci/test_check_ci_filters.py.
 """
 from __future__ import annotations
 
-import json
 import re
 import sys
 import tomllib
@@ -55,23 +63,30 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 CI_YML_REL = ".github/workflows/ci.yml"
-AUDIT_SCRIPT_REL = "platform/ci/check_ci_filters.py"
-# Gated jobs that must exist; a rename or removal is an error, not a silent pass.
-EXPECTED_GATED_JOBS = {"engine", "protocol", "rest-contract", "protocol-parity",
-                       "services", "web", "web-e2e", "mobile", "platform"}
+
+# P1: the only paths each consumer may exclude. Docs and OTHER applications only.
+#   docs:  docs/** and root-level *.md (README, CONTRIBUTING). `*.md` has one
+#          star, so it matches root files only, never a .md inside a source tree.
+ALLOWED_EXCLUSIONS: dict[str, set[str]] = {
+    "services": {"docs/**", "*.md", "clients/**", "platform/mobile/**"},
+    "web": {"docs/**", "*.md", "services/**", "clients/ios/**", "clients/android/**", "platform/mobile/**"},
+    "e2e": {"docs/**", "*.md", "clients/ios/**", "clients/android/**", "platform/mobile/**"},
+}
+# P3: consumer job -> the one exclusion-style output it must be gated on.
+CONSUMER_GATES = {"services": "services", "web": "web", "web-e2e": "e2e"}
+# P4/P8: leaf job -> exact gate outputs.
+LEAF_GATES = {"engine": {"engine"}, "protocol": {"protocol"}, "mobile": {"mobile"},
+              "platform": {"platform"}, "protocol-parity": {"protocol", "mobile"}}
+# P4: leaf output -> folder patterns its filter must contain.
+LEAF_REQUIRED_PATTERNS = {"engine": ["engine/**"], "protocol": ["protocol/**"],
+                          "platform": ["platform/**", ".github/workflows/**"]}
+# P4: crates under these folders may depend only inside the same folder.
+LEAF_CRATE_ROOTS = ["engine", "protocol"]
+# P6: unconditional job -> its exact command.
+UNCONDITIONAL = {"ci-filter-audit": "python3 platform/ci/check_ci_filters.py",
+                 "rest-contract": "python3 platform/ci/check_rest_contract.py"}
+ROOT_GRADLE_FILES = ["settings.gradle.kts", "build.gradle.kts", "gradle.properties", "gradlew"]
 SKIP_DIRS = {"target", "node_modules", "pkg", "build", "dist", ".gradle"}
-
-
-class Problems(list):
-    """A list of problem strings (fail-closed findings during derivation)."""
-
-
-def rel(path: Path, repo: Path, problems: Problems, where: str) -> str | None:
-    try:
-        return path.resolve().relative_to(repo.resolve()).as_posix()
-    except ValueError:
-        problems.append(f"{where}: {path} is outside the repository")
-        return None
 
 
 # --- workflow parsing ---------------------------------------------------------
@@ -102,9 +117,8 @@ def parse_filters(text: str) -> tuple[dict[str, list[str]], list[str]]:
         if not items:
             problems.append(f"filter {m.group(1)!r} has no patterns")
         for p in items:
-            if p.startswith("!") or "{" in p:
-                problems.append(f"filter {m.group(1)!r}: pattern {p!r} uses syntax this audit "
-                                f"does not model (negation or braces); extend check_ci_filters.py")
+            if "{" in p:
+                problems.append(f"filter {m.group(1)!r}: brace pattern {p!r} is not allowed (not modelled)")
         filters[m.group(1)] = items
     if not filters:
         problems.append("filters block is empty")
@@ -112,7 +126,6 @@ def parse_filters(text: str) -> tuple[dict[str, list[str]], list[str]]:
 
 
 def split_jobs(text: str) -> dict[str, list[str]]:
-    """Return {job: [lines of its block]} for top-level jobs."""
     jobs: dict[str, list[str]] = {}
     in_jobs = False
     job = None
@@ -135,7 +148,6 @@ def split_jobs(text: str) -> dict[str, list[str]]:
 
 
 def job_if(lines: list[str]) -> str | None:
-    """The job-level `if:` expression, including a multi-line block value."""
     for i, line in enumerate(lines):
         m = re.match(r"^    if:\s*(.*)$", line)
         if not m:
@@ -152,30 +164,59 @@ def job_if(lines: list[str]) -> str | None:
     return None
 
 
-def parse_job_gates(text: str) -> tuple[dict[str, set[str]], list[str]]:
-    """Return ({job: {filter outputs its `if:` is gated on}}, problems)."""
-    gates: dict[str, set[str]] = {}
-    problems: list[str] = []
-    for job, lines in split_jobs(text).items():
-        expr = job_if(lines) or ""
-        outputs = set(re.findall(r"needs\.changes\.outputs\.([A-Za-z0-9_-]+)", expr))
-        if outputs and ("&&" in expr or "!=" in expr):
-            problems.append(f"job {job!r}: gate {expr!r} uses && or !=; the audit only models "
-                            f"OR-of-outputs gates (== 'true' joined by ||)")
-        gates[job] = outputs
-    return gates, problems
+_GATE_TERM = r"needs\.changes\.outputs\.([A-Za-z0-9_-]+)\s*==\s*'true'"
+_GATE_EXPR = re.compile(r"^\$\{\{\s*" + _GATE_TERM + r"(?:\s*\|\|\s*" + _GATE_TERM.replace("(", "(?:", 1) + r")*\s*\}\}$")
 
 
-def has_unconditional_audit(text: str) -> bool:
-    """True if some job with no `if:` runs the audit script."""
-    for lines in split_jobs(text).values():
-        # Comments do not count: a comment naming the script runs nothing.
-        if job_if(lines) is None and re.search(r"\bpython3?\s+" + re.escape(AUDIT_SCRIPT_REL), step_text(lines)):
-            return True
-    return False
+def gate_outputs(expr: str | None) -> tuple[set[str] | None, str | None]:
+    """(outputs, problem). None outputs = not a changes gate."""
+    if expr is None or "needs.changes.outputs" not in expr:
+        return None, None
+    if not _GATE_EXPR.match(expr.strip()):
+        return set(re.findall(r"needs\.changes\.outputs\.([A-Za-z0-9_-]+)", expr)), \
+            f"gate {expr!r} is not of the form ${{{{ needs.changes.outputs.X == 'true' || ... }}}}"
+    return set(re.findall(r"needs\.changes\.outputs\.([A-Za-z0-9_-]+)", expr)), None
 
 
-# --- glob matching (dorny/paths-filter uses picomatch) -----------------------
+def run_lines(lines: list[str]) -> list[str]:
+    """Non-comment, non-empty command lines from every `run:` in a job."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)(?:-\s*)?run:\s*(.*)$", lines[i])
+        if not m:
+            i += 1
+            continue
+        indent, value = len(m.group(1)), m.group(2).strip()
+        if value in ("|", "|-", ">", ">-"):
+            i += 1
+            # A block scalar's content is indented deeper than the `run:` key.
+            while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > indent):
+                s = lines[i].strip()
+                if s and not s.startswith("#"):
+                    out.append(s)
+                i += 1
+            continue
+        if value:
+            out.append(value)
+        i += 1
+    return out
+
+
+def on_block(text: str) -> list[str]:
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if re.match(r"^(on|\"on\"|'on'):", l)), None)
+    if start is None:
+        return []
+    block = []
+    for l in lines[start + 1:]:
+        if re.match(r"^\S", l):
+            break
+        block.append(l)
+    return block
+
+
+# --- glob + simulation of dorny 'some-with-excludes' (used by the tests) ------
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
     out = []
@@ -198,9 +239,7 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
                 out.append(re.escape(c))
             else:
                 body = pattern[i + 1:j]
-                if body.startswith("!"):
-                    body = "^" + body[1:]  # glob negation -> regex negation
-                out.append("[" + body + "]")
+                out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
                 i = j
         else:
             out.append(re.escape(c))
@@ -208,308 +247,185 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile("^" + "".join(out) + "$")
 
 
-def covers(patterns: list[str], required: str, is_dir: bool) -> bool:
-    probe = required.rstrip("/") + "/__probe__/__probe__.x" if is_dir else required
-    return any(glob_to_regex(p).match(probe) for p in patterns)
+def filter_matches(patterns: list[str], changed: list[str]) -> bool:
+    """dorny 'some-with-excludes': a file counts if it matches an include pattern
+    and no `!` pattern; the filter is true if any changed file counts."""
+    inc = [glob_to_regex(p) for p in patterns if not p.startswith("!")]
+    exc = [glob_to_regex(p[1:]) for p in patterns if p.startswith("!")]
+    return any(any(r.match(f) for r in inc) and not any(r.match(f) for r in exc) for f in changed)
 
 
-# --- derivation helpers -------------------------------------------------------
-
-def cargo_path_deps(crate_dir: Path, repo: Path, problems: Problems, seen: set[str]) -> None:
-    r = rel(crate_dir, repo, problems, "Cargo dependency")
-    if r is None or r in seen:
-        return
-    seen.add(r)
-    manifest = crate_dir / "Cargo.toml"
-    if not manifest.exists():
-        return
-    try:
-        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as e:
-        problems.append(f"{r}/Cargo.toml: cannot parse: {e}")
-        return
-    tables = [data.get(k, {}) for k in ("dependencies", "dev-dependencies", "build-dependencies")]
-    for tgt in (data.get("target") or {}).values():
-        tables += [tgt.get(k, {}) for k in ("dependencies", "dev-dependencies", "build-dependencies")]
-    ws = data.get("workspace") or {}
-    tables.append(ws.get("dependencies", {}))
-    targets = [spec["path"] for t in tables for spec in t.values() if isinstance(spec, dict) and "path" in spec]
-    targets += list(ws.get("members", []))
-    for target in targets:
-        dep = (crate_dir / target).resolve()
-        if not (dep / "Cargo.toml").exists():
-            problems.append(f"{r}/Cargo.toml: path dependency {target!r} has no Cargo.toml")
+def jobs_that_run(text: str, changed: list[str]) -> set[str]:
+    """Which jobs run for a pull request changing `changed` (for the tests)."""
+    filters, _ = parse_filters(text)
+    outputs = {name: filter_matches(p, changed) for name, p in filters.items()}
+    result = set()
+    for job, lines in split_jobs(text).items():
+        if job == "changes":
             continue
-        cargo_path_deps(dep, repo, problems, seen)
+        expr = job_if(lines)
+        outs, _ = gate_outputs(expr)
+        if expr is None:
+            result.add(job)
+        elif outs is not None and any(outputs.get(o) for o in outs):
+            result.add(job)
+    return result
 
 
-def nearest_crate(path: Path, repo: Path) -> Path | None:
-    p = path.resolve()
-    root = repo.resolve()
-    while p != root and root in p.parents:
-        if (p / "Cargo.toml").exists():
-            return p
-        p = p.parent
-    return None
+# --- policy checks ------------------------------------------------------------
 
-
-_MAKE_ASSIGN = re.compile(r"^([A-Za-z0-9_]+)\s*(?::=|\?=|=)\s*(.*?)\s*$", re.M)
-_MAKE_REF = re.compile(r"\$[({]([A-Za-z0-9_]+)[)}]")
-
-
-def makefile_deps(make_dir: Path, repo: Path, problems: Problems, out: set[str]) -> None:
-    mk = make_dir / "Makefile"
-    where = rel(mk, repo, problems, "Makefile") or str(mk)
-    if not mk.exists():
-        problems.append(f"{where}: not found (job runs make -C on it)")
-        return
-    text = mk.read_text(encoding="utf-8")
-    raw = dict(_MAKE_ASSIGN.findall(text))
-
-    def expand(value: str, depth: int = 0) -> str | None:
-        if depth > 10:
-            return None
-        def sub(m: re.Match[str]) -> str:
-            v = raw.get(m.group(1))
-            return "\x00" if v is None else (expand(v, depth + 1) or "\x00")
-        res = _MAKE_REF.sub(sub, value)
-        return None if "\x00" in res else res
-
-    found = 0
-    for name, value in raw.items():
-        if "../" not in value and "$" not in value:
+def check_cargo_leaf(repo: Path, root: str, errors: list[str]) -> None:
+    base = (repo / root).resolve()
+    manifests = [m for m in sorted((repo / root).rglob("Cargo.toml")) if not (set(m.parts) & SKIP_DIRS)]
+    if not manifests:
+        errors.append(f"{root}/: no Cargo.toml found (leaf crate check cannot run)")
+    for m in manifests:
+        rel = m.relative_to(repo).as_posix()
+        try:
+            data = tomllib.loads(m.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as e:
+            errors.append(f"{rel}: cannot parse: {e}")
             continue
-        val = expand(value)
-        if val is None:
-            if "../" in value:
-                problems.append(f"{where}: {name} = {value!r} uses a variable this audit cannot expand")
-            continue
-        if not val.startswith("../"):
-            continue
-        dep = (make_dir / val).resolve()
-        crate = nearest_crate(dep, repo)
-        if not dep.exists() and crate is None:
-            # A build output under a crate (e.g. .../target/release) resolves
-            # to that crate; anything else missing is a real problem.
-            problems.append(f"{where}: {name} = {val!r} does not exist")
-            continue
-        found += 1
-        crate = crate or dep
-        seen: set[str] = set()
-        cargo_path_deps(crate, repo, problems, seen)
-        out |= seen
-    if found == 0 and re.search(r"\bcargo\b", text):
-        problems.append(f"{where}: runs cargo but declares no ../ dependency paths the audit can read")
+        specs: list[dict] = []
+        def tables(d: dict) -> None:
+            for k in ("dependencies", "dev-dependencies", "build-dependencies"):
+                specs.extend(v for v in (d.get(k) or {}).values() if isinstance(v, dict))
+        tables(data)
+        for tgt in (data.get("target") or {}).values():
+            tables(tgt)
+        ws = data.get("workspace") or {}
+        specs.extend(v for v in (ws.get("dependencies") or {}).values() if isinstance(v, dict))
+        for section in ("patch", "replace"):
+            for registry in (data.get(section) or {}).values():
+                if isinstance(registry, dict):
+                    specs.extend(v for v in registry.values() if isinstance(v, dict))
+        paths = [s["path"] for s in specs if "path" in s] + list(ws.get("members", []))
+        for p in paths:
+            dep = (m.parent / p).resolve()
+            if dep != base and base not in dep.parents:
+                errors.append(f"{rel}: path dependency {p!r} leaves {root}/; the {root!r} job has an owner "
+                              f"filter, so this would be a hollow gate. Keep deps inside {root}/ or make the "
+                              f"job's filter exclusion-style")
 
 
-_GO_STR = re.compile(r"\"((?:[^\"\\]|\\.)*)\"|`([^`]*)`")
-_GO_JOIN = re.compile(r"\b(?:filepath|path)\.Join\(([^)]*)\)")
-# `#cgo` directives appear in a /* */ preamble or as `// #cgo` lines.
-_GO_CGO = re.compile(r"^\s*(?://\s*)?#cgo\b.*$", re.M)
-
-
-def go_deps(module_dir: Path, repo: Path, problems: Problems, out: set[str]) -> None:
-    root = module_dir.resolve()
-    for src in sorted(module_dir.rglob("*.go")):
-        text = src.read_text(encoding="utf-8", errors="replace")
-        where = rel(src, repo, problems, "Go source") or str(src)
-        candidates: list[str] = []
-        for m in _GO_JOIN.finditer(text):
-            args = [a.strip() for a in m.group(1).split(",") if a.strip()]
-            lits = [_GO_STR.fullmatch(a) for a in args]
-            if any(a == '".."' or a.startswith('"../') for a in args):
-                if not all(lits):
-                    problems.append(f"{where}: {m.group(0)!r} builds a ../ path from a non-literal; "
-                                    f"use string literals so the audit can resolve it")
-                    continue
-                candidates.append("/".join((l.group(1) or l.group(2)) for l in lits))
-        for m in _GO_STR.finditer(text):
-            s = m.group(1) if m.group(1) is not None else m.group(2)
-            if s.startswith("../"):
-                candidates.append(s)
-        for line in _GO_CGO.findall(text):
-            for p in re.findall(r"-[IL]\s*\$\{SRCDIR\}/(\S+)", line):
-                candidates.append(p)
-        for c in candidates:
-            dep = (src.parent / c).resolve()
-            if dep == root or root in dep.parents:
-                continue
-            if not dep.exists():
-                problems.append(f"{where}: {c!r} does not exist")
-                continue
-            r = rel(dep, repo, problems, where)
-            if r:
-                out.add(r)
-
-
-def npm_deps(pkg_dir: Path, repo: Path, problems: Problems, out: set[str]) -> None:
-    pkg = pkg_dir / "package.json"
-    where = rel(pkg, repo, problems, "package.json") or str(pkg)
-    if not pkg.exists():
-        problems.append(f"{where}: not found")
-        return
-    try:
-        data = json.loads(pkg.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        problems.append(f"{where}: not valid JSON: {e}")
-        return
-    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
-        for name, spec in (data.get(section) or {}).items():
-            if not isinstance(spec, str):
-                continue
-            m = re.match(r"^(?:file:|link:|portal:)?(\.{1,2}/.*)$", spec)
-            if not m:
-                continue
-            dep = (pkg_dir / m.group(1)).resolve()
-            if not dep.exists() and not dep.parent.exists():
-                problems.append(f"{where}: {name} -> {spec} does not exist")
-                continue
-            if rel(dep, repo, problems, f"{where}: {name}") is None:
-                continue
-            crate = nearest_crate(dep, repo)
-            if crate is None:
-                r = rel(dep, repo, problems, where)
-                if r:
-                    out.add(r)
-                continue
-            seen: set[str] = set()
-            cargo_path_deps(crate, repo, problems, seen)
-            out |= seen
-
-
-def gradle_deps(repo: Path, problems: Problems, out: set[str]) -> None:
-    for f in ("settings.gradle.kts", "build.gradle.kts", "gradle.properties", "gradlew"):
-        if (repo / f).exists():
-            out.add(f)
-    if (repo / "gradle").is_dir():
-        out.add("gradle")
+def check_gradle_leaf(repo: Path, mobile_patterns: list[str], errors: list[str]) -> None:
+    for f in ROOT_GRADLE_FILES:
+        if (repo / f).exists() and f not in mobile_patterns:
+            errors.append(f"{CI_YML_REL}: mobile filter must list root Gradle file {f!r}")
+    if (repo / "gradle").is_dir() and "gradle/**" not in mobile_patterns:
+        errors.append(f"{CI_YML_REL}: mobile filter must list 'gradle/**'")
     settings = repo / "settings.gradle.kts"
     if not settings.exists():
-        problems.append("settings.gradle.kts: not found (job runs ./gradlew)")
         return
-    for d in re.findall(r"projectDir\s*=\s*file\(\"([^\"]+)\"\)", settings.read_text(encoding="utf-8")):
-        if not (repo / d).is_dir():
-            problems.append(f"settings.gradle.kts: projectDir {d!r} does not exist")
-            continue
-        out.add(d)
+    text = settings.read_text(encoding="utf-8")
+    includes = re.findall(r"include\(\s*\"(:[^\"]+)\"\s*\)", text)
+    dirs = dict(re.findall(r"project\(\s*\"(:[^\"]+)\"\s*\)\.projectDir\s*=\s*file\(\s*\"([^\"]+)\"\s*\)", text))
+    for mod in includes:
+        d = dirs.get(mod)
+        if d is None:
+            errors.append(f"settings.gradle.kts: module {mod} has no projectDir; declare it under clients/")
+        elif not d.startswith("clients/"):
+            errors.append(f"settings.gradle.kts: module {mod} projectDir {d!r} is outside clients/")
+    for gf in [settings, repo / "build.gradle.kts", *sorted((repo / "clients").rglob("*.gradle.kts"))]:
+        if gf.exists() and not (set(gf.parts) & SKIP_DIRS) and "../" in gf.read_text(encoding="utf-8"):
+            errors.append(f"{gf.relative_to(repo).as_posix()}: references '../'; the mobile job has an owner "
+                          f"filter, so reading outside it would be a hollow gate")
 
 
-_REPO_ASSIGN = re.compile(r"^[A-Z0-9_]+\s*=\s*REPO\b.*$", re.M)
-_REPO_CHAIN = re.compile(r"^[A-Z0-9_]+\s*=\s*REPO((?:\s*/\s*\"[^\"]+\")+)\s*$")
+def check_unconditional(job: str, lines: list[str] | None, command: str, errors: list[str]) -> None:
+    if lines is None:
+        errors.append(f"{CI_YML_REL}: unconditional job {job!r} not found")
+        return
+    where = f"{CI_YML_REL}: job {job!r} must run on every change"
+    if any(re.match(r"^    if:", l) for l in lines):
+        errors.append(f"{where}: remove its job-level `if:`")
+    if any(re.match(r"^    needs:", l) for l in lines):
+        errors.append(f"{where}: remove `needs:` (a skipped dependency skips it)")
+    if any(re.search(r"\bcontinue-on-error\b", l) for l in lines if not l.lstrip().startswith("#")):
+        errors.append(f"{where}: remove `continue-on-error` (a failure must fail CI)")
+    if any(re.match(r"^\s{6,}(?:-\s+)?if:", l) for l in lines):
+        errors.append(f"{where}: remove step-level `if:`")
+    cmds = run_lines(lines)
+    if cmds != [command]:
+        errors.append(f"{where}: its run lines must be exactly [{command!r}], found {cmds!r}")
 
 
-def python_script_deps(script: Path, repo: Path, problems: Problems, out: set[str]) -> None:
-    where = rel(script, repo, problems, "script") or str(script)
-    for line in _REPO_ASSIGN.findall(script.read_text(encoding="utf-8")):
-        m = _REPO_CHAIN.match(line)
-        if not m:
-            problems.append(f"{where}: cannot read input path from {line.strip()!r}")
-            continue
-        out.add("/".join(re.findall(r"\"([^\"]+)\"", m.group(1))))
-
-
-# --- deriving a job's inputs from its steps ----------------------------------
-
-def top_level_dirs(repo: Path) -> list[str]:
-    return sorted(p.name for p in repo.iterdir()
-                  if p.is_dir() and not p.name.startswith(".") and p.name not in SKIP_DIRS)
-
-
-def path_tokens(text: str, tops: list[str]) -> list[str]:
-    alt = "|".join(re.escape(t) for t in tops)
-    return [m.group(1).rstrip(".,;:)'\"") for m in
-            re.finditer(r"(?<![\w./-])((?:" + alt + r")/[A-Za-z0-9_./-]*)", text)]
-
-
-def step_text(lines: list[str]) -> str:
-    """The job's lines minus YAML/shell comment lines and `uses:` lines (an
-    action reference such as gradle/actions/setup-gradle is not a repo path)."""
-    return "\n".join(l for l in lines
-                     if not l.lstrip().startswith("#") and not re.match(r"^\s*-?\s*uses:", l))
-
-
-def derive_job_inputs(job_lines: list[str], repo: Path, problems: Problems) -> set[str]:
-    tops = top_level_dirs(repo)
-    text = step_text(job_lines)
-    inputs: set[str] = {CI_YML_REL}
-    queue = path_tokens(text, tops)
-    scanned: set[str] = set()
-    while queue:
-        tok = queue.pop()
-        if tok in scanned:
-            continue
-        scanned.add(tok)
-        p = repo / tok
-        if not p.exists():
-            # A build output (e.g. .../pkg, target/...) resolves to its crate.
-            crate = nearest_crate(p, repo)
-            if crate is None:
-                problems.append(f"{CI_YML_REL}: step path {tok!r} does not exist")
-                continue
-            p = crate
-        r = rel(p, repo, problems, CI_YML_REL)
-        if r is None:
-            continue
-        inputs.add(r)
-        crate = nearest_crate(p if p.is_dir() else p.parent, repo)
-        if crate is not None:
-            seen: set[str] = set()
-            cargo_path_deps(crate, repo, problems, seen)
-            inputs |= seen
-        if p.is_file() and p.suffix == ".sh":
-            queue += path_tokens("\n".join(l for l in p.read_text(encoding="utf-8").splitlines()
-                                           if not l.lstrip().startswith("#")), tops)
-        if p.is_file() and p.suffix == ".py":
-            python_script_deps(p, repo, problems, inputs)
-    for d in re.findall(r"make\s+(?:[^\n]*?\s)?-C\s+(\S+)", text):
-        makefile_deps(repo / d, repo, problems, inputs)
-        go_root = repo / d
-        if (go_root / "go.mod").exists():
-            go_deps(go_root, repo, problems, inputs)
-    for d in re.findall(r"working-directory:\s*(\S+)", text):
-        if re.search(r"\bnpm\b", text) and (repo / d / "package.json").exists():
-            npm_deps(repo / d, repo, problems, inputs)
-    if re.search(r"(?:^|\s)\./gradlew\b", text):
-        gradle_deps(repo, problems, inputs)
-    return inputs
-
-
-# --- the check ---------------------------------------------------------------
-
-def check(repo: Path, ci_text: str) -> list[str]:
+def check(repo: Path, text: str) -> list[str]:
     errors: list[str] = []
-    filters, fprob = parse_filters(ci_text)
+    filters, fprob = parse_filters(text)
     errors += [f"{CI_YML_REL}: {p}" for p in fprob]
-    gates, gprob = parse_job_gates(ci_text)
-    errors += [f"{CI_YML_REL}: {p}" for p in gprob]
-    jobs = split_jobs(ci_text)
-    if not has_unconditional_audit(ci_text):
-        errors.append(f"{CI_YML_REL}: no job without an `if:` runs {AUDIT_SCRIPT_REL}; "
-                      f"a filtered audit is itself a hollow gate")
-    for job in sorted(EXPECTED_GATED_JOBS):
-        if job not in jobs:
-            errors.append(f"{CI_YML_REL}: job {job!r} not found (a gate this check requires)")
-        elif not gates.get(job):
-            errors.append(f"{CI_YML_REL}: job {job!r} is not gated on needs.changes.outputs.*")
-    derived: dict[str, set[str]] = {}
-    for job, outputs in gates.items():
-        if not outputs:
-            continue  # unfiltered or schedule-only: not a path gate
-        problems = Problems()
-        derived[job] = derive_job_inputs(jobs[job], repo, problems)
-        errors += problems
-    if "web-e2e" in derived:
-        derived["web-e2e"] |= derived.get("web", set()) | derived.get("services", set())
-    for job, inputs in sorted(derived.items()):
-        outputs = gates[job]
-        unknown = sorted(o for o in outputs if o not in filters)
-        if unknown:
-            errors.append(f"{CI_YML_REL}: job {job!r} references undefined filter output(s) {unknown}")
-        patterns = [p for o in outputs if o in filters for p in filters[o]]
-        for path in sorted(inputs):
-            if not covers(patterns, path, (repo / path).is_dir()):
-                errors.append(f"{CI_YML_REL}: job {job!r} reads {path} but its filter(s) {sorted(outputs)} "
-                              f"do not match it, so a change there would skip the job (hollow gate)")
+    jobs = split_jobs(text)
+
+    # P7
+    for l in on_block(text):
+        if re.match(r"^\s+(paths|paths-ignore):", l):
+            errors.append(f"{CI_YML_REL}: workflow-level {l.strip()!r} would skip every job; remove it")
+
+    # P2
+    changes = jobs.get("changes")
+    if changes is None:
+        errors.append(f"{CI_YML_REL}: job 'changes' not found")
+    else:
+        body = "\n".join(changes)
+        if not re.search(r"uses:\s*dorny/paths-filter@v4\b", body):
+            errors.append(f"{CI_YML_REL}: the changes job must use dorny/paths-filter@v4 (some-with-excludes needs v4)")
+        if not re.search(r"predicate-quantifier:\s*['\"]some-with-excludes['\"]", body):
+            errors.append(f"{CI_YML_REL}: paths-filter must set predicate-quantifier: 'some-with-excludes'")
+
+    # P1, P5
+    for name, patterns in filters.items():
+        if name in ALLOWED_EXCLUSIONS:
+            if not patterns or patterns[0] != "**":
+                errors.append(f"{CI_YML_REL}: filter {name!r} must start with '**' (exclusion-style)")
+            for p in patterns[1:]:
+                if not p.startswith("!"):
+                    errors.append(f"{CI_YML_REL}: filter {name!r} may only add '!' exclusions after '**', found {p!r}")
+                elif p[1:] not in ALLOWED_EXCLUSIONS[name]:
+                    errors.append(f"{CI_YML_REL}: filter {name!r} excludes {p[1:]!r}, which is not in "
+                                  f"ALLOWED_EXCLUSIONS (only docs and other applications may be excluded)")
+        else:
+            for p in patterns:
+                if p.startswith("!"):
+                    errors.append(f"{CI_YML_REL}: owner filter {name!r} must not use '!' ({p!r})")
+            if not any(glob_to_regex(p).match(CI_YML_REL) for p in patterns):
+                errors.append(f"{CI_YML_REL}: filter {name!r} must include {CI_YML_REL}")
+    for name in ALLOWED_EXCLUSIONS:
+        if name not in filters:
+            errors.append(f"{CI_YML_REL}: exclusion-style filter {name!r} not found")
+
+    # P3, P8 gates
+    expected = {**{j: {o} for j, o in CONSUMER_GATES.items()}, **LEAF_GATES}
+    for job, want in sorted(expected.items()):
+        lines = jobs.get(job)
+        if lines is None:
+            errors.append(f"{CI_YML_REL}: job {job!r} not found")
+            continue
+        outs, prob = gate_outputs(job_if(lines))
+        if prob:
+            errors.append(f"{CI_YML_REL}: job {job!r}: {prob}")
+        if outs != want:
+            errors.append(f"{CI_YML_REL}: job {job!r} must be gated on {sorted(want)}, found {sorted(outs or [])}")
+        for o in outs or []:
+            if o not in filters:
+                errors.append(f"{CI_YML_REL}: job {job!r} references undefined filter output {o!r}")
+    for job, lines in jobs.items():
+        outs, prob = gate_outputs(job_if(lines))
+        if outs is not None and job not in expected:
+            errors.append(f"{CI_YML_REL}: new gated job {job!r} is not in the policy; add it to "
+                          f"CONSUMER_GATES (exclusion-style) or LEAF_GATES (with a leaf check)")
+
+    # P4
+    for out, required in LEAF_REQUIRED_PATTERNS.items():
+        for p in required:
+            if p not in filters.get(out, []):
+                errors.append(f"{CI_YML_REL}: leaf filter {out!r} must contain {p!r}")
+    for root in LEAF_CRATE_ROOTS:
+        check_cargo_leaf(repo, root, errors)
+    check_gradle_leaf(repo, filters.get("mobile", []), errors)
+
+    # P6
+    for job, command in UNCONDITIONAL.items():
+        check_unconditional(job, jobs.get(job), command, errors)
     return sorted(set(errors))
 
 
