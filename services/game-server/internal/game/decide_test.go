@@ -987,3 +987,22 @@ func TestMemStore(t *testing.T) {
 		t.Errorf("failure should be one-shot: %v", err)
 	}
 }
+
+// TestReackAfterNonMoveEndIsNotEndedGame: a game that ended by resign AFTER its
+// last move re-acks that move without EndedGame (no GAME_END re-send), §4.
+func TestReackAfterNonMoveEndIsNotEndedGame(t *testing.T) {
+	m := newSim(t, false)
+	m.playTo(2)
+	last := m.s.History[len(m.s.History)-1]
+	m.do(CmdResign{By: 0}, 0)
+	if m.s.Phase != PhaseEnded {
+		t.Fatalf("resign did not end the game")
+	}
+	d, err := m.try(CmdMove{Seat: last.Seat, PlyExpected: 2, UCI: last.UCI}, 0)
+	if err != nil || !d.Move.Reacked {
+		t.Fatalf("re-ack after resign: %+v err=%v", d.Move, err)
+	}
+	if d.Move.EndedGame {
+		t.Fatalf("EndedGame set for a move that did not end the game")
+	}
+}

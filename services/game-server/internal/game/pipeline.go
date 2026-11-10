@@ -238,7 +238,9 @@ func decideMove(ctx context.Context, s State, c CmdMove, nowMs uint64, opts Fold
 		return Decision{Effect: EffectNone, Move: MoveOutcome{
 			Accepted: true, Reacked: true, AppliedSeq: e.Seq, Ply: c.PlyExpected, UCI: e.UCI,
 			ClockAfterMs: e.ClockAfterMs, NewFEN: e.FEN, NewZobrist: e.Zobrist, Terminal: e.Terminal,
-			EndedGame: s.Phase == PhaseEnded && c.PlyExpected == s.Ply,
+			// Only when THIS move ended the game (§4): a game that ended later by
+			// resign, flag or agreement re-acks its last move without GAME_END.
+			EndedGame: s.Phase == PhaseEnded && c.PlyExpected == s.Ply && e.Terminal != nil,
 		}}, nil
 	}
 	if s.Phase != PhaseLive || s.HalfTerminal != nil {
