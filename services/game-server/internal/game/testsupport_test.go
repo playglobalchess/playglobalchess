@@ -3,6 +3,8 @@ package game
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"testing"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/clock"
 )
@@ -112,3 +114,142 @@ func clockTC(baseMs, incMs int64) clock.TimeControl {
 }
 
 func baseOpts() FoldOptions { return FoldOptions{TimeControl: tc53()} }
+
+func evClockStarted(ts uint64) Event {
+	return Event{Type: EvClockStarted, ClockStarted: &ClockStarted{ServerTS: ts}}
+}
+
+// sim drives a game through Decide + Evolve exactly as the live session does
+// (decide, evolve every event with its verdict, append), so a test proves decide
+// and evolve agree. After every decision it re-folds the whole stream with the
+// pure Fold and requires the same projection (a rebuild must equal the live
+// state) and NextSeq == len(events).
+type sim struct {
+	t      *testing.T
+	o      *fakeOracle
+	opts   FoldOptions
+	s      State
+	events []Event
+	now    uint64
+	n      int // unique uci counter
+}
+
+func newSim(t *testing.T, rated bool) *sim {
+	t.Helper()
+	m := &sim{t: t, o: newFakeOracle(), opts: baseOpts(), s: initialState(), now: 1_000_000}
+	for _, ev := range liveStream(rated) {
+		m.apply(ev, nil)
+	}
+	d := m.do(CmdStartClock{}, 0)
+	if d.Effect != EffectClockStarted {
+		t.Fatalf("start clock effect = %v", d.Effect)
+	}
+	return m
+}
+
+func (m *sim) apply(ev Event, v *Verdict) {
+	m.t.Helper()
+	next, err := Evolve(m.s, ev, v, m.opts)
+	if err != nil {
+		m.t.Fatalf("evolve %s: %v", ev.Type, err)
+	}
+	m.s = next
+	m.events = append(m.events, ev)
+	if int(m.s.NextSeq) != len(m.events) {
+		m.t.Fatalf("NextSeq = %d, want %d", m.s.NextSeq, len(m.events))
+	}
+}
+
+// do advances the wall clock by advMs, decides cmd, evolves and appends.
+func (m *sim) do(cmd Command, advMs uint64) Decision {
+	m.t.Helper()
+	m.now += advMs
+	d, err := Decide(context.Background(), m.s, cmd, m.now, m.opts, m.o)
+	if err != nil {
+		m.t.Fatalf("decide %T: %v", cmd, err)
+	}
+	if len(d.Verdicts) != len(d.Events) {
+		m.t.Fatalf("verdicts %d != events %d", len(d.Verdicts), len(d.Events))
+	}
+	for i, ev := range d.Events {
+		m.apply(ev, d.Verdicts[i])
+	}
+	m.checkFold()
+	return d
+}
+
+// try decides cmd WITHOUT applying (for error and no-op paths).
+func (m *sim) try(cmd Command, advMs uint64) (Decision, error) {
+	m.t.Helper()
+	return Decide(context.Background(), m.s, cmd, m.now+advMs, m.opts, m.o)
+}
+
+// move plays a fresh unique legal uci for the side to move after thinkMs.
+func (m *sim) move(thinkMs uint64) Decision {
+	m.t.Helper()
+	m.n++
+	return m.moveUCI(m.s.TurnIdx, fmt.Sprintf("m%d", m.n), thinkMs)
+}
+
+func (m *sim) moveUCI(seat uint8, uci string, thinkMs uint64) Decision {
+	m.t.Helper()
+	if _, ok := m.o.legal[uci]; !ok {
+		m.o.allow(uci, "fen-"+uci, nil)
+	}
+	d := m.do(CmdMove{Seat: seat, PlyExpected: m.s.Ply + 1, UCI: uci}, thinkMs)
+	if !d.Move.Accepted || d.Move.Reacked {
+		m.t.Fatalf("move %s not freshly accepted: %+v", uci, d.Move)
+	}
+	return d
+}
+
+func (m *sim) playTo(ply uint32) {
+	m.t.Helper()
+	for m.s.Ply < ply {
+		m.move(1_000)
+	}
+}
+
+// checkFold requires a pure Fold of the stream to succeed and equal the live
+// state on everything the engine does not supply.
+func (m *sim) checkFold() {
+	m.t.Helper()
+	f, err := Fold(m.events, m.opts)
+	if err != nil {
+		m.t.Fatalf("Fold(events) failed: %v", err)
+	}
+	stateEqual(m.t, m.s, f)
+}
+
+func stateEqual(t *testing.T, a, b State) {
+	t.Helper()
+	type view struct {
+		Phase   Phase
+		Ply     uint32
+		Turn    uint8
+		Rem     []int64
+		Flagged int
+		Draw    int
+		Last    []int64
+		Pend    *PendingTakeback
+		Next    uint32
+		TS      uint64
+		Started bool
+		Half    *uint8
+		Term    Termination
+		RV      []Result
+		Hist    [][4]string
+	}
+	mk := func(s State) view {
+		v := view{s.Phase, s.Ply, s.TurnIdx, s.Clock.RemainingMs, s.Clock.FlaggedSeat, s.DrawOfferBy,
+			s.LastDrawOfferPly, s.PendingTakeback, s.NextSeq, s.LastChangeTS, s.ClockStartedSet,
+			s.HalfTerminal, s.Termination, s.ResultVector, nil}
+		for _, e := range s.History {
+			v.Hist = append(v.Hist, [4]string{fmt.Sprint(e.Seat), e.UCI, fmt.Sprint(e.ClockAfterMs), fmt.Sprint(e.Seq)})
+		}
+		return v
+	}
+	if va, vb := mk(a), mk(b); !reflect.DeepEqual(va, vb) {
+		t.Fatalf("live state and Fold disagree:\n live=%+v\n fold=%+v", va, vb)
+	}
+}

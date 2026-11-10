@@ -130,6 +130,21 @@ func TestAbortAfterStartTooLate(t *testing.T) {
 	}
 }
 
+// playOpening plays 1.e4 e5 (ply 2): draw offers and takebacks need ply >= 2
+// (GS-7 §5/§6). Seat 0 is to move afterwards.
+func playOpening(t *testing.T, s *Session, fc *fakeClock) {
+	t.Helper()
+	ctx := context.Background()
+	fc.add(time.Second)
+	if out, err := s.SubmitMove(ctx, 0, 1, "e2e4", 1); err != nil || !out.Accepted {
+		t.Fatalf("e4: %v %+v", err, out)
+	}
+	fc.add(time.Second)
+	if out, err := s.SubmitMove(ctx, 1, 2, "e7e5", 2); err != nil || !out.Accepted {
+		t.Fatalf("e5: %v %+v", err, out)
+	}
+}
+
 // --- Draw: happy path -------------------------------------------------------
 
 func TestDrawOfferAccept(t *testing.T) {
@@ -137,6 +152,7 @@ func TestDrawOfferAccept(t *testing.T) {
 	s, store, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
+	playOpening(t, s, fc)
 
 	if err := s.OfferDraw(ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
@@ -172,6 +188,7 @@ func TestAcceptOwnDrawOfferRejected(t *testing.T) {
 	s, _, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
+	playOpening(t, s, fc)
 	if err := s.OfferDraw(ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
 	}
@@ -184,38 +201,47 @@ func TestAcceptOwnDrawOfferRejected(t *testing.T) {
 // --- Draw: invalidation on a move (the review-caught edge) ------------------
 
 func TestDrawOfferWithdrawnByOffererMove(t *testing.T) {
+	// GS-7 §5.2 (behaviour reversed): only the RESPONDER's move clears an
+	// offer. The offerer moving on leaves the offer standing and acceptable.
 	fc := &fakeClock{t: time.Unix(0, 0)}
 	s, _, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
+	playOpening(t, s, fc)
 	if err := s.OfferDraw(ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
 	}
 	fc.add(time.Second)
-	if out, err := s.SubmitMove(ctx, 0, 1, "e2e4", 1); err != nil || !out.Accepted {
+	if out, err := s.SubmitMove(ctx, 0, 3, "g1f3", 3); err != nil || !out.Accepted {
 		t.Fatalf("offerer move: %v %+v", err, out)
 	}
-	// Offer withdrawn by the offerer's own move.
-	if err := s.AcceptDraw(ctx, 1); !errors.Is(err, ErrNoDrawToAccept) {
-		t.Fatalf("accept after offerer moved = %v, want ErrNoDrawToAccept (withdrawn)", err)
+	snap, _ := s.StateSnapshot(ctx)
+	if snap.DrawOfferBy != 0 {
+		t.Fatalf("DrawOfferBy after offerer's move = %d, want 0 (offer survives)", snap.DrawOfferBy)
+	}
+	if err := s.AcceptDraw(ctx, 1); err != nil {
+		t.Fatalf("accept after offerer moved: %v (offer must survive the offerer's move)", err)
+	}
+	if snap, _ := s.StateSnapshot(ctx); !snap.Ended || snap.Terminal != game.TermDrawAgree {
+		t.Fatalf("snapshot = {%v %v}, want ended+DRAW_AGREE", snap.Ended, snap.Terminal)
 	}
 }
 
 func TestDrawOfferDeclinedByOpponentMove(t *testing.T) {
-	// The exact edge the spec review caught: a move by the side that did NOT
-	// offer must implicitly DECLINE the offer, not leave it live for a later
-	// accept. Here seat 1 (not to move) offers; seat 0 (to move) then plays e4,
-	// which must clear seat 1's pending offer. A later AcceptDraw by seat 0
-	// against seat 1's (now-gone) offer must be rejected.
+	// A move by the RESPONDER implicitly declines the offer (no extra event).
+	// After 1.e4 e5 it is seat 0's turn; seat 1 (not to move) offers; seat 0
+	// (the responder) then plays on, which clears seat 1's pending offer. A later
+	// AcceptDraw by seat 0 against the now-gone offer must be rejected.
 	fc := &fakeClock{t: time.Unix(0, 0)}
 	s, _, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
+	playOpening(t, s, fc)
 	if err := s.OfferDraw(ctx, 1); err != nil { // seat 1 offers (not its turn)
 		t.Fatalf("OfferDraw(1): %v", err)
 	}
 	fc.add(time.Second)
-	if out, err := s.SubmitMove(ctx, 0, 1, "e2e4", 1); err != nil || !out.Accepted { // seat 0 plays on
+	if out, err := s.SubmitMove(ctx, 0, 3, "g1f3", 3); err != nil || !out.Accepted { // seat 0 plays on
 		t.Fatalf("opponent (seat 0) move: %v %+v", err, out)
 	}
 	// Seat 1's offer is now declined by seat 0's move; seat 0 cannot accept it.
@@ -227,20 +253,23 @@ func TestDrawOfferDeclinedByOpponentMove(t *testing.T) {
 // --- Draw: mutual offer stream shape (Q-EG5) --------------------------------
 
 func TestMutualDrawOfferPairsInStream(t *testing.T) {
+	// GS-7 shape (reversed): a mutual offer is DrawAccepted{1} directly, with NO
+	// extra DrawOffered{1}, then GameEnded.
 	fc := &fakeClock{t: time.Unix(0, 0)}
 	s, store, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
+	playOpening(t, s, fc)
 	if err := s.OfferDraw(ctx, 0); err != nil {
 		t.Fatalf("OfferDraw(0): %v", err)
 	}
-	// Seat 1 offers while seat 0's offer is pending → mutual agreement.
+	// Seat 1 offers while seat 0's offer is pending -> mutual agreement.
 	if err := s.OfferDraw(ctx, 1); err != nil {
 		t.Fatalf("OfferDraw(1) mutual: %v", err)
 	}
 	ev := lastEvents(t, store, 3)
-	if ev[0].Type != game.EvDrawOffered || ev[0].SeatAction.SeatIdx != 1 {
-		t.Fatalf("expected DrawOffered{1} first, got %+v", ev[0])
+	if ev[0].Type != game.EvDrawOffered || ev[0].SeatAction.SeatIdx != 0 {
+		t.Fatalf("expected DrawOffered{0} first, got %+v", ev[0])
 	}
 	if ev[1].Type != game.EvDrawAccepted || ev[1].SeatAction.SeatIdx != 1 {
 		t.Fatalf("expected DrawAccepted{1}, got %+v", ev[1])
@@ -248,17 +277,12 @@ func TestMutualDrawOfferPairsInStream(t *testing.T) {
 	if ev[2].Type != game.EvGameEnded || ev[2].GameEnded.Termination != game.TermDrawAgree {
 		t.Fatalf("expected GameEnded{DRAW_AGREE}, got %+v", ev[2])
 	}
-	// The whole stream: every DrawAccepted{X} has a preceding DrawOffered{X}.
+	// The whole stream: no DrawOffered{1} was appended, and every DrawAccepted{X}
+	// answers a pending offer from the OTHER seat.
 	all, _ := store.Load(ctx, game.StreamIDFor(gameID))
-	offered := map[uint8]bool{}
 	for _, e := range all {
-		switch e.Type {
-		case game.EvDrawOffered:
-			offered[e.SeatAction.SeatIdx] = true
-		case game.EvDrawAccepted:
-			if !offered[e.SeatAction.SeatIdx] {
-				t.Fatalf("DrawAccepted{%d} with no preceding DrawOffered{%d}", e.SeatAction.SeatIdx, e.SeatAction.SeatIdx)
-			}
+		if e.Type == game.EvDrawOffered && e.SeatAction.SeatIdx == 1 {
+			t.Fatalf("mutual offer appended an extra DrawOffered{1}")
 		}
 	}
 }
@@ -268,6 +292,7 @@ func TestRepeatOfferSameSeatIsNoop(t *testing.T) {
 	s, store, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
+	playOpening(t, s, fc)
 	if err := s.OfferDraw(ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
 	}
@@ -409,9 +434,7 @@ func TestAbortAllowedFromMatched(t *testing.T) {
 
 func TestTakebackVoidsPendingDrawOffer(t *testing.T) {
 	// offer-then-takeback-then-accept must NOT end the game: a takeback rewinds
-	// game state, so a pending offer is voided. Without the fix, the ephemeral
-	// drawOfferBy survived the rewind and AcceptDraw ended the game on a
-	// withdrawn offer.
+	// game state, so a pending offer is voided (two-step takeback API, GS-7).
 	fc := &fakeClock{t: time.Unix(0, 0)}
 	s, _, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
@@ -429,8 +452,12 @@ func TestTakebackVoidsPendingDrawOffer(t *testing.T) {
 	if err := s.OfferDraw(ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
 	}
-	if err := s.Takeback(ctx, 1, 1); err != nil {
-		t.Fatalf("Takeback: %v", err)
+	tb, err := s.ProposeTakeback(ctx, 1)
+	if err != nil || tb.Effect != game.EffectTakebackProposed {
+		t.Fatalf("ProposeTakeback: %v %+v", err, tb)
+	}
+	if tb, err = s.AcceptTakeback(ctx, 0, tb.AtPly); err != nil || tb.Effect != game.EffectTakebackRewound {
+		t.Fatalf("AcceptTakeback: %v %+v", err, tb)
 	}
 	// The offer is voided by the takeback — seat 1 cannot accept it.
 	if err := s.AcceptDraw(ctx, 1); !errors.Is(err, ErrNoDrawToAccept) {

@@ -282,12 +282,23 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 		// The move arrived after the clock expired: the session appended the
 		// ClockFlagged+GameEnded ending. Broadcast GAME_END to both seats.
 		s.broadcastGameEnd(ctx, p.GameID)
+	case out.Accepted && out.Reacked:
+		// GS-7 §4: a re-ack is not news to the opponent, so MOVE_ACCEPTED goes
+		// to the SENDER only. (A resend after the game ended cannot reach here
+		// today: the session is dropped at GAME_END, #102.)
+		s.send(ctx, c, codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
+			GameID: p.GameID, Ply: out.Ply, UCI: out.UCI, ClockAfterMs: out.ClockAfterMs,
+		}})
+		// If the re-acked move ended the game, the sender also gets GAME_END
+		// again (#89, #122): its first one may be what got lost.
+		if out.EndedGame {
+			if sp, err := sess.StateSnapshot(ctx); err == nil && sp.Ended {
+				s.send(ctx, c, gameEndMsg(p.GameID, sp.ResultVector, sp.Terminal))
+			}
+		}
 	case out.Accepted:
-		// §4A v1.2 (ADR-18): broadcast MOVE_ACCEPTED (carrying the authoritative
-		// uci) to BOTH seats, not just the mover — the mover confirms its
-		// optimistic move, the opponent learns and applies it. uci comes from
-		// out.UCI (the pipeline's authoritative value: the fresh move or, on a
-		// re-ack, the PERSISTED move), never the request's p.UCI.
+		// §4A v1.2 (ADR-18): a new move goes to BOTH seats, carrying the
+		// authoritative uci.
 		acc := codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
 			GameID: p.GameID, Ply: out.Ply, UCI: out.UCI, ClockAfterMs: out.ClockAfterMs,
 		}}
@@ -296,8 +307,8 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 				s.send(ctx, cc, acc)
 			}
 		}
-		// An engine-detected terminal (mate/stalemate/draw) ended the game.
-		if out.Terminal != nil {
+		// The move and its GameEnded were one batch; announce the end.
+		if out.EndedGame {
 			s.broadcastGameEnd(ctx, p.GameID)
 		}
 	}
@@ -311,15 +322,18 @@ type endingKind int
 const (
 	endingResign endingKind = iota
 	endingAbort
-	endingOfferDraw
-	endingTakeback
-	// NOTE: DRAW_ACCEPT shares the OFFER_DRAW wire code path in this protocol —
-	// the §4A client set has OFFER_DRAW (0x04) only; an accept is a second
-	// OFFER_DRAW by the other seat (the session's mutual-offer path turns it into
-	// a DrawAccepted). So there is no separate accept message to route.
+	endingOfferDraw // also the accept: a second OFFER_DRAW by the other seat
+	endingDeclineDraw
+	endingTakeback // TAKEBACK: request only (v1.3)
+	endingTakebackAccept
+	endingTakebackDecline
 )
 
-func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind endingKind) bool {
+// handleEnding routes the resign/abort/draw/takeback commands and sends what
+// each outcome needs (GS-7 §5.2, §6.3): the notification to the other seat for
+// a new prompt or a decline, STATE to both seats after a rewind, STATE to the
+// sender for an ignored (stale or refused) action, GAME_END if it ended.
+func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind endingKind, atPly uint32) bool {
 	seat, seated := s.seatOf(c, gameID)
 	if !seated {
 		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "not seated in this game"))
@@ -330,53 +344,73 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "no such live game"))
 		return true
 	}
-	var err error
-	// offeredNew is set only for a genuine first draw offer (not a no-op repeat),
-	// so the transport notifies the opponent exactly once per real offer —
-	// honoring the session's idempotency at the notification layer.
-	offeredNew := false
+	var (
+		err    error
+		effect game.Effect
+		snap   session.Snapshot
+		at     uint32
+	)
 	switch kind {
 	case endingResign:
 		err = sess.Resign(ctx, seat)
 	case endingAbort:
 		err = sess.Abort(ctx, seat)
 	case endingOfferDraw:
-		offeredNew, err = sess.OfferDrawResult(ctx, seat)
+		var r session.DrawResult
+		r, err = sess.OfferDrawResult(ctx, seat)
+		effect, snap = r.Effect, r.Snap
+	case endingDeclineDraw:
+		var r session.DrawResult
+		r, err = sess.DeclineDraw(ctx, seat)
+		effect, snap = r.Effect, r.Snap
 	case endingTakeback:
-		err = sess.Takeback(ctx, seat, 1)
+		var r session.TakebackResult
+		r, err = sess.ProposeTakeback(ctx, seat)
+		effect, snap, at = r.Effect, r.Snap, r.AtPly
+	case endingTakebackAccept:
+		var r session.TakebackResult
+		r, err = sess.AcceptTakeback(ctx, seat, atPly)
+		effect, snap = r.Effect, r.Snap
+	case endingTakebackDecline:
+		var r session.TakebackResult
+		r, err = sess.DeclineTakeback(ctx, seat, atPly)
+		effect, snap = r.Effect, r.Snap
 	}
 	if err != nil {
 		s.send(ctx, c, mapSessionErr(gameID, err))
 		return true
 	}
-	// Did this command end the game? If so, broadcast GAME_END to both seats.
-	if snap, serr := sess.StateSnapshot(ctx); serr == nil {
-		if snap.Ended {
-			s.broadcastGameEnd(ctx, gameID)
-			return true
+	if kind == endingResign || kind == endingAbort {
+		if sp, serr := sess.StateSnapshot(ctx); serr == nil {
+			snap = sp
 		}
-		// Non-ending outcomes that the opponent must still learn about:
-		switch kind {
-		case endingTakeback:
-			// A takeback rewinds the board but §4A has no takeback frame — push
-			// STATE to both seats so neither client's board silently diverges (S2).
-			s.broadcastState(ctx, gameID, snap)
-		case endingOfferDraw:
-			// Push DRAW_OFFERED{game_id, by} to the OPPONENT only when a NEW offer
-			// was recorded (§4A v1.1, ADR-17). A no-op repeat by the same seat
-			// (offeredNew == false) sends nothing, so a double-click / resent
-			// OFFER_DRAW does not spam the opponent. The opponent accepts by
-			// sending their own OFFER_DRAW (the mutual path ends via GAME_END).
-			if !offeredNew {
-				break
-			}
-			other := uint8(1) - seat
-			if cc, present := s.connFor(gameID, other); present {
-				s.send(ctx, cc, codec.ServerMsg{Type: codec.SMDrawOffered, DrawOffered: &codec.DrawOfferedPayload{
-					GameID: gameID, By: seat,
-				}})
-			}
+	}
+	if snap.Ended {
+		s.broadcastGameEnd(ctx, gameID)
+		return true
+	}
+	other := uint8(1) - seat
+	toOther := func(msg codec.ServerMsg) {
+		if cc, present := s.connFor(gameID, other); present {
+			s.send(ctx, cc, msg)
 		}
+	}
+	switch effect {
+	case game.EffectDrawOffered:
+		toOther(codec.ServerMsg{Type: codec.SMDrawOffered, DrawOffered: &codec.DrawOfferedPayload{GameID: gameID, By: seat}})
+	case game.EffectDrawDeclined:
+		toOther(codec.ServerMsg{Type: codec.SMDrawDeclined, SeatNotice: &codec.SeatNoticePayload{GameID: gameID, SeatIdx: seat}})
+	case game.EffectTakebackProposed:
+		toOther(codec.ServerMsg{Type: codec.SMTakebackOffered, TakebackOffered: &codec.TakebackOfferedPayload{GameID: gameID, SeatIdx: seat, AtPly: at}})
+	case game.EffectTakebackDeclined:
+		toOther(codec.ServerMsg{Type: codec.SMTakebackDeclined, SeatNotice: &codec.SeatNoticePayload{GameID: gameID, SeatIdx: seat}})
+	case game.EffectTakebackRewound:
+		s.broadcastState(ctx, gameID, snap) // each seat its own you_seat
+	case game.EffectIgnored:
+		// Nothing changed, but the sender's UI is out of step: resync it.
+		s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
+			GameID: gameID, State: snapshotToStateBody(snap, seat),
+		}})
 	}
 	return true
 }
@@ -429,6 +463,9 @@ func mapSessionErr(gameID string, err error) codec.ServerMsg {
 		return errorMsg(codec.ECProtocolViolation, "no draw offer to accept")
 	case errors.Is(err, session.ErrGameNotLive):
 		return errorMsg(codec.ECProtocolViolation, "game is not live")
+	case errors.Is(err, session.ErrTakebackNotAllowed):
+		// GS-7 §5.2.1: rated game or seat count != 2.
+		return errorMsg(codec.ECProtocolViolation, "takeback is not allowed in this game")
 	case errors.Is(err, session.ErrUnsupportedSeatCount):
 		return errorMsg(codec.ECInternal, "unsupported game shape")
 	default:

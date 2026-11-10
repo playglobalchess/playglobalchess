@@ -1,103 +1,77 @@
-// Package session is the live in-memory game session (SPEC-S2-GAME-SERVER-GS3):
-// the single in-process owner of one running game. It owns the authoritative
-// live projection — current position (CurFEN), per-seat clocks, the folded
-// Zobrist history, phase/ply/turn — drives the GS-1 move pipeline against the
-// GS-2 real engine, applies the resulting events to the event store, and serves
-// the §3.5 reconnection resync.
+// Package session is the live in-memory game session: the single in-process
+// owner of one running game.
 //
-// Ownership (Q-GS3A, §3.5): a Session is a single-writer ACTOR. All mutating
-// work runs on ONE goroutine (Run); callers submit commands over a channel and
-// receive replies. There is no shared mutable Session state touched by many
-// goroutines, so the hot path is lock-free and "one owner per game" is a
-// structural guarantee, not a discipline reviewers must re-check. This maps onto
-// the §6.3 goroutine-per-game model.
+// GS-7 (SPEC-S2-GAME-SERVER-GS7 §3.4): the session holds ONE game.State and
+// changes it only through the canonical loop
 //
-// Out of scope here (later chunks): the WS transport that feeds this session,
-// matchmaking that creates the game stream, the real event store (ADR-10 — this
-// uses whatever game.EventStore it is given, the GS-1 stub for now), and
-// sharding. No network is opened here.
+//	decide -> evolve (before persisting) -> append at State.NextSeq -> commit
+//
+// so a live session can never disagree with a rebuild from the store, and no
+// event it writes can be unfoldable. On a seq conflict it reloads the stream,
+// rebuilds with FoldWithEngine and re-decides the same command.
+//
+// Ownership: a Session is a single-writer ACTOR. All work runs on one
+// goroutine (Run); callers submit commands over a channel and wait for replies.
 package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/playglobalchess/playglobalchess/services/game-server/internal/clock"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 )
 
-// Session owns one live game. Construct with NewSession, then run the actor loop
-// with Run and talk to it via SubmitMove / StateSnapshot / TickFlagCheck /
-// Takeback (all of which marshal onto the owning goroutine). The exported
-// methods are safe to call from any goroutine; the fields are owned by Run and
-// must NOT be read or written directly from outside.
+// Session owns one live game. Construct with NewSession, run the actor with
+// Run, and talk to it through the exported methods (safe from any goroutine).
 type Session struct {
 	gameID string
 	stream string
 	store  game.EventStore
 	oracle game.LegalityOracle
-	pipe   *game.Pipeline
 	opts   game.FoldOptions
-	now    func() time.Time // injected clock source (monotonic; fakeable in tests)
+	now    func() time.Time // wall clock (fakeable); read once per command
 
-	// commands marshals all mutating/reading work onto the single owner
-	// goroutine (the actor). It is NEVER closed (that would race dispatchers into
-	// a send-on-closed panic); shutdown uses quit instead.
-	commands chan command
-	// quit is closed once by Close() (guarded by closeOnce) to stop the actor
-	// without closing commands.
+	commands  chan command
 	quit      chan struct{}
 	closeOnce sync.Once
 
-	// --- owner-goroutine-only live projection ---
-	curFEN    string
-	priorKeys []uint64 // folded Zobrist history (one key per MovePlayed, in order)
-	clocks    clock.Clock
-	phase     game.Phase
-	ply       uint32
-	turn      uint8
-	seatCount int
-	rated     bool
-	ended     bool
-	terminal  game.Termination // the ending condition, set when ended=true
-	// resultVector is the GameEnded result, set with terminal by endGame (or at
-	// construction for an already-ended stream). Carried in STATE (v1.3).
-	resultVector []game.Result
-	// lastMoveUCI is the last LIVE move (empty at ply 0); after a takeback it is
-	// the last move of the retained prefix. Carried in STATE (v1.3).
-	lastMoveUCI string
-	lastMoveAt  time.Time
-	// drawOfferBy is the seat with a pending draw offer, or nil (GS-3b, §3.3). It
-	// is EPHEMERAL (owner-goroutine-only, like the other projection fields): it is
-	// cleared when EITHER seat moves (offerer withdraws / opponent declines) and
-	// is NOT reconstructed from the stream on rebuild — a reconnect does not
-	// resurrect a stale offer (Q-EG2).
-	drawOfferBy *uint8
+	// st is the game: the only state, owned by the actor goroutine.
+	st game.State
 	// abortBeforePly is the exclusive ply ceiling under which Abort is allowed
-	// (GS-3b, Q-EG1); at or past it a quit is a resign, not an abort. Default 2.
+	// (GS-3b Q-EG1). Default 2.
 	abortBeforePly uint32
 }
 
-// Config bundles a Session's dependencies. now may be nil (defaults to
-// time.Now); tests inject a fake for deterministic clocks.
+// Config bundles a Session's dependencies. Now may be nil (time.Now).
 type Config struct {
-	GameID string
-	Store  game.EventStore
-	Oracle game.LegalityOracle
-	Opts   game.FoldOptions
-	Now    func() time.Time
-	// AbortBeforePly is the exclusive ply ceiling under which Abort is allowed
-	// (GS-3b, Q-EG1/Q-EG3). Zero means use the default (2).
-	AbortBeforePly uint32
+	GameID         string
+	Store          game.EventStore
+	Oracle         game.LegalityOracle
+	Opts           game.FoldOptions
+	Now            func() time.Time
+	AbortBeforePly uint32 // zero means the default (2)
 }
 
-// NewSession builds a Session by loading the game's durable stream and folding
-// it (FoldWithEngine, GS-2) to seed the live projection — CurFEN, clocks,
-// phase/ply/turn, and the folded Zobrist history. This is the one O(ply) rebuild
-// (resume/construction cost, §3.5), NOT the per-move path. It does not start the
-// actor loop; call Run.
+// Command errors, re-exported from the game package for callers.
+var (
+	ErrGameNotLive          = game.ErrGameNotLive
+	ErrAbortTooLate         = game.ErrAbortTooLate
+	ErrNoDrawToAccept       = game.ErrNoDrawToAccept
+	ErrTakebackNotAllowed   = game.ErrTakebackNotAllowed
+	ErrUnsupportedSeatCount = game.ErrUnsupportedSeatCount
+)
+
+// maxConflictRetries bounds reload-and-redecide on ErrSeqConflict.
+const maxConflictRetries = 8
+
+// NewSession loads the game's stream and folds it with the engine. It then
+// makes the stream current before serving (§3.5, §3.6): a half-terminal stream
+// gets its missing GameEnded, and a LIVE game whose clock has not started gets
+// ClockStarted{now} (today's first-clock rule, made durable). Both go through
+// the same decide/evolve/append loop as every command.
 func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 	if cfg.Store == nil || cfg.Oracle == nil {
 		return nil, fmt.Errorf("session: nil store or oracle")
@@ -106,88 +80,92 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 	if now == nil {
 		now = time.Now
 	}
-	stream := game.StreamIDFor(cfg.GameID)
-	events, err := cfg.Store.Load(ctx, stream)
-	if err != nil {
-		return nil, fmt.Errorf("session: load stream: %w", err)
+	s := &Session{
+		gameID:         cfg.GameID,
+		stream:         game.StreamIDFor(cfg.GameID),
+		store:          cfg.Store,
+		oracle:         cfg.Oracle,
+		opts:           cfg.Opts,
+		now:            now,
+		commands:       make(chan command),
+		quit:           make(chan struct{}),
+		abortBeforePly: cfg.AbortBeforePly,
 	}
-	if len(events) == 0 {
+	if s.abortBeforePly == 0 {
+		s.abortBeforePly = 2 // Q-EG3: before both players have moved once
+	}
+	if err := s.reload(ctx); err != nil {
+		return nil, err
+	}
+	if s.st.Phase == game.PhaseNone {
 		return nil, fmt.Errorf("session: unknown game %q", cfg.GameID)
 	}
-	st, err := game.FoldWithEngine(ctx, events, cfg.Opts, cfg.Oracle)
-	if err != nil {
-		return nil, fmt.Errorf("session: fold: %w", err)
-	}
-	// RECOVERY (half-terminal stream, §5 + the GS-3 non-atomic-ending finding).
-	// A game ends with a GameEnded event, but the session appends it SEPARATELY
-	// from the ClockFlagged / terminal MovePlayed that precedes it, so a store
-	// hiccup or crash between the two can leave a stream that is terminal in
-	// substance but has no GameEnded — which the pure fold projects as still
-	// LIVE, letting a finished game resume and accept moves. On rebuild we detect
-	// and FINISH such a stream before serving it, so it never resumes live. (A
-	// real event store, GS-4, will make the ending append atomic; until then this
-	// recovery is the correctness guarantee.) finishIfHalfTerminal appends the
-	// missing GameEnded and returns the re-folded state + the terminal.
-	// finishIfHalfTerminal appends the missing GameEnded (if the stream is
-	// half-terminal) and returns the re-folded state, so the end-state fields
-	// below (st.Phase == PhaseEnded, st.Termination) are correct for the
-	// recovered case exactly as for a normally-ended stream.
-	st, err = finishIfHalfTerminal(ctx, cfg, events, st)
-	if err != nil {
+	if _, err := s.exec(ctx, game.CmdFinishHalfTerminal{}); err != nil {
 		return nil, fmt.Errorf("session: half-terminal recovery: %w", err)
 	}
-	// Seed the idle baseline from the LAST move's server timestamp, not now():
-	// after a node-failover/reconnect rebuild (§3.5), the side to move may be
-	// deep in a think, and that already-elapsed idle time must not be forgotten.
-	// MovePlayed.ServerTS (§4A.8, epoch ms) is the move's wall-clock instant, so
-	// now()-lastMoveAt correctly includes pre-rebuild idle time. A game with no
-	// moves yet falls back to now() (the clock has not started ticking on a
-	// specific side's think).
-	lastMoveAt := now()
-	if ts, ok := lastMoveServerTS(events); ok {
-		lastMoveAt = time.UnixMilli(int64(ts))
-	}
-	s := &Session{
-		gameID:       cfg.GameID,
-		stream:       stream,
-		store:        cfg.Store,
-		oracle:       cfg.Oracle,
-		pipe:         &game.Pipeline{Oracle: cfg.Oracle, Store: cfg.Store, Opts: cfg.Opts},
-		opts:         cfg.Opts,
-		now:          now,
-		commands:     make(chan command),
-		quit:         make(chan struct{}),
-		curFEN:       st.CurFEN,
-		priorKeys:    st.PriorKeys,
-		clocks:       st.Clock,
-		phase:        st.Phase,
-		ply:          st.Ply,
-		turn:         st.TurnIdx,
-		seatCount:    len(st.Seats),
-		rated:        st.Rated,
-		ended:        st.Phase == game.PhaseEnded,
-		terminal:     st.Termination, // meaningful when already ended at construction
-		resultVector: st.ResultVector,
-		lastMoveUCI:  st.LastMoveUCI,
-		lastMoveAt:   lastMoveAt,
-	}
-	s.abortBeforePly = cfg.AbortBeforePly
-	if s.abortBeforePly == 0 {
-		s.abortBeforePly = 2 // Q-EG3 default: before both players have moved once.
+	if _, err := s.exec(ctx, game.CmdStartClock{}); err != nil {
+		return nil, fmt.Errorf("session: start clock: %w", err)
 	}
 	return s, nil
 }
 
-// Run is the actor loop: it owns all Session state and serves commands until the
-// context is cancelled or Close() is called. Launch it in its own goroutine:
-//
-//	go s.Run(ctx)
-//
-// Exactly one Run per Session. All exported methods block until Run processes
-// their command, so no caller ever touches Session fields concurrently. On
-// shutdown Run returns; the `commands` channel is NEVER closed (closing it would
-// race concurrent dispatchers into a send-on-closed-channel panic), so shutdown
-// is signalled via the separate `quit` channel instead.
+// reload rebuilds the state from the store with the engine.
+func (s *Session) reload(ctx context.Context) error {
+	events, err := s.store.Load(ctx, s.stream)
+	if err != nil {
+		return fmt.Errorf("session: load stream: %w", err)
+	}
+	if len(events) == 0 {
+		s.st = game.State{}
+		return nil
+	}
+	st, err := game.FoldWithEngine(ctx, events, s.opts, s.oracle)
+	if err != nil {
+		return fmt.Errorf("session: fold: %w", err)
+	}
+	s.st = st
+	return nil
+}
+
+// exec runs one command through the canonical loop (§3.4). It is the ONLY
+// place the session's state changes. On success the decision's events are
+// durably committed (persist-before-ack, NFR-7) and s.st includes them.
+func (s *Session) exec(ctx context.Context, cmd game.Command) (game.Decision, error) {
+	for attempt := 0; ; attempt++ {
+		nowMs := uint64(s.now().UnixMilli()) // one read per decide (§3.1)
+		d, err := game.Decide(ctx, s.st, cmd, nowMs, s.opts, s.oracle)
+		if err != nil || len(d.Events) == 0 {
+			return d, err
+		}
+		// Evolve BEFORE persisting: an event the fold would reject is caught
+		// here and never reaches the store.
+		next := s.st
+		for i := range d.Events {
+			if next, err = game.Evolve(next, d.Events[i], d.Verdicts[i], s.opts); err != nil {
+				return game.Decision{}, fmt.Errorf("session: decided an unfoldable event %s: %w", d.Events[i].Type, err)
+			}
+		}
+		if len(d.Events) == 1 {
+			err = s.store.Append(ctx, s.stream, s.st.NextSeq, d.Events[0]) // the move hot path
+		} else {
+			err = s.store.AppendBatch(ctx, s.stream, s.st.NextSeq, d.Events)
+		}
+		if err == nil {
+			s.st = next
+			return d, nil
+		}
+		if !errors.Is(err, game.ErrSeqConflict) || attempt >= maxConflictRetries {
+			return game.Decision{}, fmt.Errorf("session: persist: %w", err)
+		}
+		// Another writer took the seq: rebuild from the store and re-decide the
+		// same command (it may now be a re-ack, stale, or still valid).
+		if rerr := s.reload(ctx); rerr != nil {
+			return game.Decision{}, rerr
+		}
+	}
+}
+
+// Run is the actor loop. Exactly one Run per Session.
 func (s *Session) Run(ctx context.Context) {
 	for {
 		select {
@@ -196,69 +174,30 @@ func (s *Session) Run(ctx context.Context) {
 		case <-s.quit:
 			return
 		case cmd := <-s.commands:
-			s.applyRecovered(s.runCtx(ctx), cmd)
+			s.applyRecovered(ctx, cmd)
 		}
 	}
 }
 
-// applyRecovered runs one command's apply with a panic barrier. A command's
-// apply does `defer close(c.done)`, which still runs during panic unwinding, so
-// the blocked caller is released BEFORE this recover fires — the caller does not
-// hang. The recover then stops the panic from unwinding out of the actor
-// goroutine, which (with no recover) would crash the WHOLE process and every
-// other live game session on this server. A panic in one command thus fails
-// that command's turn and keeps the actor — and every other game — alive. This
-// is defense-in-depth: command handlers return typed errors rather than
-// panicking (e.g. the 2-seat guard is now ErrUnsupportedSeatCount, not a panic),
-// but a future handler bug must not take down the process.
+// applyRecovered runs one command with a panic barrier, so a handler bug fails
+// that command (its done channel is closed by its own defer) and keeps the
+// actor and every other game on this process alive.
 func (s *Session) applyRecovered(ctx context.Context, cmd command) {
-	defer func() {
-		if r := recover(); r != nil {
-			// The command's own `defer close(c.done)` already ran during
-			// unwinding, so its caller is unblocked (it sees whatever c.err/c.out
-			// was set before the panic — typically the zero value). Swallow here
-			// to protect the actor loop and the process.
-			_ = r
-		}
-	}()
+	defer func() { _ = recover() }()
 	cmd.apply(ctx, s)
 }
 
-// runCtx returns the context the actor uses for a command's own I/O: the Run
-// context. A command's EXECUTION is deliberately governed by the actor's
-// lifetime, NOT by the caller's per-call ctx — once the actor accepts a mutating
-// command it must run to completion so a durably-committed move is never
-// reported to the caller as a failure (the caller's ctx governs delivery only;
-// see dispatch).
-func (s *Session) runCtx(ctx context.Context) context.Context { return ctx }
-
-// Close stops the actor loop. Idempotent and safe to call concurrently with
-// in-flight dispatchers: it closes the `quit` signal (via sync.Once) rather than
-// the `commands` channel, so a racing send never panics. Prefer cancelling the
-// Run context for shutdown; Close() is the explicit alternative.
+// Close stops the actor loop. Idempotent; never closes the commands channel.
 func (s *Session) Close() { s.closeOnce.Do(func() { close(s.quit) }) }
 
-// command is a unit of work for the actor goroutine. apply runs ON that
-// goroutine and may freely touch Session fields.
+// command is a unit of work run on the actor goroutine.
 type command interface {
 	apply(ctx context.Context, s *Session)
 }
 
-// dispatch sends a command to the actor and waits for it to run.
-//
-// Two phases with DIFFERENT cancellation semantics (this is deliberate — it is
-// the fix for "a cancelled caller is told the move failed while the actor still
-// commits it"):
-//   - BEFORE the actor accepts the command, the caller's ctx (or session
-//     shutdown) may abandon it — nothing has been committed, so returning an
-//     error is correct and safe.
-//   - AFTER the send succeeds, the command is owned by the actor and WILL run to
-//     completion (it may append to the store and advance the projection). We no
-//     longer honour the caller's ctx for the result wait — we wait for `done`
-//     (or session shutdown). The caller's ctx governs DELIVERY, not EXECUTION,
-//     so a move the server durably commits stays ackable and is never silently
-//     lost. (A read-only command is harmless either way; mutating ones must not
-//     diverge ack from durability — NFR-7.)
+// dispatch sends a command to the actor and waits for it. Before the actor
+// accepts it the caller's ctx may abandon it; after, it runs to completion so
+// a durably committed move is never reported as a failure.
 func (s *Session) dispatch(ctx context.Context, c command, done <-chan struct{}) error {
 	select {
 	case <-ctx.Done():
@@ -266,118 +205,38 @@ func (s *Session) dispatch(ctx context.Context, c command, done <-chan struct{})
 	case <-s.quit:
 		return errSessionClosed
 	case s.commands <- c:
-		// Accepted by the actor: from here the command runs to completion.
 	}
 	select {
 	case <-s.quit:
-		// Session shut down before the command finished. The actor loop has
-		// returned, so `done` may never close; report shutdown rather than hang.
 		return errSessionClosed
 	case <-done:
 		return nil
 	}
 }
 
-// errSessionClosed is returned when a command cannot be completed because the
-// session is shutting down.
 var errSessionClosed = fmt.Errorf("session: closed")
 
-// finishIfHalfTerminal closes a half-terminal stream on rebuild (the GS-3
-// non-atomic-ending finding). A game ends with a GameEnded event appended
-// SEPARATELY from the ClockFlagged / terminal MovePlayed before it, so a store
-// hiccup or crash between the two can leave a stream that is terminal in
-// substance but lacks GameEnded — which the pure fold projects as LIVE. If
-// `events` already ends in GameEnded, nothing to do. Otherwise, if the stream is
-// half-terminal — (a) its last substantive event is a ClockFlagged, or (b) the
-// final move produced a terminal (st.LastMoveTerminal != nil) — append the
-// missing GameEnded and re-fold so the returned state is PhaseEnded with the
-// right termination, exactly as a normally-ended stream would be. (A real event
-// store, GS-4, makes the ending append atomic and this a no-op.)
-func finishIfHalfTerminal(ctx context.Context, cfg Config, events []game.Event, st game.State) (game.State, error) {
-	if st.Phase == game.PhaseEnded {
-		return st, nil // already closed by a committed GameEnded
-	}
-	stream := game.StreamIDFor(cfg.GameID)
-
-	// Case (a): a trailing ClockFlagged with no GameEnded after it.
-	if seat, ok := trailingUnendedFlag(events); ok {
-		term, err := game.FlagTermination(ctx, cfg.Oracle, st.CurFEN, seat, len(st.Seats))
-		if err != nil {
-			return game.State{}, fmt.Errorf("recover flag termination: %w", err)
-		}
-		rv := flagResultVector(term, seat, len(st.Seats))
-		if err := cfg.Store.Append(ctx, stream, uint32(len(events)), game.Event{
-			Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: term},
-		}); err != nil {
-			return game.State{}, fmt.Errorf("recover append GameEnded(flag): %w", err)
-		}
-		return refold(ctx, cfg, stream)
-	}
-
-	// Case (b): the last move produced a terminal but no GameEnded was appended.
-	if st.LastMoveTerminal != nil {
-		mover := lastMover(events)
-		rv := winnerFromMover(mover, *st.LastMoveTerminal, len(st.Seats))
-		if err := cfg.Store.Append(ctx, stream, uint32(len(events)), game.Event{
-			Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: rv, Termination: *st.LastMoveTerminal},
-		}); err != nil {
-			return game.State{}, fmt.Errorf("recover append GameEnded(terminal move): %w", err)
-		}
-		return refold(ctx, cfg, stream)
-	}
-
-	return st, nil // not half-terminal — a genuinely live game
+// execCmd marshals a game.Command onto the actor and runs exec.
+type execCmd struct {
+	cmd  game.Command
+	d    game.Decision
+	snap Snapshot
+	err  error
+	done chan struct{}
 }
 
-func refold(ctx context.Context, cfg Config, stream string) (game.State, error) {
-	events, err := cfg.Store.Load(ctx, stream)
-	if err != nil {
-		return game.State{}, fmt.Errorf("recover reload: %w", err)
-	}
-	st, err := game.FoldWithEngine(ctx, events, cfg.Opts, cfg.Oracle)
-	if err != nil {
-		return game.State{}, fmt.Errorf("recover refold: %w", err)
-	}
-	return st, nil
+func (c *execCmd) apply(ctx context.Context, s *Session) {
+	defer close(c.done)
+	c.d, c.err = s.exec(ctx, c.cmd)
+	c.snap = s.snapshot()
 }
 
-// trailingUnendedFlag reports the flagged seat of a ClockFlagged that is the last
-// substantive game event with no GameEnded after it (and true). A GameEnded
-// anywhere after the last ClockFlagged means the flag was already closed.
-func trailingUnendedFlag(events []game.Event) (uint8, bool) {
-	for i := len(events) - 1; i >= 0; i-- {
-		switch events[i].Type {
-		case game.EvGameEnded:
-			return 0, false // already ended
-		case game.EvClockFlagged:
-			if events[i].SeatAction != nil {
-				return events[i].SeatAction.SeatIdx, true
-			}
-			return 0, false
-		}
+// run executes cmd on the actor and returns the decision and the snapshot
+// taken right after it.
+func (s *Session) run(ctx context.Context, cmd game.Command) (game.Decision, Snapshot, error) {
+	c := &execCmd{cmd: cmd, done: make(chan struct{})}
+	if err := s.dispatch(ctx, c, c.done); err != nil {
+		return game.Decision{}, Snapshot{}, err
 	}
-	return 0, false
-}
-
-// lastMover returns the seat of the most recent MovePlayed (0 if none).
-func lastMover(events []game.Event) uint8 {
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Type == game.EvMovePlayed && events[i].MovePlayed != nil {
-			return events[i].MovePlayed.SeatIdx
-		}
-	}
-	return 0
-}
-
-// lastMoveServerTS returns the ServerTS of the most recent MovePlayed in the
-// stream (and true), or (0,false) if no move has been played. Used to seed the
-// idle baseline so a reconnect/failover rebuild does not forget pre-rebuild
-// think time (§3.5).
-func lastMoveServerTS(events []game.Event) (uint64, bool) {
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Type == game.EvMovePlayed && events[i].MovePlayed != nil {
-			return events[i].MovePlayed.ServerTS, true
-		}
-	}
-	return 0, false
+	return c.d, c.snap, c.err
 }

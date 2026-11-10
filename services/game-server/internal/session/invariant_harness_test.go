@@ -3,56 +3,29 @@ package session
 // GS-7 invariant harness (SPEC-S2-GAME-SERVER-GS7 §9.2).
 //
 // Drives the REAL session over the real cgo engine and a MemStore with random,
-// seeded command sequences, and after every step checks invariants no existing
-// test checked:
+// seeded command sequences, and after every step checks:
 //
 //   I1  every stream the session wrote folds: game.Fold(store) returns no error;
 //   I2  the live position is never empty: snapshot FEN != "";
 //   I3  the live session equals a rebuild: a fresh NewSession over the same store
-//       has the same FEN, ply, turn, phase, ended, terminal and clocks (public
-//       Snapshot) AND the same repetition history, pending draw offer and idle
-//       clock baseline (internal state, read through the actor).
+//       holds an IDENTICAL game.State (every field, §3.9) and an identical
+//       Snapshot;
+//   I4  the pure Fold of the store agrees with live on every engine-free field
+//       (ply, turn, clocks, history shape, prompts, baselines, NextSeq);
+//   I5  the live draw offer matches the offer ORACLE (gs7Rules, the ratified
+//       §6.2-§6.3 rules pinned by TestOfferRulesOracle).
 //
-// Known failures on today's code are handled as STRICT expected failures so CI
-// stays green while the harness still fails on anything new:
-//
-//   - a break is reported as a list of differing parts. #84 (takeback) is
-//     recognised only on the check right after a one-ply takeback, and only in
-//     its exact shape: the rebuild sits at the pre-takeback FEN and ply while
-//     live sits exactly one ply earlier (sig84). Otherwise EVERY part must be
-//     owned by an issue whose trigger or state was reached (#85 own-offer fold
-//     error, #157 clocks, #124 idle baseline before the first move, #159 offer
-//     lost on rebuild or restart). Any unowned part fails the test;
-//   - the pending draw offer is also checked against an ORACLE of the offer
-//     rules (offerModel). The oracle never encodes a bug: a restart keeps the
-//     offer, and today's loss is reported as #159. A live offer that breaks the
-//     rules is never excused;
-//   - every seed also runs an "unrated-clean" configuration that never takes back,
-//     never offers a draw, never flags and never moves the clock before the first
-//     move, and excuses nothing;
-//   - each known issue has a strict repro test that must keep failing with that
-//     issue's own signature; once it passes, the test fails and says to delete it
-//     from knownFailures.
-//
-// GS7_STRICT=1 excuses nothing AND switches the offer oracle from todayRules to
-// gs7Rules (the ratified §6.2-§6.3 rules, pinned by TestOfferRulesOracle). So the
-// GS-7 fix PR is checked against the spec, not against an oracle edited to match
-// its code. The fix PR must pass with GS7_STRICT=1. It then deletes
-// knownFailures, the trigger tracking, todayRules and this switch.
-//
-// What the fix PR WILL have to change here, by design: the operations, because
-// the session API changes (takeback becomes propose/accept/decline, draw gains
-// decline). What it must NOT change: gs7Rules and TestOfferRulesOracle, except
-// where the spec itself is amended.
-//
-// When the GS-7 refactor adds State fields (§3.9), extend snapshotDiff and
-// internalDiff so every field is compared.
+// This is the GS-7 fix PR's version: the known-failure machinery that kept CI
+// green before the fix (knownFailures, triggers, todayRules, GS7_STRICT) is
+// gone, so nothing is excused. The former strict repros are plain regression
+// tests at the bottom.
 
 import (
 	"context"
 	"fmt"
 	"math/rand"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -62,20 +35,8 @@ import (
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 )
 
-// knownFailures lists the issues whose invariant breaks are expected on today's
-// code. Each has a strict repro test below.
-var knownFailures = map[string]string{
-	"#84":  "takeback: only the session cuts undone moves; rebuild replays them, a later move is re-acked as the undone one",
-	"#85":  "mutual draw offer: the persisted stream does not fold",
-	"#124": "no move yet: the idle-clock baseline is the session's construction time, not in the stream",
-	"#157": "flag: live zeroes the flagged clock, a rebuild keeps its last ClockAfterMs",
-	"#159": "a pending draw offer is not rebuilt from the stream",
-}
-
 // reproOpts matches the FoldOptions seedLive builds its session with (5+3).
 var reproOpts = game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 300_000, IncrementMs: 3_000}}
-
-func strictMode() bool { return os.Getenv("GS7_STRICT") == "1" }
 
 // startPositions are cycled across seeds so promotion, castling and en passant
 // are exercised, not only the standard opening.
@@ -89,56 +50,32 @@ var startPositions = []string{
 // --- harness world ----------------------------------------------------------
 
 type harness struct {
-	t      *testing.T
-	ctx    context.Context
-	store  *game.MemStore
-	oracle game.LegalityOracle
-	clock  *fakeClock
-	live   *Session
-	stop   context.CancelFunc
-	rated  bool
-	// avoidKnown: never exercise a known trigger and never excuse a break.
-	avoidKnown bool
-
-	// Triggers set by operations: which known-failure paths were exercised.
-	triggers map[string]bool
-	// offers is the oracle for the pending draw offer (see offerModel).
-	offers *offerModel
-	// justTookBack holds the position before a takeback, for the ONE check that
-	// follows it; #84 is recognised only there (see sig84).
-	justTookBack *Snapshot
-	lastMove     *harnessMove
-	log          []string
+	t        *testing.T
+	ctx      context.Context
+	store    *game.MemStore
+	oracle   game.LegalityOracle
+	clock    *fakeClock
+	live     *Session
+	stop     context.CancelFunc
+	rated    bool
+	offers   *offerModel
+	lastMove *harnessMove
+	log      []string
 }
 
 // --- the draw-offer oracle --------------------------------------------------
 
-// offerRules are the draw-offer rules the oracle applies. Two rule sets exist:
-//
-//   - todayRules: what main does now (GS-3b). Used in the default mode.
-//   - gs7Rules:   the ratified target, SPEC-S2-GAME-SERVER-GS7 §6.2-§6.3. Used
-//     when GS7_STRICT=1, so the GS-7 fix PR is checked against the
-//     SPEC, not against an oracle its author edits to match the code.
-//
-// The differences between the two are deliberate rule changes in GS-7, not
-// bugs, so they are not known failures. Bugs are never encoded in either set:
-// a restart KEEPS a pending offer in both, and today's loss of it is #159.
+// offerRules are the draw-offer rules the oracle applies: the ratified target,
+// SPEC-S2-GAME-SERVER-GS7 §6.2-§6.3. They must not be edited to match code.
 type offerRules struct {
 	name string
 	// moveClears reports whether an accepted new move by mover clears an offer
 	// made by offerer.
 	moveClears func(mover, offerer uint8) bool
-	// endClears: a game end (resign, flag, mate, any terminal) clears the offer.
+	// endClears: a game end clears the offer.
 	endClears bool
 	// gated: an offer needs ply >= 2 and no own offer within the last 20 plies.
 	gated bool
-}
-
-var todayRules = offerRules{
-	name:       "today",
-	moveClears: func(mover, offerer uint8) bool { return true },
-	endClears:  false,
-	gated:      false,
 }
 
 var gs7Rules = offerRules{
@@ -148,21 +85,11 @@ var gs7Rules = offerRules{
 	gated:      true,                                                        // §6.3: ply >= 2, 20-ply cooldown
 }
 
-func activeOfferRules() offerRules {
-	if strictMode() {
-		return gs7Rules
-	}
-	return todayRules
-}
-
 // offerModel is the expected pending draw offer under a rule set.
 type offerModel struct {
 	rules   offerRules
 	pending int              // seat with a pending offer, or -1
-	last    map[uint8]uint32 // ply of each seat's last offer (gs7 cooldown)
-	// lostToRestart: a restart happened while an offer was pending, so a live
-	// session that now has none shows #159.
-	lostToRestart bool
+	last    map[uint8]uint32 // ply of each seat's last offer (cooldown)
 }
 
 func newOfferModel(rules offerRules) *offerModel {
@@ -175,7 +102,6 @@ func (m *offerModel) offer(by uint8, ply uint32) (mutual bool) {
 	switch {
 	case m.pending >= 0 && m.pending != int(by):
 		m.pending = -1 // accept; no gate applies to an accept (§6.3 step 1)
-		m.lostToRestart = false
 		return true
 	case m.pending == int(by):
 		return false // repeat by the same seat: no-op
@@ -190,14 +116,12 @@ func (m *offerModel) offer(by uint8, ply uint32) (mutual bool) {
 	}
 	m.pending = int(by)
 	m.last[by] = ply
-	m.lostToRestart = false
 	return false
 }
 
 func (m *offerModel) move(mover uint8) {
 	if m.pending >= 0 && m.rules.moveClears(mover, uint8(m.pending)) {
 		m.pending = -1
-		m.lostToRestart = false
 	}
 }
 
@@ -205,15 +129,16 @@ func (m *offerModel) move(mover uint8) {
 func (m *offerModel) accept(by uint8) {
 	if m.pending >= 0 && m.pending != int(by) {
 		m.pending = -1
-		m.lostToRestart = false
 	}
 }
+
+// decline applies DECLINE_DRAW by either seat (§6.3): it clears the offer.
+func (m *offerModel) decline() { m.pending = -1 }
 
 // rewind applies a takeback to toPly: the offer is cleared and cooldown entries
 // above toPly are dropped (§5.5).
 func (m *offerModel) rewind(toPly uint32) {
 	m.pending = -1
-	m.lostToRestart = false
 	for s, l := range m.last {
 		if l > toPly {
 			delete(m.last, s)
@@ -221,13 +146,8 @@ func (m *offerModel) rewind(toPly uint32) {
 	}
 }
 
-// restart: the correct behaviour keeps the offer (GS-7 §6.1). Today's loss of it
-// is #159, reported by check(), never encoded here.
-func (m *offerModel) restart() {
-	if m.pending >= 0 {
-		m.lostToRestart = true
-	}
-}
+// restart: a restart keeps the offer (GS-7 §6.1, #159).
+func (m *offerModel) restart() {}
 
 // expected is the offer a live session must hold now.
 func (m *offerModel) expected(gameEnded bool) int {
@@ -237,20 +157,13 @@ func (m *offerModel) expected(gameEnded bool) int {
 	return m.pending
 }
 
-// acceptLoss resyncs the model after an excused #159 restart loss, so the run
-// can continue from what the session really holds.
-func (m *offerModel) acceptLoss() {
-	m.pending = -1
-	m.lostToRestart = false
-}
-
 type harnessMove struct {
 	seat uint8
 	ply  uint32
 	uci  string
 }
 
-func newHarness(t *testing.T, startpos string, rated, avoidKnown bool) *harness {
+func newHarness(t *testing.T, startpos string, rated bool) *harness {
 	t.Helper()
 	fc := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	s, store, cancel := seedLive(t, startpos, rated, fc.now)
@@ -260,8 +173,7 @@ func newHarness(t *testing.T, startpos string, rated, avoidKnown bool) *harness 
 	}
 	return &harness{
 		t: t, ctx: context.Background(), store: store, oracle: o, clock: fc,
-		live: s, stop: cancel, rated: rated, avoidKnown: avoidKnown,
-		triggers: map[string]bool{}, offers: newOfferModel(activeOfferRules()),
+		live: s, stop: cancel, rated: rated, offers: newOfferModel(gs7Rules),
 	}
 }
 
@@ -284,259 +196,105 @@ func (h *harness) note(format string, args ...any) {
 
 // --- internal state, read on the actor goroutine ----------------------------
 
-// internalView is session state the public Snapshot does not expose but a
-// rebuild must reproduce.
-type internalView struct {
-	priorKeys   []uint64
-	drawOfferBy int // -1 none
-	lastMoveMs  int64
-}
-
-type internalCmd struct {
-	v    internalView
+type stateCmd struct {
+	st   game.State
 	done chan struct{}
 }
 
-func (c *internalCmd) apply(_ context.Context, s *Session) {
+func (c *stateCmd) apply(_ context.Context, s *Session) {
 	defer close(c.done)
-	c.v.priorKeys = append([]uint64(nil), s.priorKeys...)
-	c.v.drawOfferBy = -1
-	if s.drawOfferBy != nil {
-		c.v.drawOfferBy = int(*s.drawOfferBy)
-	}
-	c.v.lastMoveMs = s.lastMoveAt.UnixMilli()
+	c.st = s.st
 }
 
-func readInternal(ctx context.Context, s *Session) (internalView, error) {
-	c := &internalCmd{done: make(chan struct{})}
+// readState returns the session's whole game.State (read on its actor).
+func readState(ctx context.Context, s *Session) (game.State, error) {
+	c := &stateCmd{done: make(chan struct{})}
 	if err := s.dispatch(ctx, c, c.done); err != nil {
-		return internalView{}, err
+		return game.State{}, err
 	}
-	return c.v, nil
+	return c.st, nil
 }
 
 // --- invariants -------------------------------------------------------------
 
-// violation describes a broken invariant. parts names what differs; the excuse
-// logic matches issues to parts.
-type violation struct {
-	text  string
-	parts []string
-	// live and rebuilt snapshots, when the break came from the I3 comparison.
-	live, rb *Snapshot
-}
-
-func (v *violation) String() string {
-	if v == nil {
-		return ""
-	}
-	return v.text
-}
-
-func (v *violation) has(part string) bool {
-	for _, p := range v.parts {
-		if p == part {
-			return true
-		}
-	}
-	return false
-}
-
-func brk(part, format string, args ...any) *violation {
-	return &violation{text: fmt.Sprintf(format, args...), parts: []string{part}}
-}
-
-// check returns nil when every invariant holds.
-func (h *harness) check() *violation {
+// check returns "" when every invariant holds, else what broke.
+func (h *harness) check() string {
 	events, err := h.store.Load(h.ctx, game.StreamIDFor(gameID))
 	if err != nil {
-		return brk("harness", "store load: %v", err)
+		return fmt.Sprintf("harness: store load: %v", err)
 	}
-	if _, err := game.Fold(events, reproOpts); err != nil {
-		return brk("fold", "I1 stream does not fold: %v", err)
-	}
-	live, err := h.live.StateSnapshot(h.ctx)
+	pure, err := game.Fold(events, reproOpts)
 	if err != nil {
-		return brk("harness", "live snapshot: %v", err)
+		return fmt.Sprintf("I1 stream does not fold: %v", err)
 	}
-	if live.FEN == "" {
-		return brk("emptyFEN", "I2 live FEN is empty")
+	liveSnap, err := h.live.StateSnapshot(h.ctx)
+	if err != nil {
+		return fmt.Sprintf("harness: live snapshot: %v", err)
+	}
+	if liveSnap.FEN == "" {
+		return "I2 live FEN is empty"
 	}
 	rb, cancel, err := h.rebuild()
 	if err != nil {
-		return brk("rebuild", "I3 rebuild fails: %v", err)
+		return fmt.Sprintf("I3 rebuild fails: %v", err)
 	}
 	defer cancel()
 	rbSnap, err := rb.StateSnapshot(h.ctx)
 	if err != nil {
-		return brk("harness", "I3 rebuild snapshot: %v", err)
+		return fmt.Sprintf("harness: rebuild snapshot: %v", err)
 	}
-	liveIn, err := readInternal(h.ctx, h.live)
+	liveSt, err := readState(h.ctx, h.live)
 	if err != nil {
-		return brk("harness", "live internal: %v", err)
+		return fmt.Sprintf("harness: live state: %v", err)
 	}
-	rbIn, err := readInternal(h.ctx, rb)
+	rbSt, err := readState(h.ctx, rb)
 	if err != nil {
-		return brk("harness", "rebuild internal: %v", err)
+		return fmt.Sprintf("harness: rebuild state: %v", err)
 	}
-	want := h.offers.expected(live.Ended)
-	parts, texts := snapshotDiff(live, rbSnap)
-	p2, t2 := internalDiff(liveIn, rbIn, want)
-	parts, texts = append(parts, p2...), append(texts, t2...)
-	// The live offer must match the offer oracle (activeOfferRules). This
-	// compares live against the RULES, not against a rebuild. The one excusable
-	// shape is #159: a restart while an offer was pending left the live session
-	// with none. Any other mismatch is "offerModel", which is never excused.
-	if liveIn.drawOfferBy != want {
-		part := "offerModel"
-		if liveIn.drawOfferBy == -1 && want >= 0 && h.offers.lostToRestart {
-			part = "offerLostOnRestart"
-		}
-		parts = append(parts, part)
-		texts = append(texts, fmt.Sprintf("live drawOfferBy %d but the %s offer rules say %d",
-			liveIn.drawOfferBy, h.offers.rules.name, want))
+	var broken []string
+	if d := fieldDiff(liveSt, rbSt); d != "" {
+		broken = append(broken, "I3 live != rebuild State: "+d)
 	}
-	if len(parts) == 0 {
-		return nil
+	if !reflect.DeepEqual(liveSnap, rbSnap) {
+		broken = append(broken, fmt.Sprintf("I3 live != rebuild Snapshot:\n live %+v\n rb   %+v", liveSnap, rbSnap))
 	}
-	return &violation{text: "I3 live != rebuild: " + strings.Join(texts, "; "), parts: parts,
-		live: &live, rb: &rbSnap}
+	if d := pureDiff(liveSt, pure); d != "" {
+		broken = append(broken, "I4 live != pure Fold: "+d)
+	}
+	if want := h.offers.expected(liveSnap.Ended); liveSt.DrawOfferBy != want {
+		broken = append(broken, fmt.Sprintf("I5 live drawOfferBy %d but the %s offer rules say %d",
+			liveSt.DrawOfferBy, h.offers.rules.name, want))
+	}
+	return strings.Join(broken, "; ")
 }
 
-func snapshotDiff(a, b Snapshot) (parts, texts []string) {
-	add := func(p, f string, args ...any) {
-		parts = append(parts, p)
-		texts = append(texts, fmt.Sprintf(f, args...))
-	}
-	if a.FEN != b.FEN {
-		add("fen", "fen %q vs %q", a.FEN, b.FEN)
-	}
-	if a.Ply != b.Ply {
-		add("ply", "ply %d vs %d", a.Ply, b.Ply)
-	}
-	if a.Turn != b.Turn {
-		add("turn", "turn %d vs %d", a.Turn, b.Turn)
-	}
-	if a.Phase != b.Phase {
-		add("phase", "phase %v vs %v", a.Phase, b.Phase)
-	}
-	if a.Ended != b.Ended {
-		add("ended", "ended %v vs %v", a.Ended, b.Ended)
-	}
-	if a.Ended && b.Ended && a.Terminal != b.Terminal {
-		add("terminal", "terminal %v vs %v", a.Terminal, b.Terminal)
-	}
-	if fmt.Sprint(a.RemainingMs) != fmt.Sprint(b.RemainingMs) {
-		add("clocks", "clocks %v vs %v", a.RemainingMs, b.RemainingMs)
-	}
-	return parts, texts
-}
-
-// internalDiff compares live (a) with a rebuild (b). model is the harness's
-// expected live offer. A pending offer the rebuild lost while live holds exactly
-// the expected offer is the known #159 gap and gets its own part name; any other
-// offer difference is the unowned part "drawOfferBy".
-func internalDiff(a, b internalView, model int) (parts, texts []string) {
-	if fmt.Sprint(a.priorKeys) != fmt.Sprint(b.priorKeys) {
-		parts = append(parts, "priorKeys")
-		texts = append(texts, fmt.Sprintf("priorKeys len %d vs %d", len(a.priorKeys), len(b.priorKeys)))
-	}
-	if a.drawOfferBy != b.drawOfferBy {
-		part := "drawOfferBy"
-		if b.drawOfferBy == -1 && a.drawOfferBy >= 0 && a.drawOfferBy == model {
-			part = "offerLostOnRebuild"
-		}
-		parts = append(parts, part)
-		texts = append(texts, fmt.Sprintf("drawOfferBy %d vs %d", a.drawOfferBy, b.drawOfferBy))
-	}
-	if a.lastMoveMs != b.lastMoveMs {
-		parts = append(parts, "lastMoveAt")
-		texts = append(texts, fmt.Sprintf("lastMoveAt %d vs %d ms", a.lastMoveMs, b.lastMoveMs))
-	}
-	return parts, texts
-}
-
-// --- known-issue signatures -------------------------------------------------
-
-// sig84 is #84's exact signature on the check right after a one-ply takeback:
-// the rebuild replays the undone move, so it sits EXACTLY at the position before
-// the takeback (same FEN and ply) while live sits exactly one ply earlier. The
-// only other parts allowed are the direct consequences of that replay (turn,
-// clocks, repetition history, idle baseline). Anything else, including a
-// different position, is not #84.
-func sig84(v *violation, before *Snapshot) bool {
-	if v == nil || before == nil || v.live == nil || v.rb == nil {
-		return false
-	}
-	allowed := map[string]bool{"fen": true, "ply": true, "turn": true, "clocks": true, "priorKeys": true, "lastMoveAt": true}
-	for _, p := range v.parts {
-		if !allowed[p] {
-			return false
+// fieldDiff names every game.State field that differs.
+func fieldDiff(a, b game.State) string {
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	var out []string
+	for i := 0; i < va.NumField(); i++ {
+		if !reflect.DeepEqual(va.Field(i).Interface(), vb.Field(i).Interface()) {
+			out = append(out, fmt.Sprintf("%s %+v vs %+v", va.Type().Field(i).Name, va.Field(i).Interface(), vb.Field(i).Interface()))
 		}
 	}
-	return v.rb.FEN == before.FEN && v.rb.Ply == before.Ply && v.live.Ply+1 == before.Ply
+	return strings.Join(out, "; ")
 }
 
-// partOwner maps a single differing part to the issue that explains it.
-func partOwner(part, text string) string {
-	switch part {
-	case "fold":
-		if strings.Contains(text, "DrawAccepted") && strings.Contains(text, "cannot accept its own offer") {
-			return "#85"
+// pureDiff compares live with the engine-free Fold on every field the pure
+// fold is exact for (§3.2): everything except CurFEN and the History engine
+// fields.
+func pureDiff(live, pure game.State) string {
+	strip := func(s game.State) game.State {
+		s.CurFEN = ""
+		h := make([]game.PlyEntry, len(s.History))
+		for i, e := range s.History {
+			e.FEN, e.Zobrist, e.Terminal = "", 0, nil
+			h[i] = e
 		}
-	case "clocks":
-		return "#157"
-	case "lastMoveAt":
-		return "#124"
-	case "offerLostOnRebuild", "offerLostOnRestart":
-		return "#159"
+		s.History = h
+		return s
 	}
-	return ""
-}
-
-// neverExcused lists parts no known issue may explain: harness failures, a
-// failing rebuild, and a live offer that contradicts the offer rules.
-var neverExcused = map[string]bool{"harness": true, "rebuild": true, "offerModel": true}
-
-// excuse returns the known issues that together explain v, or nil if any part
-// is unexplained.
-func (h *harness) excuse(v *violation) []string {
-	if strictMode() || h.avoidKnown || v == nil {
-		return nil
-	}
-	for _, p := range v.parts {
-		if neverExcused[p] {
-			return nil
-		}
-	}
-	if sig84(v, h.justTookBack) {
-		return []string{"#84"}
-	}
-	var used []string
-	for _, p := range v.parts {
-		owner := partOwner(p, v.text)
-		if owner == "" || !h.triggered(owner) {
-			return nil
-		}
-		used = append(used, owner)
-	}
-	return used
-}
-
-// triggered reports whether this sequence reached the state an issue needs.
-// #124 and #159 are states, not operations, so they are read live.
-func (h *harness) triggered(issue string) bool {
-	switch issue {
-	case "#124":
-		snap, err := h.live.StateSnapshot(h.ctx)
-		return err == nil && snap.Ply == 0
-	case "#159":
-		// Fully encoded in the part itself: offerLostOnRebuild needs the rebuild
-		// to have lost exactly the offer the rules expect; offerLostOnRestart
-		// needs a restart while that offer was pending.
-		return true
-	}
-	return h.triggers[issue]
+	return fieldDiff(strip(live), strip(pure))
 }
 
 // --- legal move generation via the engine -----------------------------------
@@ -602,7 +360,8 @@ func sq(file, rank int) string { return string(rune('a'+file)) + string(rune('1'
 // coverage counts what the harness actually exercised, so a green run can be
 // read for what it proves.
 type coverage struct {
-	moves, promotions, castles, enPassant, takebacks, offers, flags, restarts, resends int
+	moves, promotions, castles, enPassant, takebacks, takebackDeclines, offers, declines,
+	agreements, flags, restarts, resends int
 }
 
 // step performs one random operation. It returns false when the game cannot
@@ -613,30 +372,36 @@ func (h *harness) step(r *rand.Rand, cov *coverage) bool {
 		h.t.Fatalf("snapshot: %v", err)
 	}
 	if snap.Ended {
-		// After the end, only a resend of the last move is interesting.
+		// After the end, only a resend of the last move is interesting: it must
+		// be re-acked (#122), not GAME_OVER.
 		if h.lastMove != nil && r.Intn(2) == 0 {
 			m := h.lastMove
-			_, err := h.live.SubmitMove(h.ctx, m.seat, m.ply, m.uci, h.ts())
-			h.note("resend-after-end %s ply %d -> err=%v", m.uci, m.ply, err)
+			out, err := h.live.SubmitMove(h.ctx, m.seat, m.ply, m.uci, h.ts())
+			h.note("resend-after-end %s ply %d -> reacked=%v err=%v", m.uci, m.ply, out.Reacked, err)
+			if err == nil && !out.Reacked {
+				h.t.Fatalf("resend of the last live move after the end was not re-acked: %+v", out)
+			}
 			cov.resends++
 		}
 		return false
 	}
 	switch p := r.Intn(100); {
-	case p < 62:
+	case p < 58:
 		return h.opMove(r, snap, cov)
-	case p < 69:
+	case p < 64:
 		h.opResend(cov)
-	case p < 77:
+	case p < 74:
 		h.opTakeback(r, snap, cov)
-	case p < 84:
+	case p < 81:
 		h.opOfferDraw(r, snap, cov)
-	case p < 88:
+	case p < 84:
+		h.opDeclineDraw(r, cov)
+	case p < 87:
 		h.opAcceptDraw(r)
-	case p < 95:
+	case p < 94:
 		h.opRestart(cov)
 	case p < 99:
-		h.opClock(r, snap, cov)
+		h.opClock(r, cov)
 	default:
 		by := uint8(r.Intn(2))
 		err := h.live.Resign(h.ctx, by)
@@ -648,10 +413,6 @@ func (h *harness) step(r *rand.Rand, cov *coverage) bool {
 func (h *harness) ts() uint64 { return uint64(h.clock.now().UnixMilli()) }
 
 func (h *harness) opMove(r *rand.Rand, snap Snapshot, cov *coverage) bool {
-	if snap.FEN == "" {
-		h.note("move skipped: live FEN empty")
-		return false
-	}
 	moves := h.legalMoves(snap.FEN)
 	if len(moves) == 0 {
 		h.note("no legal moves from %q", snap.FEN)
@@ -676,6 +437,9 @@ func (h *harness) opMove(r *rand.Rand, snap Snapshot, cov *coverage) bool {
 	out, err := h.live.SubmitMove(h.ctx, m.seat, m.ply, m.uci, h.ts())
 	h.note("move seat %d ply %d %s -> accepted=%v uci=%q err=%v", m.seat, m.ply, uci, out.Accepted, out.UCI, err)
 	if err == nil && out.Accepted {
+		if out.UCI != uci || out.Reacked {
+			h.t.Fatalf("new move %s acked as %q (reacked=%v)", uci, out.UCI, out.Reacked)
+		}
 		h.lastMove = m
 		h.offers.move(m.seat)
 		cov.moves++
@@ -727,39 +491,88 @@ func (h *harness) opResend(cov *coverage) {
 	}
 	m := h.lastMove
 	out, err := h.live.SubmitMove(h.ctx, m.seat, m.ply, m.uci, h.ts())
-	h.note("resend seat %d ply %d %s -> accepted=%v uci=%q err=%v", m.seat, m.ply, m.uci, out.Accepted, out.UCI, err)
+	h.note("resend seat %d ply %d %s -> reacked=%v uci=%q err=%v", m.seat, m.ply, m.uci, out.Reacked, out.UCI, err)
+	if err == nil && out.Accepted && (!out.Reacked || out.UCI != m.uci) {
+		h.t.Fatalf("resend of the live move %s at ply %d: %+v (want a re-ack of it)", m.uci, m.ply, out)
+	}
 	cov.resends++
 }
 
+// opTakeback proposes a takeback and usually resolves it: the other seat
+// accepts or declines, the proposer cancels, or it is left pending for later
+// operations (a responder's move declines it).
 func (h *harness) opTakeback(r *rand.Rand, snap Snapshot, cov *coverage) {
-	if h.rated || h.avoidKnown || snap.Ply == 0 {
+	by := uint8(r.Intn(2))
+	res, err := h.live.ProposeTakeback(h.ctx, by)
+	h.note("takeback propose by %d -> effect=%v at=%d err=%v", by, res.Effect, res.AtPly, err)
+	if h.rated {
+		if err == nil {
+			h.t.Fatalf("takeback proposed in a rated game: %+v", res)
+		}
 		return
 	}
-	before := snap // the position #84's rebuild will replay back to
-	by := uint8(r.Intn(2))
-	err := h.live.Takeback(h.ctx, by, 1) // the transport always passes 1
-	h.note("takeback by %d -> err=%v", by, err)
-	if err == nil {
-		h.justTookBack = &before
-		h.offers.rewind(snap.Ply - 1)
-		h.lastMove = nil // the undone move is no longer the last live move
-		cov.takebacks++
+	if err != nil {
+		h.t.Fatalf("takeback propose: %v", err)
 	}
+	pending, err := h.live.StateSnapshot(h.ctx)
+	if err != nil || pending.TakebackBy < 0 {
+		return // nothing pending (ply < 2, or the other seat's request is pending)
+	}
+	proposer, at := uint8(pending.TakebackBy), pending.TakebackAtPly
+	other := 1 - proposer
+	switch r.Intn(4) {
+	case 0, 1:
+		res, err := h.live.AcceptTakeback(h.ctx, other, at)
+		h.note("takeback accept by %d at %d -> effect=%v err=%v", other, at, res.Effect, err)
+		if err == nil && res.Effect == game.EffectTakebackRewound {
+			h.offers.rewind(res.Snap.Ply)
+			h.lastMove = nil // the undone move is no longer the last live move
+			if res.Snap.Ply > 0 {
+				h.lastMove = &harnessMove{seat: 1 - res.Snap.Turn, ply: res.Snap.Ply, uci: res.Snap.LastMoveUCI}
+			}
+			cov.takebacks++
+		}
+	case 2:
+		decliner := other
+		if r.Intn(2) == 0 {
+			decliner = proposer // a cancel
+		}
+		res, err := h.live.DeclineTakeback(h.ctx, decliner, at)
+		h.note("takeback decline by %d at %d -> effect=%v err=%v", decliner, at, res.Effect, err)
+		if err == nil && res.Effect == game.EffectTakebackDeclined {
+			cov.takebackDeclines++
+		}
+	default:
+		// a stale accept (wrong at_ply) must change nothing
+		res, err := h.live.AcceptTakeback(h.ctx, other, at+1)
+		h.note("stale takeback accept at %d -> effect=%v err=%v", at+1, res.Effect, err)
+		if err == nil && res.Effect != game.EffectIgnored {
+			h.t.Fatalf("stale takeback accept changed state: %v", res.Effect)
+		}
+	}
+	_ = snap
 }
 
 func (h *harness) opOfferDraw(r *rand.Rand, snap Snapshot, cov *coverage) {
-	if h.avoidKnown {
-		return // any pending offer is the #159 state; a second one is #85
-	}
 	by := uint8(r.Intn(2))
-	err := h.live.OfferDraw(h.ctx, by)
-	h.note("offer draw by %d -> err=%v", by, err)
+	res, err := h.live.OfferDrawResult(h.ctx, by)
+	h.note("offer draw by %d at ply %d -> effect=%v err=%v", by, snap.Ply, res.Effect, err)
 	if err != nil {
 		return
 	}
 	cov.offers++
 	if h.offers.offer(by, snap.Ply) {
-		h.triggers["#85"] = true // a mutual offer: today it writes the unfoldable stream
+		cov.agreements++
+	}
+}
+
+func (h *harness) opDeclineDraw(r *rand.Rand, cov *coverage) {
+	by := uint8(r.Intn(2))
+	res, err := h.live.DeclineDraw(h.ctx, by)
+	h.note("decline draw by %d -> effect=%v err=%v", by, res.Effect, err)
+	if err == nil && res.Effect == game.EffectDrawDeclined {
+		h.offers.decline()
+		cov.declines++
 	}
 }
 
@@ -775,13 +588,10 @@ func (h *harness) opAcceptDraw(r *rand.Rand) {
 func (h *harness) opRestart(cov *coverage) {
 	rb, cancel, err := h.rebuild()
 	if err != nil {
-		h.note("restart failed: %v", err)
-		return
+		h.t.Fatalf("restart failed: %v", err)
 	}
 	h.stop()
 	h.live, h.stop = rb, cancel
-	// The oracle keeps a pending offer across a restart (the correct behaviour);
-	// today's loss of it is reported by check() as #159, not encoded here.
 	h.offers.restart()
 	h.note("restart: live session replaced by a rebuild from the store")
 	cov.restarts++
@@ -789,19 +599,15 @@ func (h *harness) opRestart(cov *coverage) {
 
 // opClock advances the clock and drives the flag check, as the transport's
 // ticker does. One jump in four is long enough to flag the side to move.
-func (h *harness) opClock(r *rand.Rand, snap Snapshot, cov *coverage) {
-	if h.avoidKnown && snap.Ply == 0 {
-		return // moving the clock before the first move is the #124 state
-	}
+func (h *harness) opClock(r *rand.Rand, cov *coverage) {
 	d := time.Duration(r.Intn(2000)) * time.Millisecond
-	if !h.avoidKnown && r.Intn(4) == 0 {
-		d = 400 * time.Second // long enough to flag: the #157 trigger
+	if r.Intn(4) == 0 {
+		d = 400 * time.Second
 	}
 	h.clock.add(d)
 	ended, err := h.live.TickFlagCheck(h.ctx)
 	h.note("advance clock %v + flag tick -> ended=%v err=%v", d, ended, err)
 	if ended {
-		h.triggers["#157"] = true
 		cov.flags++
 	}
 }
@@ -820,231 +626,166 @@ var harnessSeeds = func() int64 {
 	return n
 }()
 
-type harnessConfig struct {
-	name       string
-	rated      bool
-	avoidKnown bool
-}
-
-var harnessConfigs = []harnessConfig{
-	{"unrated", false, false},      // everything; known breaks excused by part ownership
-	{"unrated-clean", false, true}, // no known trigger or state; nothing excused
-	{"rated", true, false},         // no takeback by rule
-}
-
 func TestGS7InvariantHarness(t *testing.T) {
-	excused := map[string]int{}
-	cov := map[string]*coverage{}
-	noBreak, gameOver := 0, 0
+	cov := map[string]*coverage{"unrated": {}, "rated": {}}
 	for seed := int64(1); seed <= harnessSeeds; seed++ {
 		start := startPositions[int(seed-1)%len(startPositions)]
-		for _, cfg := range harnessConfigs {
-			if cov[cfg.name] == nil {
-				cov[cfg.name] = &coverage{}
+		for _, rated := range []bool{false, true} {
+			name := "unrated"
+			if rated {
+				name = "rated"
 			}
-			c := cov[cfg.name]
-			name := fmt.Sprintf("seed%d/%s", seed, cfg.name)
-			t.Run(name, func(t *testing.T) {
-				h := newHarness(t, start, cfg.rated, cfg.avoidKnown)
+			c := cov[name]
+			t.Run(fmt.Sprintf("seed%d/%s", seed, name), func(t *testing.T) {
+				h := newHarness(t, start, rated)
 				defer h.close()
 				r := rand.New(rand.NewSource(seed))
 				for i := 0; i < harnessSteps; i++ {
 					cont := h.step(r, c)
-					v := h.check()
-					excuseIssues := h.excuse(v)
-					// #84 is recognised only on the check right after the takeback.
-					h.justTookBack = nil
-					if v == nil {
-						// A clean check closes every operation trigger, so a
-						// flag or mutual offer earlier in the run cannot excuse
-						// a later, unrelated break.
-						h.triggers = map[string]bool{}
-					}
-					if v != nil {
-						if issues := excuseIssues; issues != nil {
-							for _, is := range issues {
-								excused[is]++
-							}
-							t.Logf("known failure %v after %d steps: %s", issues, i+1, v)
-							if v.has("offerLostOnRestart") {
-								h.offers.acceptLoss() // continue from what the session really holds
-							}
-							if !stateOnly(issues) {
-								return // #84/#85 corrupt the stream: nothing after is meaningful
-							}
-							// #124/#157/#159 differ only in rebuilt state; the stream
-							// is sound, so keep exercising the session.
-						} else {
-							t.Fatalf("invariant broken after %d steps (not explained by a known issue): %s\nstart %q\nsequence:\n  %s",
-								i+1, v, start, strings.Join(h.log, "\n  "))
-						}
+					if v := h.check(); v != "" {
+						t.Fatalf("invariant broken after %d steps: %s\nstart %q\nsequence:\n  %s",
+							i+1, v, start, strings.Join(h.log, "\n  "))
 					}
 					if !cont {
-						noBreak++
-						gameOver++
 						return
 					}
 				}
-				noBreak++
 			})
 		}
 	}
-	t.Logf("runs: %d; reached the end or game over without an unexcused break: %d (game over before %d steps: %d); excused known failures: %v (GS7_STRICT=1 makes these fail)",
-		int(harnessSeeds)*len(harnessConfigs), noBreak, harnessSteps, gameOver, excused)
-	for _, cfg := range harnessConfigs {
-		t.Logf("coverage %s: %+v", cfg.name, *cov[cfg.name])
+	for name, c := range cov {
+		t.Logf("coverage %s: %+v", name, *c)
+	}
+	u := cov["unrated"]
+	if u.takebacks == 0 || u.offers == 0 || u.flags == 0 || u.restarts == 0 || u.resends == 0 || u.declines == 0 {
+		t.Fatalf("the harness did not exercise every operation: %+v", *u)
 	}
 }
 
-// stateOnly reports whether every excused issue leaves the stream sound.
-func stateOnly(issues []string) bool {
-	for _, is := range issues {
-		if is != "#124" && is != "#157" && is != "#159" {
-			return false
-		}
-	}
-	return true
-}
+// --- regression tests (were the strict repros before the fix) ---------------
 
-// --- strict repro cases -----------------------------------------------------
-
-// expectKnownFailure enforces a strict expected failure. In the default mode the
-// repro must still break WITH that issue's own signature (a different break is a
-// failure, so a repro cannot pass for the wrong reason); once it no longer breaks
-// the test fails so the entry is removed from knownFailures. In strict mode any
-// remaining break fails.
-func expectKnownFailure(t *testing.T, issue string, v *violation, matches func(*violation) bool) {
+func mustClean(t *testing.T, h *harness) {
 	t.Helper()
-	if _, ok := knownFailures[issue]; !ok {
-		t.Fatalf("%s is not in knownFailures", issue)
+	if v := h.check(); v != "" {
+		t.Fatalf("%s\nsequence:\n  %s", v, strings.Join(h.log, "\n  "))
 	}
-	switch {
-	case strictMode() && v != nil:
-		t.Fatalf("%s still reproduces (GS7_STRICT=1): %s", issue, v)
-	case v == nil:
-		if !strictMode() {
-			t.Fatalf("%s no longer reproduces: the fix landed, so delete it from knownFailures "+
-				"and make this a plain regression test", issue)
+}
+
+func playMoves(t *testing.T, h *harness, ucis ...string) {
+	t.Helper()
+	for _, u := range ucis {
+		snap, err := h.live.StateSnapshot(h.ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
-	case !matches(v):
-		t.Fatalf("%s repro broke with a DIFFERENT signature (new or changed bug): %s", issue, v)
-	default:
-		t.Logf("%s reproduces as expected: %s", issue, v)
-	}
-}
-
-// onlyPart matches a break whose parts are exactly one named part.
-func onlyPart(part string) func(*violation) bool {
-	return func(v *violation) bool { return len(v.parts) == 1 && v.parts[0] == part }
-}
-
-// TestRepro85_MutualDrawStreamFolds: both seats offer a draw. The ended stream
-// must fold (I1).
-func TestRepro85_MutualDrawStreamFolds(t *testing.T) {
-	h := newHarness(t, startFEN, false, false)
-	defer h.close()
-	if err := h.live.OfferDraw(h.ctx, 0); err != nil {
-		t.Fatalf("OfferDraw(0): %v", err)
-	}
-	if err := h.live.OfferDraw(h.ctx, 1); err != nil {
-		t.Fatalf("OfferDraw(1): %v", err)
-	}
-	expectKnownFailure(t, "#85", h.check(), func(v *violation) bool {
-		return len(v.parts) == 1 && partOwner(v.parts[0], v.text) == "#85"
-	})
-}
-
-// TestRepro84_MoveAfterTakeback: e4 e5 Nf3, takeback one ply, then Nc3. The new
-// move must be acked as itself, the FEN must stay valid, and a rebuild must agree.
-func TestRepro84_MoveAfterTakeback(t *testing.T) {
-	h := newHarness(t, startFEN, false, false)
-	defer h.close()
-	for i, m := range []struct {
-		seat uint8
-		uci  string
-	}{{0, "e2e4"}, {1, "e7e5"}, {0, "g1f3"}} {
 		h.clock.add(time.Second)
-		if _, err := h.live.SubmitMove(h.ctx, m.seat, uint32(i+1), m.uci, h.ts()); err != nil {
-			t.Fatalf("setup move %s: %v", m.uci, err)
+		out, err := h.live.SubmitMove(h.ctx, snap.Turn, snap.Ply+1, u, h.ts())
+		if err != nil || !out.Accepted {
+			t.Fatalf("move %s: %+v err=%v", u, out, err)
 		}
+		h.offers.move(snap.Turn)
 	}
-	if err := h.live.Takeback(h.ctx, 0, 1); err != nil {
-		t.Fatalf("Takeback: %v", err)
+}
+
+// TestRegression85_MutualDrawStreamFolds: both seats offer a draw. The ended
+// stream must fold, with DrawAccepted and no second DrawOffered (§6.1).
+func TestRegression85_MutualDrawStreamFolds(t *testing.T) {
+	h := newHarness(t, startFEN, false)
+	defer h.close()
+	playMoves(t, h, "e2e4", "e7e5")
+	for _, by := range []uint8{0, 1} {
+		if err := h.live.OfferDraw(h.ctx, by); err != nil {
+			t.Fatalf("OfferDraw(%d): %v", by, err)
+		}
+		h.offers.offer(by, 2)
 	}
+	snap, _ := h.live.StateSnapshot(h.ctx)
+	if !snap.Ended || snap.Terminal != game.TermDrawAgree {
+		t.Fatalf("mutual offer did not end in DRAW_AGREE: %+v", snap)
+	}
+	mustClean(t, h)
+}
+
+// TestRegression84_MoveAfterTakeback: e4 e5 Nf3, White takes Nf3 back, Black
+// accepts, then Nc3. The new move is acked as itself, and a rebuild agrees.
+func TestRegression84_MoveAfterTakeback(t *testing.T) {
+	h := newHarness(t, startFEN, false)
+	defer h.close()
+	playMoves(t, h, "e2e4", "e7e5", "g1f3")
+	p, err := h.live.ProposeTakeback(h.ctx, 0)
+	if err != nil || p.Effect != game.EffectTakebackProposed || p.AtPly != 3 {
+		t.Fatalf("propose: %+v err=%v", p, err)
+	}
+	a, err := h.live.AcceptTakeback(h.ctx, 1, 3)
+	if err != nil || a.Effect != game.EffectTakebackRewound || a.Snap.Ply != 2 || a.Snap.LastMoveUCI != "e7e5" {
+		t.Fatalf("accept: %+v err=%v", a, err)
+	}
+	mustClean(t, h)
 	out, err := h.live.SubmitMove(h.ctx, 0, 3, "b1c3", h.ts())
-	var v *violation
-	switch {
-	case err != nil:
-		v = brk("reack", "move after takeback errored: %v", err)
-	case out.UCI != "b1c3":
-		v = brk("reack", "acked %q instead of b1c3 (undone move re-acked)", out.UCI)
-	default:
-		v = h.check()
+	if err != nil || !out.Accepted || out.Reacked || out.UCI != "b1c3" {
+		t.Fatalf("move after takeback: %+v err=%v (want b1c3 accepted as new)", out, err)
 	}
-	// #84's own signature: the new move is acked as the UNDONE move g1f3.
-	expectKnownFailure(t, "#84", v, func(v *violation) bool {
-		return v.has("reack") && strings.Contains(v.text, `acked "g1f3"`)
-	})
+	mustClean(t, h)
 }
 
-// TestRepro157_FlaggedClockSurvivesRebuild: one move each, then white's clock
-// runs out and the flag tick ends the game. A rebuild must report the same clocks.
-func TestRepro157_FlaggedClockSurvivesRebuild(t *testing.T) {
-	h := newHarness(t, startFEN, false, false)
+// TestRegression157_FlaggedClockSurvivesRebuild: white's clock runs out and the
+// flag tick ends the game; a rebuild reports the same (zeroed) clock.
+func TestRegression157_FlaggedClockSurvivesRebuild(t *testing.T) {
+	h := newHarness(t, startFEN, false)
 	defer h.close()
-	for i, m := range []struct {
-		seat uint8
-		uci  string
-	}{{0, "e2e4"}, {1, "e7e5"}} {
-		h.clock.add(time.Second)
-		if _, err := h.live.SubmitMove(h.ctx, m.seat, uint32(i+1), m.uci, h.ts()); err != nil {
-			t.Fatalf("setup move %s: %v", m.uci, err)
-		}
-	}
+	playMoves(t, h, "e2e4", "e7e5")
 	h.clock.add(400 * time.Second)
 	ended, err := h.live.TickFlagCheck(h.ctx)
 	if err != nil || !ended {
 		t.Fatalf("flag tick: ended=%v err=%v (want ended)", ended, err)
 	}
-	expectKnownFailure(t, "#157", h.check(), onlyPart("clocks"))
+	snap, _ := h.live.StateSnapshot(h.ctx)
+	if snap.RemainingMs[0] != 0 {
+		t.Fatalf("flagged clock %d, want 0", snap.RemainingMs[0])
+	}
+	mustClean(t, h)
 }
 
-// TestRepro124_IdleBaselineBeforeFirstMove: no move yet, the clock advances,
-// then a rebuild. The rebuild must charge White from the same instant.
-func TestRepro124_IdleBaselineBeforeFirstMove(t *testing.T) {
-	h := newHarness(t, startFEN, false, false)
+// TestRegression124_IdleBaselineBeforeFirstMove: no move yet, the clock
+// advances, then a rebuild charges White from the same instant (ClockStarted).
+func TestRegression124_IdleBaselineBeforeFirstMove(t *testing.T) {
+	h := newHarness(t, startFEN, false)
 	defer h.close()
 	h.clock.add(5 * time.Second)
-	expectKnownFailure(t, "#124", h.check(), onlyPart("lastMoveAt"))
+	mustClean(t, h)
+	snap, _ := h.live.StateSnapshot(h.ctx)
+	if snap.RunningSeat != 0 || snap.RemainingMs[0] != 295_000 {
+		t.Fatalf("white must be charged 5 s from the durable clock start: %+v", snap)
+	}
 }
 
-// TestRepro159_PendingDrawOfferSurvivesRebuild: one move each, white offers a
-// draw, then a rebuild. The rebuilt session must still hold the offer.
-func TestRepro159_PendingDrawOfferSurvivesRebuild(t *testing.T) {
-	h := newHarness(t, startFEN, false, false)
+// TestRegression159_PendingDrawOfferSurvivesRebuild: one move each, white
+// offers a draw, then a rebuild still holds the offer.
+func TestRegression159_PendingDrawOfferSurvivesRebuild(t *testing.T) {
+	h := newHarness(t, startFEN, false)
 	defer h.close()
-	for i, m := range []struct {
-		seat uint8
-		uci  string
-	}{{0, "e2e4"}, {1, "e7e5"}} {
-		if _, err := h.live.SubmitMove(h.ctx, m.seat, uint32(i+1), m.uci, h.ts()); err != nil {
-			t.Fatalf("setup move %s: %v", m.uci, err)
-		}
-	}
+	playMoves(t, h, "e2e4", "e7e5")
 	if err := h.live.OfferDraw(h.ctx, 0); err != nil {
 		t.Fatalf("OfferDraw: %v", err)
 	}
-	h.offers.offer(0, 2) // the oracle: white's first offer, at ply 2, is now pending
-	expectKnownFailure(t, "#159", h.check(), onlyPart("offerLostOnRebuild"))
+	h.offers.offer(0, 2)
+	mustClean(t, h)
+	rb, cancel, err := h.rebuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if snap, _ := rb.StateSnapshot(h.ctx); snap.DrawOfferBy != 0 {
+		t.Fatalf("rebuilt drawOfferBy %d, want 0", snap.DrawOfferBy)
+	}
 }
 
-// TestOfferRulesOracle pins both offer rule sets the harness uses as its
-// oracle. gs7Rules cannot be checked against the real session until the GS-7
-// fix lands, so each case below is taken directly from the ratified spec
-// (SPEC-S2-GAME-SERVER-GS7 §6.2-§6.3, §5.5) and must not be edited to match code.
+// TestOfferRulesOracle pins the offer rules the harness uses as its oracle.
+// Each case is taken directly from the ratified spec (SPEC-S2-GAME-SERVER-GS7
+// §6.2-§6.3, §5.5) and must not be edited to match code.
 func TestOfferRulesOracle(t *testing.T) {
 	type step struct {
-		op    string // offer, move, accept, rewind, restart
+		op    string // offer, move, accept, decline, rewind, restart
 		seat  uint8
 		ply   uint32
 		want  int  // expected(false) after the step
@@ -1053,55 +794,52 @@ func TestOfferRulesOracle(t *testing.T) {
 	}
 	cases := []struct {
 		name  string
-		rules offerRules
 		steps []step
 	}{
-		{"gs7: offer before ply 2 is ignored", gs7Rules, []step{
+		{"offer before ply 2 is ignored", []step{
 			{op: "offer", seat: 0, ply: 0, want: -1},
 			{op: "offer", seat: 0, ply: 1, want: -1},
 			{op: "offer", seat: 0, ply: 2, want: 0},
 		}},
-		{"gs7: offerer's own move keeps the offer, responder's move declines it", gs7Rules, []step{
+		{"offerer's own move keeps the offer, responder's move declines it", []step{
 			{op: "offer", seat: 0, ply: 2, want: 0},
 			{op: "move", seat: 0, want: 0},
 			{op: "move", seat: 1, want: -1},
 		}},
-		{"gs7: re-offer within 20 plies rejected, boundary exact", gs7Rules, []step{
+		{"re-offer within 20 plies rejected, boundary exact", []step{
 			{op: "offer", seat: 0, ply: 2, want: 0},
 			{op: "move", seat: 1, want: -1},
 			{op: "offer", seat: 0, ply: 22, want: -1}, // last 2 >= 22-20 → rejected
 			{op: "offer", seat: 0, ply: 23, want: 0},  // last 2 <  23-20 → allowed
 		}},
-		{"gs7: cooldown does not block an accept", gs7Rules, []step{
+		{"cooldown does not block an accept", []step{
 			{op: "offer", seat: 1, ply: 2, want: 1},
 			{op: "move", seat: 0, want: -1}, // seat 0 declines by moving
 			{op: "offer", seat: 0, ply: 4, want: 0},
 			{op: "offer", seat: 1, ply: 5, want: -1}, // mutual = accept, despite seat 1's cooldown
 		}},
-		{"gs7: rewind clears the offer and prunes later cooldown entries", gs7Rules, []step{
+		{"rewind clears the offer and prunes later cooldown entries", []step{
 			{op: "offer", seat: 0, ply: 10, want: 0},
 			{op: "rewind", ply: 8, want: -1},
 			{op: "offer", seat: 0, ply: 9, want: 0}, // the ply-10 entry was dropped
 		}},
-		{"gs7: game end clears the offer; restart keeps it", gs7Rules, []step{
+		{"game end clears the offer; restart keeps it", []step{
 			{op: "offer", seat: 0, ply: 2, want: 0},
 			{op: "restart", want: 0, ended: true, wantE: -1},
 		}},
-		{"today: any move clears, no gate, end keeps, restart keeps", todayRules, []step{
-			{op: "offer", seat: 0, ply: 0, want: 0},
-			{op: "move", seat: 0, want: -1},
-			{op: "offer", seat: 1, ply: 1, want: 1},
-			{op: "restart", want: 1, ended: true, wantE: 1},
-		}},
-		{"both: accept by the other seat clears, accept by the offerer does not", gs7Rules, []step{
+		{"accept by the other seat clears, accept by the offerer does not", []step{
 			{op: "offer", seat: 0, ply: 2, want: 0},
 			{op: "accept", seat: 0, want: 0},
 			{op: "accept", seat: 1, want: -1},
 		}},
+		{"explicit decline clears the offer", []step{
+			{op: "offer", seat: 0, ply: 2, want: 0},
+			{op: "decline", seat: 1, want: -1},
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			m := newOfferModel(c.rules)
+			m := newOfferModel(gs7Rules)
 			for i, s := range c.steps {
 				switch s.op {
 				case "offer":
@@ -1110,6 +848,8 @@ func TestOfferRulesOracle(t *testing.T) {
 					m.move(s.seat)
 				case "accept":
 					m.accept(s.seat)
+				case "decline":
+					m.decline()
 				case "rewind":
 					m.rewind(s.ply)
 				case "restart":

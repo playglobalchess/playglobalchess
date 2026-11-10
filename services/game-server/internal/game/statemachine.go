@@ -1,10 +1,17 @@
 package game
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/clock"
 )
+
+// GS-7 (SPEC-S2-GAME-SERVER-GS7 §3): ONE evolve. Evolve is the only state
+// transition in the game server. Fold, FoldWithEngine, the live session and
+// every stream consumer go through it, so a live session can never disagree with
+// a rebuild from the store, and no event the server writes can be unfoldable
+// (the session evolves before it appends).
 
 // Phase is a game lifecycle state (SPEC-S2-GAME-SERVER §3.2).
 type Phase uint8
@@ -12,16 +19,13 @@ type Phase uint8
 const (
 	// PhaseNone is the zero value: no game yet (before GameCreated).
 	PhaseNone Phase = iota
-	// PhaseSeeking — a seek is open (GameCreated applied, awaiting players).
-	// Modeled for completeness of §3.2; matchmaking (which drives SEEKING) is a
-	// later chunk, so GS-1 reaches SEEKING via GameCreated and leaves it on the
-	// first PlayerJoined wiring in MATCHED.
+	// PhaseSeeking is modelled for §3.2 completeness; matchmaking does not use it.
 	PhaseSeeking
-	// PhaseMatched — game created and seats assigned, not all players joined.
+	// PhaseMatched: game created and seats assigned, not all players joined.
 	PhaseMatched
-	// PhaseLive — all seats joined; moves and in-game actions allowed.
+	// PhaseLive: all seats joined; moves and in-game actions allowed.
 	PhaseLive
-	// PhaseEnded — terminal (GameEnded applied). Only RatingApplied may follow.
+	// PhaseEnded: terminal (GameEnded applied). Only RatingApplied may follow.
 	PhaseEnded
 )
 
@@ -42,59 +46,82 @@ func (p Phase) String() string {
 	}
 }
 
-// State is the projection folded from a game's event stream (SPEC-S2-GAME-SERVER
-// §3.2). It is a VALUE produced by Fold; it is never mutated in place by callers
-// and holds no I/O handles. Board truth beyond what GS-1 needs for routing/authz
-// (the current FEN, whose turn, the ply) is tracked; full board state is the
-// engine's (NFR-5).
+// NoSeat marks "no seat" in the int-valued seat fields of State.
+const NoSeat = -1
+
+var (
+	// ErrLegacyTakeback: a stream holds the pre-GS-7 TakebackReq/TakebackAccepted
+	// events. They stay decodable but are never folded (GS-7 §5.1, Q-V3: no
+	// production data exists).
+	ErrLegacyTakeback = errors.New("game: legacy TakebackReq/TakebackAccepted events are not supported (GS-7 §5.1)")
+	// ErrUnsupportedSeatCount: takeback and draw are 2-seat only (GS-7 §1).
+	ErrUnsupportedSeatCount = errors.New("game: takeback and draw are 2-seat only")
+)
+
+// PlyEntry is one LIVE (not undone) ply. FEN, Zobrist and Terminal are
+// engine-derived and are filled only when Evolve is given a verdict (§3.2).
+type PlyEntry struct {
+	Seat         uint8
+	UCI          string
+	ClockAfterMs uint32
+	ServerTS     uint64
+	Seq          uint32 // the MovePlayed's stream seq (re-ack reports it)
+	FEN          string
+	Zobrist      uint64
+	Terminal     *Termination
+}
+
+// PendingTakeback is an open takeback request: proposed by By when the game
+// was at AtPly.
+type PendingTakeback struct {
+	By    uint8
+	AtPly uint32
+}
+
+// Verdict is the engine's result for one MovePlayed, supplied to Evolve.
+type Verdict struct {
+	FEN      string
+	Zobrist  uint64
+	Terminal *Termination
+}
+
+// State is the projection folded from a game's event stream. It is a value:
+// Evolve returns a new State and never mutates its input's backing arrays.
 type State struct {
 	Phase Phase
 
-	// Game identity / config (from GameCreated).
+	// Game identity and config (GameCreated).
 	PoolID      string
 	Rated       bool
 	Seats       []Seat
 	TimeControl string
 	StartFEN    string
+	BaseMs      int64 // each seat's starting time (needed by a rewind to ply 0)
 
-	// Which seats have joined (indexed by seat_idx).
-	Joined []bool
+	Joined []bool // indexed by seat_idx
 
-	// Live play projection.
-	Ply uint32 // number of half-moves played (0 before the first move)
-	// CurFEN is the current position. The PURE Fold cannot derive a position
-	// from a UCI move (that is chess logic — NFR-5), so after Fold CurFEN equals
-	// StartFEN regardless of moves played; use FoldWithEngine to project the live
-	// position by replaying moves through the engine. Phase/Ply/TurnIdx/Clock are
-	// always accurate from either fold.
-	CurFEN  string
-	TurnIdx uint8 // seat_idx to move (derived from Ply over the seat order)
+	// Live play.
+	Ply     uint32
+	TurnIdx uint8
 	Clock   clock.Clock
-	// LastMoveUCI is the UCI of the last folded MovePlayed (empty at ply 0). A
-	// takeback re-folds the retained prefix, so this is the last LIVE move.
-	LastMoveUCI string
+	// CurFEN is the current position. Only an engine verdict can advance it
+	// (NFR-5), so after a pure Fold it stays at StartFEN; FoldWithEngine and the
+	// live session supply verdicts and keep it exact.
+	CurFEN  string
+	History []PlyEntry // one entry per live ply; History[i] is ply i+1
+	NextSeq uint32     // stream seq of the next append
 
-	// PriorKeys is the folded Zobrist-key history of the positions reached by
-	// the moves played so far (one key per MovePlayed, in order). Populated only
-	// by FoldWithEngine (the pure Fold leaves it nil — it has no engine to hash
-	// with). The live session (GS-3) seeds its running history from this and
-	// threads it back into Legality so repetition is detected on the live path
-	// (Q-GS5). It follows status_with_history's convention indirectly: to ask
-	// about the position after move N, pass PriorKeys[:N].
-	PriorKeys []uint64
-	// LastMoveTerminal is the terminal condition (if any) the FINAL replayed move
-	// produced, as the engine reported it — set only by FoldWithEngine. The live
-	// session uses it to detect a half-terminal stream on rebuild (a terminal
-	// move or flag whose GameEnded append did not land) and finish it, so a
-	// finished game never resumes as LIVE. Nil when the last move was not
-	// terminal (or no moves / pure Fold).
-	LastMoveTerminal *Termination
+	// Idle-clock baseline (§3.1), epoch ms, read ONLY from event bodies.
+	LastChangeTS    uint64
+	ClockStartedSet bool
 
-	// Pending offers/requests (reset appropriately on resolution).
-	DrawOfferBy   int // seat_idx with an open draw offer, or -1
-	TakebackReqBy int // seat_idx with an open takeback request, or -1
+	// Pending prompts.
+	DrawOfferBy      int     // seat with a pending draw offer, or NoSeat
+	LastDrawOfferPly []int64 // per seat: ply of its last offer, or -1 (cooldown)
+	PendingTakeback  *PendingTakeback
+	HalfTerminal     *uint8 // a ClockFlagged not yet followed by GameEnded
 
-	// Terminal projection (set at GameEnded).
+	// Terminal projection (GameEnded).
 	Termination   Termination
 	ResultVector  []Result
 	RatingApplied bool
@@ -103,36 +130,90 @@ type State struct {
 // seatCount is the number of seats in the game (2 for v1 Standard).
 func (s State) seatCount() int { return len(s.Seats) }
 
-// FoldOptions carries the time-control expansion the clock projection needs. The
-// event stream carries only the TimeControlId string (SPEC-S2-PROTOCOL §3.3);
-// the expanded {base,increment,per_move} is resolved elsewhere (GET /v1/pools)
-// and supplied to the fold. A takeback re-fold reuses the same expansion.
+// SeatCount is the number of seats in the game.
+func (s State) SeatCount() int { return len(s.Seats) }
+
+// PriorKeys is the Zobrist history of the live plies (one key per ply), the
+// repetition input the engine needs (Q-GS5). Empty without verdicts.
+func (s State) PriorKeys() []uint64 {
+	keys := make([]uint64, 0, len(s.History))
+	for _, e := range s.History {
+		keys = append(keys, e.Zobrist)
+	}
+	return keys
+}
+
+// LastMoveUCI is the last live move, empty at ply 0.
+func (s State) LastMoveUCI() string {
+	if len(s.History) == 0 {
+		return ""
+	}
+	return s.History[len(s.History)-1].UCI
+}
+
+// LastMoveTerminal is the terminal the last live move produced (engine verdict),
+// or nil. Used to finish a half-terminal stream on rebuild.
+func (s State) LastMoveTerminal() *Termination {
+	if len(s.History) == 0 {
+		return nil
+	}
+	return s.History[len(s.History)-1].Terminal
+}
+
+// RunningSeat is the seat whose clock is running, or NoSeat: none before the
+// clock has started, after a flag, and once the game has ended.
+func (s State) RunningSeat() int {
+	if s.Phase != PhaseLive || !s.ClockStartedSet || s.HalfTerminal != nil || s.Clock.Flagged() {
+		return NoSeat
+	}
+	return int(s.TurnIdx)
+}
+
+// ElapsedMs is the side to move's think time at nowMs: integer epoch ms since
+// LastChangeTS, never negative; 0 before the clock has started (§3.5).
+func (s State) ElapsedMs(nowMs uint64) int64 {
+	if !s.ClockStartedSet || nowMs <= s.LastChangeTS {
+		return 0
+	}
+	return int64(nowMs - s.LastChangeTS)
+}
+
+// ClocksAt returns every seat's remaining ms charged up to nowMs: the running
+// seat is charged its elapsed think (after the per-move delay), floored at 0;
+// increment is not granted (that happens only on a completed move). STATE
+// carries these values with server_t = nowMs (§7.4, #123).
+func (s State) ClocksAt(nowMs uint64, tc clock.TimeControl) []int64 {
+	out := append([]int64(nil), s.Clock.RemainingMs...)
+	if seat := s.RunningSeat(); seat != NoSeat && seat < len(out) {
+		charged := s.ElapsedMs(nowMs) - tc.PerMoveMs
+		if charged > 0 {
+			out[seat] -= charged
+		}
+		if out[seat] < 0 {
+			out[seat] = 0
+		}
+	}
+	return out
+}
+
+// FoldOptions carries the time-control expansion the clock projection needs
+// (the stream carries only the TimeControlId string).
 type FoldOptions struct {
-	// TimeControl is the expanded form of the GameCreated TimeControlId. The
-	// fold uses it only to initialize the per-seat clock at GameCreated (every
-	// seat starts at BaseMs). The per-move remaining time is NOT recomputed by
-	// the fold — it is read from each MovePlayed's authoritative ClockAfterMs
-	// (the server computed it with clock.Apply and persisted it, SPEC-S2-PROTOCOL
-	// §4A.8). This keeps the fold self-contained from the stream and makes it
-	// trivially deterministic: the same events always project the same clock, no
-	// external timing input to vary.
 	TimeControl clock.TimeControl
 }
 
-// Fold replays an ordered event slice into the resulting State (SPEC-S2-GAME-
-// SERVER §3.2: "the game state is a FOLD over an ordered event slice"). It is
-// deterministic: the same events + options always produce the same State, which
-// is what makes reconnection resync and takeback re-fold correct.
-//
-// It validates each transition against the §3.2 state machine and returns an
-// error on an illegal/rejected transition (e.g. a MovePlayed before LIVE, a
-// second GameEnded) — the stream is the authority, so an impossible stream is a
-// bug upstream and the fold refuses to project a nonsensical state rather than
-// silently accepting it.
+// initialState is the state before any event.
+func initialState() State {
+	return State{Phase: PhaseNone, DrawOfferBy: NoSeat}
+}
+
+// Fold replays a stream with no engine (NFR-5): ply, turn, clocks, offers,
+// History shape and NextSeq are exact; CurFEN and the History engine fields are
+// left empty. It is the same Evolve the live session uses.
 func Fold(events []Event, opts FoldOptions) (State, error) {
-	s := State{Phase: PhaseNone, DrawOfferBy: -1, TakebackReqBy: -1}
+	s := initialState()
 	for i := range events {
-		next, err := apply(s, events[i], opts.TimeControl)
+		next, err := Evolve(s, events[i], nil, opts)
 		if err != nil {
 			return State{}, fmt.Errorf("fold: event %d (%s): %w", i, events[i].Type, err)
 		}
@@ -141,38 +222,56 @@ func Fold(events []Event, opts FoldOptions) (State, error) {
 	return s, nil
 }
 
-// apply is the single transition function: (state, event) -> state' or error. It
-// is the §3.2 state machine. Keeping every legal transition — and the rejection
-// of every illegal one — in this one switch makes the machine auditable.
-func apply(s State, ev Event, tc clock.TimeControl) (State, error) {
+// Evolve applies one event. v is the engine verdict for a MovePlayed (nil
+// otherwise, or nil throughout a pure Fold). Every value it writes comes from
+// the event body, the verdict, or the prior state; no wall clock and no store
+// header is read (§3.2, §3.9).
+func Evolve(s State, ev Event, v *Verdict, opts FoldOptions) (State, error) {
+	var (
+		next State
+		err  error
+	)
 	switch ev.Type {
 	case EvGameCreated:
-		return applyGameCreated(s, ev, tc)
+		next, err = applyGameCreated(s, ev, opts.TimeControl)
 	case EvPlayerJoined:
-		return applyPlayerJoined(s, ev)
+		next, err = applyPlayerJoined(s, ev)
+	case EvClockStarted:
+		next, err = applyClockStarted(s, ev)
 	case EvMovePlayed:
-		return applyMovePlayed(s, ev)
+		next, err = applyMovePlayed(s, ev, v)
 	case EvDrawOffered:
-		return applyDrawOffered(s, ev)
+		next, err = applyDrawOffered(s, ev)
 	case EvDrawAccepted:
-		return applyDrawAccepted(s, ev)
+		next, err = applyDrawAccepted(s, ev)
+	case EvDrawDeclined:
+		next, err = applyDrawDeclined(s, ev)
 	case EvResigned:
-		return applyResigned(s, ev)
+		next, err = applyResigned(s, ev)
 	case EvAborted:
-		return applyAborted(s, ev)
-	case EvTakebackReq:
-		return applyTakebackReq(s, ev)
-	case EvTakebackAccepted:
-		return applyTakebackAccepted(s, ev)
+		next, err = applyAborted(s, ev)
+	case EvTakebackProposed:
+		next, err = applyTakebackProposed(s, ev)
+	case EvTakebackDeclined:
+		next, err = applyTakebackDeclined(s, ev)
+	case EvTakebackRewound:
+		next, err = applyTakebackRewound(s, ev)
+	case EvTakebackReq, EvTakebackAccepted:
+		return s, ErrLegacyTakeback
 	case EvClockFlagged:
-		return applyClockFlagged(s, ev)
+		next, err = applyClockFlagged(s, ev)
 	case EvGameEnded:
-		return applyGameEnded(s, ev)
+		next, err = applyGameEnded(s, ev)
 	case EvRatingApplied:
-		return applyRatingApplied(s, ev)
+		next, err = applyRatingApplied(s, ev)
 	default:
 		return s, fmt.Errorf("unknown event type %d", ev.Type)
 	}
+	if err != nil {
+		return s, err
+	}
+	next.NextSeq = s.NextSeq + 1
+	return next, nil
 }
 
 func applyGameCreated(s State, ev Event, tc clock.TimeControl) (State, error) {
@@ -186,8 +285,6 @@ func applyGameCreated(s State, ev Event, tc clock.TimeControl) (State, error) {
 	if len(b.Seats) == 0 {
 		return s, fmt.Errorf("GameCreated: no seats")
 	}
-	// seat_idx must be the contiguous 0-based set {0..n-1} (SPEC-S2-PROTOCOL
-	// §3.3). Reject gaps/dups so downstream seat indexing is safe.
 	seen := make([]bool, len(b.Seats))
 	for _, seat := range b.Seats {
 		if int(seat.SeatIdx) >= len(b.Seats) || seen[seat.SeatIdx] {
@@ -206,10 +303,16 @@ func applyGameCreated(s State, ev Event, tc clock.TimeControl) (State, error) {
 	s.TimeControl = b.TimeControl
 	s.StartFEN = b.StartFEN
 	s.CurFEN = b.StartFEN
+	s.BaseMs = tc.BaseMs
 	s.Joined = make([]bool, len(b.Seats))
 	s.Ply = 0
 	s.TurnIdx = 0
 	s.Clock = cl
+	s.DrawOfferBy = NoSeat
+	s.LastDrawOfferPly = make([]int64, len(b.Seats))
+	for i := range s.LastDrawOfferPly {
+		s.LastDrawOfferPly[i] = -1
+	}
 	return s, nil
 }
 
@@ -229,7 +332,6 @@ func applyPlayerJoined(s State, ev Event) (State, error) {
 	}
 	s.Joined = append([]bool(nil), s.Joined...)
 	s.Joined[b.SeatIdx] = true
-	// Transition to LIVE once every seat has joined.
 	all := true
 	for _, j := range s.Joined {
 		if !j {
@@ -243,7 +345,23 @@ func applyPlayerJoined(s State, ev Event) (State, error) {
 	return s, nil
 }
 
-func applyMovePlayed(s State, ev Event) (State, error) {
+// applyClockStarted records the durable first-clock baseline (§3.5).
+func applyClockStarted(s State, ev Event) (State, error) {
+	if s.Phase != PhaseLive {
+		return s, fmt.Errorf("ClockStarted in phase %s (must be Live)", s.Phase)
+	}
+	if ev.ClockStarted == nil {
+		return s, fmt.Errorf("ClockStarted: nil body")
+	}
+	if s.ClockStartedSet {
+		return s, fmt.Errorf("ClockStarted: clock already started")
+	}
+	s.LastChangeTS = ev.ClockStarted.ServerTS
+	s.ClockStartedSet = true
+	return s, nil
+}
+
+func applyMovePlayed(s State, ev Event, v *Verdict) (State, error) {
 	if s.Phase != PhaseLive {
 		return s, fmt.Errorf("MovePlayed in phase %s (must be Live)", s.Phase)
 	}
@@ -260,45 +378,59 @@ func applyMovePlayed(s State, ev Event) (State, error) {
 	if b.Ply != s.Ply+1 {
 		return s, fmt.Errorf("MovePlayed: ply %d not sequential (expected %d)", b.Ply, s.Ply+1)
 	}
-	// Project the clock from the move's authoritative ClockAfterMs: the server
-	// computed the mover's remaining time with clock.Apply and persisted it on
-	// the event (SPEC-S2-PROTOCOL §4A.8). The fold trusts the stored value
-	// rather than recomputing — the event is the truth, and a MovePlayed is only
-	// ever appended for a non-flagging move (a flag is ClockFlagged, not a
-	// MovePlayed), so a stored ClockAfterMs is always a valid remaining time.
-	// Only the mover's clock changes; the opponent's is unchanged (§4A.3:
-	// MOVE_ACCEPTED carries only the mover's clock_after_ms).
-	cl := s.Clock.CloneWith(int(b.SeatIdx), int64(b.ClockAfterMs))
-	s.Clock = cl
+	if s.HalfTerminal != nil {
+		return s, fmt.Errorf("MovePlayed after ClockFlagged")
+	}
+	entry := PlyEntry{Seat: b.SeatIdx, UCI: b.UCI, ClockAfterMs: b.ClockAfterMs, ServerTS: b.ServerTS, Seq: s.NextSeq}
+	if v != nil {
+		entry.FEN, entry.Zobrist, entry.Terminal = v.FEN, v.Zobrist, v.Terminal
+		s.CurFEN = v.FEN
+	}
+	s.History = append(append([]PlyEntry(nil), s.History...), entry)
+	s.Clock = s.Clock.CloneWith(int(b.SeatIdx), int64(b.ClockAfterMs))
 	s.Ply = b.Ply
-	s.LastMoveUCI = b.UCI
-	// CurFEN is engine-authoritative and is NOT derived here (the pure fold has
-	// no chess logic — NFR-5); FoldWithEngine projects it by replaying moves
-	// through the engine. The pure fold advances only ply/turn/clock.
 	s.TurnIdx = uint8((int(s.TurnIdx) + 1) % s.seatCount())
-	// A new move clears a pending draw offer (standard: a move declines a
-	// standing offer). Takeback requests persist until resolved.
-	s.DrawOfferBy = -1
+	s.LastChangeTS = b.ServerTS
+	// A move means the clock is running. Without this, a stream with moves but no
+	// ClockStarted would get one appended on rebuild, resetting the baseline.
+	s.ClockStartedSet = true
+	// Only the responder's move declines (§6.2, §5.2.4); the offerer's or
+	// proposer's own move leaves its prompt standing.
+	if s.DrawOfferBy != NoSeat && int(b.SeatIdx) != s.DrawOfferBy {
+		s.DrawOfferBy = NoSeat
+	}
+	if s.PendingTakeback != nil && b.SeatIdx != s.PendingTakeback.By {
+		s.PendingTakeback = nil
+	}
 	return s, nil
 }
 
 func applyDrawOffered(s State, ev Event) (State, error) {
-	if s.Phase != PhaseLive {
-		return s, fmt.Errorf("DrawOffered in phase %s (must be Live)", s.Phase)
+	if err := liveTwoSeat(s, "DrawOffered"); err != nil {
+		return s, err
 	}
 	seat, err := seatOf(s, ev)
 	if err != nil {
 		return s, fmt.Errorf("DrawOffered: %w", err)
 	}
+	switch s.DrawOfferBy {
+	case int(seat):
+		return s, nil // a repeat while its own offer is pending: idempotent (§5.1)
+	case NoSeat:
+	default:
+		return s, fmt.Errorf("DrawOffered: seat %d offered while seat %d's offer is pending (that is an accept)", seat, s.DrawOfferBy)
+	}
 	s.DrawOfferBy = int(seat)
+	s.LastDrawOfferPly = append([]int64(nil), s.LastDrawOfferPly...)
+	s.LastDrawOfferPly[seat] = int64(s.Ply)
 	return s, nil
 }
 
 func applyDrawAccepted(s State, ev Event) (State, error) {
-	if s.Phase != PhaseLive {
-		return s, fmt.Errorf("DrawAccepted in phase %s (must be Live)", s.Phase)
+	if err := liveTwoSeat(s, "DrawAccepted"); err != nil {
+		return s, err
 	}
-	if s.DrawOfferBy < 0 {
+	if s.DrawOfferBy == NoSeat {
 		return s, fmt.Errorf("DrawAccepted: no open draw offer")
 	}
 	seat, err := seatOf(s, ev)
@@ -308,12 +440,22 @@ func applyDrawAccepted(s State, ev Event) (State, error) {
 	if int(seat) == s.DrawOfferBy {
 		return s, fmt.Errorf("DrawAccepted: seat %d cannot accept its own offer", seat)
 	}
-	// Note: the actual ENDED transition is driven by the GameEnded event that
-	// the pipeline appends after a DrawAccepted (SPEC-S2-GAME-SERVER §3.2:
-	// "DrawAccepted ... -> ENDED (GameEnded + term=DRAW_AGREE)"). DrawAccepted
-	// alone clears the offer; GameEnded makes it terminal. This keeps every
-	// terminal transition flowing through exactly one event (GameEnded).
-	s.DrawOfferBy = -1
+	// GameEnded (appended in the same batch) makes the game terminal.
+	s.DrawOfferBy = NoSeat
+	return s, nil
+}
+
+func applyDrawDeclined(s State, ev Event) (State, error) {
+	if err := liveTwoSeat(s, "DrawDeclined"); err != nil {
+		return s, err
+	}
+	if _, err := seatOf(s, ev); err != nil {
+		return s, fmt.Errorf("DrawDeclined: %w", err)
+	}
+	if s.DrawOfferBy == NoSeat {
+		return s, fmt.Errorf("DrawDeclined: no open draw offer")
+	}
+	s.DrawOfferBy = NoSeat
 	return s, nil
 }
 
@@ -324,16 +466,10 @@ func applyResigned(s State, ev Event) (State, error) {
 	if _, err := seatOf(s, ev); err != nil {
 		return s, fmt.Errorf("Resigned: %w", err)
 	}
-	// Terminal transition is the following GameEnded{RESIGN}. Resigned records
-	// intent; GameEnded ends the game (single terminal event, as above).
 	return s, nil
 }
 
 func applyAborted(s State, ev Event) (State, error) {
-	// Abort is allowed from MATCHED or early LIVE (SPEC-S2-GAME-SERVER §3.2:
-	// "MATCHED/LIVE(early) --Aborted--> ENDED"). "early" (pre-first-move policy
-	// window) is a pipeline/policy concern; the fold accepts an abort from
-	// MATCHED or LIVE and leaves the terminal transition to GameEnded{ABORT}.
 	if s.Phase != PhaseMatched && s.Phase != PhaseLive {
 		return s, fmt.Errorf("Aborted in phase %s (must be Matched or Live)", s.Phase)
 	}
@@ -347,48 +483,120 @@ func applyAborted(s State, ev Event) (State, error) {
 	return s, nil
 }
 
-func applyTakebackReq(s State, ev Event) (State, error) {
-	if s.Phase != PhaseLive {
-		return s, fmt.Errorf("TakebackReq in phase %s (must be Live)", s.Phase)
+func applyTakebackProposed(s State, ev Event) (State, error) {
+	if err := liveTwoSeat(s, "TakebackProposed"); err != nil {
+		return s, err
 	}
 	if s.Rated {
-		return s, fmt.Errorf("TakebackReq: not allowed in a rated game (F-01.4 unrated only)")
+		return s, fmt.Errorf("TakebackProposed: not allowed in a rated game (F-01.4)")
 	}
 	seat, err := seatOf(s, ev)
 	if err != nil {
-		return s, fmt.Errorf("TakebackReq: %w", err)
+		return s, fmt.Errorf("TakebackProposed: %w", err)
 	}
-	if s.Ply == 0 {
-		return s, fmt.Errorf("TakebackReq: no move to take back")
+	if s.Ply < 2 {
+		return s, fmt.Errorf("TakebackProposed: needs ply >= 2, at %d", s.Ply)
 	}
-	s.TakebackReqBy = int(seat)
+	if s.PendingTakeback != nil {
+		return s, fmt.Errorf("TakebackProposed: a request by seat %d is already pending", s.PendingTakeback.By)
+	}
+	s.PendingTakeback = &PendingTakeback{By: seat, AtPly: s.Ply}
 	return s, nil
 }
 
-func applyTakebackAccepted(s State, ev Event) (State, error) {
-	if s.Phase != PhaseLive {
-		return s, fmt.Errorf("TakebackAccepted in phase %s (must be Live)", s.Phase)
+func applyTakebackDeclined(s State, ev Event) (State, error) {
+	if err := liveTwoSeat(s, "TakebackDeclined"); err != nil {
+		return s, err
+	}
+	if _, err := seatOf(s, ev); err != nil {
+		return s, fmt.Errorf("TakebackDeclined: %w", err)
+	}
+	if s.PendingTakeback == nil {
+		return s, fmt.Errorf("TakebackDeclined: no pending request")
+	}
+	s.PendingTakeback = nil
+	return s, nil
+}
+
+// TakebackToPly is the §5.3 rewind target for request p at the state's
+// History: k = 1 if the proposer made the ply it asked about (the accepter was
+// to move), else 2.
+func TakebackToPly(s State, p PendingTakeback) (uint32, error) {
+	if p.AtPly < 2 || int(p.AtPly) > len(s.History) {
+		return 0, fmt.Errorf("takeback: at_ply %d outside the live history (%d plies)", p.AtPly, len(s.History))
+	}
+	k := uint32(2)
+	if s.History[p.AtPly-1].Seat == p.By {
+		k = 1
+	}
+	return p.AtPly - k, nil
+}
+
+func applyTakebackRewound(s State, ev Event) (State, error) {
+	if err := liveTwoSeat(s, "TakebackRewound"); err != nil {
+		return s, err
 	}
 	if s.Rated {
-		return s, fmt.Errorf("TakebackAccepted: not allowed in a rated game (F-01.4 unrated only)")
+		return s, fmt.Errorf("TakebackRewound: not allowed in a rated game (F-01.4)")
 	}
-	if s.TakebackReqBy < 0 {
-		return s, fmt.Errorf("TakebackAccepted: no open takeback request")
+	b := ev.TakebackRewound
+	if b == nil {
+		return s, fmt.Errorf("TakebackRewound: nil body")
 	}
-	seat, err := seatOf(s, ev)
+	if int(b.SeatIdx) >= s.seatCount() {
+		return s, fmt.Errorf("TakebackRewound: seat_idx %d out of range", b.SeatIdx)
+	}
+	p := s.PendingTakeback
+	if p == nil {
+		return s, fmt.Errorf("TakebackRewound: no pending request")
+	}
+	if b.SeatIdx == p.By {
+		return s, fmt.Errorf("TakebackRewound: seat %d cannot accept its own request", b.SeatIdx)
+	}
+	want, err := TakebackToPly(s, *p)
 	if err != nil {
-		return s, fmt.Errorf("TakebackAccepted: %w", err)
+		return s, fmt.Errorf("TakebackRewound: %w", err)
 	}
-	if int(seat) == s.TakebackReqBy {
-		return s, fmt.Errorf("TakebackAccepted: seat %d cannot accept its own request", seat)
+	if b.ToPly != want {
+		return s, fmt.Errorf("TakebackRewound: to_ply %d, the §5.3 rule gives %d", b.ToPly, want)
 	}
-	// The projection roll-back to ply-n is performed by re-folding the stream up
-	// to the pre-move point (SPEC-S2-GAME-SERVER §3.2: "re-folding to ply-n").
-	// Because the stream is append-only, the mechanism lives in RefoldTakeback
-	// (statemachine_takeback.go), not here: a TakebackAccepted event in a replay
-	// just clears the pending request; the authoritative truncated projection is
-	// produced by re-folding the retained prefix. See RefoldTakeback.
-	s.TakebackReqBy = -1
+	before := s.History
+	kept := append([]PlyEntry(nil), before[:b.ToPly]...)
+	// §5.4 clocks: the side to move after the rewind keeps the clock of its own
+	// (now undone) move; the other seat keeps its last retained move's clock, or
+	// the base time if it has none.
+	toMove := before[b.ToPly].Seat
+	cl := s.Clock.CloneWith(int(toMove), int64(before[b.ToPly].ClockAfterMs))
+	for seat := 0; seat < s.seatCount(); seat++ {
+		if uint8(seat) == toMove {
+			continue
+		}
+		rem := s.BaseMs
+		for i := len(kept) - 1; i >= 0; i-- {
+			if int(kept[i].Seat) == seat {
+				rem = int64(kept[i].ClockAfterMs)
+				break
+			}
+		}
+		cl = cl.CloneWith(seat, rem)
+	}
+	s.History = kept
+	s.Clock = cl
+	s.Ply = b.ToPly
+	s.TurnIdx = toMove
+	s.CurFEN = s.StartFEN
+	if len(kept) > 0 && kept[len(kept)-1].FEN != "" {
+		s.CurFEN = kept[len(kept)-1].FEN
+	}
+	s.LastChangeTS = b.ServerTS
+	s.PendingTakeback = nil
+	s.DrawOfferBy = NoSeat // [dev] §5.5: the offer was about a position that is gone
+	s.LastDrawOfferPly = append([]int64(nil), s.LastDrawOfferPly...)
+	for i, l := range s.LastDrawOfferPly {
+		if l > int64(b.ToPly) {
+			s.LastDrawOfferPly[i] = -1
+		}
+	}
 	return s, nil
 }
 
@@ -396,10 +604,17 @@ func applyClockFlagged(s State, ev Event) (State, error) {
 	if s.Phase != PhaseLive {
 		return s, fmt.Errorf("ClockFlagged in phase %s (must be Live)", s.Phase)
 	}
-	if _, err := seatOf(s, ev); err != nil {
+	seat, err := seatOf(s, ev)
+	if err != nil {
 		return s, fmt.Errorf("ClockFlagged: %w", err)
 	}
-	// Terminal transition is the following GameEnded{FLAG|TIMEOUT_VS_INSUFFICIENT}.
+	if s.HalfTerminal != nil {
+		return s, fmt.Errorf("ClockFlagged: seat %d already flagged", *s.HalfTerminal)
+	}
+	// #157: the flag zeroes the flagged clock in the fold, as it does live.
+	s.Clock = s.Clock.CloneWith(int(seat), 0)
+	s.Clock.FlaggedSeat = int(seat)
+	s.HalfTerminal = &seat
 	return s, nil
 }
 
@@ -420,8 +635,9 @@ func applyGameEnded(s State, ev Event) (State, error) {
 	s.Phase = PhaseEnded
 	s.Termination = b.Termination
 	s.ResultVector = append([]Result(nil), b.ResultVector...)
-	s.DrawOfferBy = -1
-	s.TakebackReqBy = -1
+	s.DrawOfferBy = NoSeat
+	s.PendingTakeback = nil
+	s.HalfTerminal = nil
 	return s, nil
 }
 
@@ -433,11 +649,7 @@ func applyRatingApplied(s State, ev Event) (State, error) {
 		return s, fmt.Errorf("RatingApplied: game is unrated")
 	}
 	if s.RatingApplied {
-		// A compensating RatingApplied is a legitimate later correction
-		// (SPEC-S2-PROTOCOL §3.2 immutability). The flag is already set; folding
-		// another is allowed (the latest wins at the projection level). We keep
-		// it idempotent-at-the-flag and leave rating math to X-4.
-		return s, nil
+		return s, nil // a compensating correction; rating math is X-4's
 	}
 	if ev.RatingApplied == nil {
 		return s, fmt.Errorf("RatingApplied: nil body")
@@ -446,8 +658,18 @@ func applyRatingApplied(s State, ev Event) (State, error) {
 	return s, nil
 }
 
-// seatOf extracts and range-checks the seat_idx of a single-seat event
-// (SeatAction body). Returns an error for a nil body or an out-of-range seat.
+// liveTwoSeat guards the takeback and draw events: Live phase, 2 seats.
+func liveTwoSeat(s State, name string) error {
+	if s.Phase != PhaseLive {
+		return fmt.Errorf("%s in phase %s (must be Live)", name, s.Phase)
+	}
+	if s.seatCount() != 2 {
+		return fmt.Errorf("%s: %w", name, ErrUnsupportedSeatCount)
+	}
+	return nil
+}
+
+// seatOf extracts and range-checks the seat_idx of a SeatAction event.
 func seatOf(s State, ev Event) (uint8, error) {
 	if ev.SeatAction == nil {
 		return 0, fmt.Errorf("nil seat body")

@@ -334,6 +334,22 @@ func TestFlagOnTimeout(t *testing.T) {
 	}
 }
 
+// takeback runs the two-step GS-7 flow: `by` proposes, `accepter` accepts at
+// the proposed at_ply, and the rewind is asserted.
+func takeback(t *testing.T, s *Session, by, accepter uint8) TakebackResult {
+	t.Helper()
+	ctx := context.Background()
+	p, err := s.ProposeTakeback(ctx, by)
+	if err != nil || p.Effect != game.EffectTakebackProposed {
+		t.Fatalf("ProposeTakeback(%d): %v %+v", by, err, p)
+	}
+	r, err := s.AcceptTakeback(ctx, accepter, p.AtPly)
+	if err != nil || r.Effect != game.EffectTakebackRewound {
+		t.Fatalf("AcceptTakeback(%d, %d): %v %+v", accepter, p.AtPly, err, r)
+	}
+	return r
+}
+
 // TestTakebackUnratedRollsBack: an unrated takeback rolls the projection back a
 // ply; a rated game refuses.
 func TestTakebackUnratedRollsBack(t *testing.T) {
@@ -353,10 +369,8 @@ func TestTakebackUnratedRollsBack(t *testing.T) {
 	if before.Ply != 2 {
 		t.Fatalf("ply before takeback = %d, want 2", before.Ply)
 	}
-	// Take back 1 ply (black's e5). Seat 1 requests; seat 0 accepts (internally).
-	if err := s.Takeback(ctx, 1, 1); err != nil {
-		t.Fatalf("takeback: %v", err)
-	}
+	// Seat 1 asks to take back its own e5 (at_ply 2); seat 0 accepts at_ply 2.
+	takeback(t, s, 1, 0)
 	after, _ := s.StateSnapshot(ctx)
 	if after.Ply != 1 {
 		t.Fatalf("ply after takeback = %d, want 1", after.Ply)
@@ -371,8 +385,8 @@ func TestTakebackUnratedRollsBack(t *testing.T) {
 	defer rc()
 	fc2.add(time.Second)
 	rs.SubmitMove(ctx, 0, 1, "e2e4", 1)
-	if err := rs.Takeback(ctx, 0, 1); err == nil {
-		t.Error("rated takeback was allowed, want refusal")
+	if r, err := rs.ProposeTakeback(ctx, 0); err == nil && r.Effect == game.EffectTakebackProposed {
+		t.Error("rated takeback was proposed, want refusal")
 	}
 }
 
@@ -461,8 +475,8 @@ func TestIdempotentReackDoesNotCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-ack: %v", err)
 	}
-	if !reack.Accepted {
-		t.Fatalf("re-ack not accepted: %+v", reack)
+	if !reack.Accepted || !reack.Reacked {
+		t.Fatalf("re-ack = %+v, want Accepted+Reacked", reack)
 	}
 	after, _ := s.StateSnapshot(ctx)
 	if after.FEN != before.FEN {
@@ -510,9 +524,7 @@ func TestDoubleTakeback(t *testing.T) {
 	}
 
 	// First takeback: undo Nf3 (1 ply) -> back to ply 2, black... no, white to move? ply2 means black just moved, white to move. White re-plays a DIFFERENT move, re-using ply 3.
-	if err := s.Takeback(ctx, 0, 1); err != nil {
-		t.Fatalf("takeback 1: %v", err)
-	}
+	takeback(t, s, 0, 1) // seat 0 asks about its own Nf3; seat 1 accepts
 	back1, _ := s.StateSnapshot(ctx)
 	if back1.Ply != 2 {
 		t.Fatalf("after takeback1 ply = %d, want 2", back1.Ply)
@@ -526,9 +538,7 @@ func TestDoubleTakeback(t *testing.T) {
 	// must target the FIRST ply-3... actually the re-fold must land on the
 	// correct current position. We assert it rolls back to ply 2 and the board
 	// matches a fresh fold of the retained stream (the real correctness check).
-	if err := s.Takeback(ctx, 0, 1); err != nil {
-		t.Fatalf("takeback 2: %v", err)
-	}
+	takeback(t, s, 0, 1)
 	back2, _ := s.StateSnapshot(ctx)
 	if back2.Ply != 2 {
 		t.Fatalf("after takeback2 ply = %d, want 2", back2.Ply)
@@ -777,5 +787,132 @@ func TestRecoverHalfTerminalMate(t *testing.T) {
 	evs, _ := store.Load(ctx, sid)
 	if evs[len(evs)-1].Type != game.EvGameEnded {
 		t.Fatalf("recovery did not append GameEnded; last=%v", evs[len(evs)-1].Type)
+	}
+}
+
+// TestDifferentUCIAtPlayedPlyIsStale: GS-7 §5 (reversed from the old
+// persisted-UCI echo): a DIFFERENT uci at an already-played ply is STALE_PLY.
+func TestDifferentUCIAtPlayedPlyIsStale(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, store, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+	fc.add(time.Second)
+	if o, _ := s.SubmitMove(ctx, 0, 1, "e2e4", 1); !o.Accepted {
+		t.Fatal("first move not accepted")
+	}
+	n := len(mustLoad(t, store))
+	out, err := s.SubmitMove(ctx, 0, 1, "d2d4", 2)
+	if err != nil {
+		t.Fatalf("SubmitMove: %v", err)
+	}
+	if !out.Rejected || out.Reason != game.RejectStalePly {
+		t.Fatalf("different uci at played ply = %+v, want STALE_PLY", out)
+	}
+	if after := len(mustLoad(t, store)); after != n {
+		t.Fatalf("stale move appended events: %d -> %d", n, after)
+	}
+}
+
+// TestReackAfterTakebackSameUCI: after a rewind the ply recurs; the same UCI
+// at the recurring (re-played) ply is re-acked, a different one is STALE_PLY.
+func TestReackAfterTakebackSameUCI(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+	playOpening(t, s, fc)
+	takeback(t, s, 1, 0) // back to ply 1, black to move
+	fc.add(time.Second)
+	if o, _ := s.SubmitMove(ctx, 1, 2, "c7c5", 3); !o.Accepted {
+		t.Fatal("replacement ply-2 move not accepted")
+	}
+	re, err := s.SubmitMove(ctx, 1, 2, "c7c5", 4)
+	if err != nil || !re.Accepted || !re.Reacked {
+		t.Fatalf("resend after takeback = %+v %v, want Reacked", re, err)
+	}
+	st, err := s.SubmitMove(ctx, 1, 2, "e7e5", 5) // the undone move
+	if err != nil || !st.Rejected || st.Reason != game.RejectStalePly {
+		t.Fatalf("undone move resent = %+v %v, want STALE_PLY", st, err)
+	}
+}
+
+// TestClockStartedAppendedOnceOnFirstBuild: GS-7 §5.4: a LIVE game appends
+// exactly one ClockStarted on first build; a second build appends none.
+func TestClockStartedAppendedOnceOnFirstBuild(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, store, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	count := func() int {
+		n := 0
+		for _, e := range mustLoad(t, store) {
+			if e.Type == game.EvClockStarted {
+				n++
+			}
+		}
+		return n
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("ClockStarted after first build = %d, want 1", got)
+	}
+	snap, _ := s.StateSnapshot(context.Background())
+	if !snap.ClockStartedSet {
+		t.Fatal("snapshot ClockStartedSet = false after first build")
+	}
+	o, _ := engine.New()
+	opts := game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 300_000, IncrementMs: 3_000}}
+	if _, err := NewSession(context.Background(), Config{GameID: gameID, Store: store, Oracle: o, Opts: opts, Now: fc.now}); err != nil {
+		t.Fatalf("second build: %v", err)
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("ClockStarted after second build = %d, want 1", got)
+	}
+}
+
+// TestTakebackSessionEdges: GS-7 §9.6 session-level edges.
+func TestTakebackSessionEdges(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+	// Propose at ply < 2 is a no-op.
+	if r, err := s.ProposeTakeback(ctx, 0); err != nil || r.Effect == game.EffectTakebackProposed {
+		t.Fatalf("propose at ply 0 = %+v %v, want no proposal", r, err)
+	}
+	playOpening(t, s, fc)
+	p, err := s.ProposeTakeback(ctx, 1)
+	if err != nil || p.Effect != game.EffectTakebackProposed || p.AtPly != 2 {
+		t.Fatalf("propose = %+v %v", p, err)
+	}
+	// The responder's TAKEBACK while a request is pending is ignored.
+	if r, _ := s.ProposeTakeback(ctx, 0); r.Effect != game.EffectIgnored {
+		t.Fatalf("responder TAKEBACK = %+v, want Ignored", r)
+	}
+	// Stale accept (wrong at_ply) is ignored and leaves the request pending.
+	if r, _ := s.AcceptTakeback(ctx, 0, 1); r.Effect != game.EffectIgnored {
+		t.Fatalf("stale accept = %+v, want Ignored", r)
+	}
+	if r, err := s.AcceptTakeback(ctx, 0, 2); err != nil || r.Effect != game.EffectTakebackRewound || r.Snap.Ply != 1 {
+		t.Fatalf("accept = %+v %v", r, err)
+	}
+	// A repeated accept after a lost ack is ignored (the transport pushes STATE).
+	if r, _ := s.AcceptTakeback(ctx, 0, 2); r.Effect != game.EffectIgnored {
+		t.Fatalf("repeated accept = %+v, want Ignored", r)
+	}
+	// Second takeback after the first works.
+	fc.add(time.Second)
+	if o, _ := s.SubmitMove(ctx, 1, 2, "c7c5", 9); !o.Accepted {
+		t.Fatal("re-play not accepted")
+	}
+	takeback(t, s, 1, 0)
+	// Decline path.
+	if r, _ := s.AcceptTakeback(ctx, 0, 0); r.Effect != game.EffectIgnored {
+		t.Fatalf("accept with nothing pending = %+v", r)
+	}
+	fc.add(time.Second)
+	s.SubmitMove(ctx, 1, 2, "e7e5", 10)
+	p, _ = s.ProposeTakeback(ctx, 0)
+	if d, _ := s.DeclineTakeback(ctx, 1, p.AtPly); d.Effect != game.EffectTakebackDeclined || d.Snap.TakebackBy != game.NoSeat {
+		t.Fatalf("decline = %+v", d)
 	}
 }
