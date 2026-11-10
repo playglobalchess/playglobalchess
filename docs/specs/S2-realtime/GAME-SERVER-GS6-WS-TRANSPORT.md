@@ -182,16 +182,21 @@ stream without a live session (no wire change):
   seat whose `GAME_END` write was accepted is not pushed the ending again (it may
   already be seeking a new game). Accepted means queued, not delivered: a
   `GAME_END` queued to a half-open socket just before it drops is lost, which is
-  why the client RESYNCs its game after every reconnect (WEB-F01 §3.4). Retention: 24 h, at most 100 000 records (oldest dropped first), expired
-  in insertion order. The record is node-local, like the reconnect index; a
-  reconnect to another node gets no push but can still RESYNC.
+  why the client RESYNCs its game after every reconnect (WEB-F01 §3.4).
+  Retention: 24 h, at most 100 000 records (oldest dropped first), expired in
+  insertion order. The record is node-local, like the reconnect index: a
+  reconnect to another node gets no push, but its RESYNC is served there once
+  the game has ended.
 - **RESYNC{game_id} of an ended game** the user was seated in (checked against
   the stream's `PlayerJoined`, before any engine replay) returns the ended
   `STATE` at any time, with no retention window: the stream is the record. Every
   RESYNC the caller may not see (a live game it is not seated in, an ended game
   it did not play, an unknown id) gets the same `ERROR{UNKNOWN_GAME, "no such
-  game"}`, so RESYNC cannot tell other players' games apart. After the push
-  window, RESYNC is the way back, on any node.
+  game"}`, so RESYNC cannot tell other players' games apart. A store failure is
+  `ERROR{INTERNAL}` and logged, never "no such game". After the push window,
+  RESYNC is the way back, on any node, for an ENDED game. A game still LIVE on
+  another node answers `UNKNOWN_GAME` here: there is no node routing yet (G-E),
+  so resuming it needs the reconnect to reach the node that holds it.
 
 ### 3.5 Heartbeat, flag-forfeit & teardown
 

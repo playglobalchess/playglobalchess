@@ -72,6 +72,12 @@ export class GameSocket {
    * returns the live or ENDED state on any node, so the board never stays live
    * for a game that is over. */
   private liveGameId: string | null = null;
+  /** The game id of a reconnect RESYNC still awaiting its answer. That RESYNC is
+   * best effort: a game live on ANOTHER node is answered UNKNOWN_GAME (there is
+   * no node routing yet, G-E), and that answer is not an error for the player, so
+   * it is dropped here instead of reaching the UI as a banner. It is retried on
+   * the next reconnect (the game may have ended by then, which any node serves). */
+  private quietResync: string | null = null;
   private closedByUs = false;
   private attempt = 0;
   /** True between onopen and the next (re)open/close — gates direct sends. */
@@ -132,6 +138,7 @@ export class GameSocket {
       }
       // Ask for the game we were in: its live state, or how it ended (#102).
       if (this.liveGameId != null) {
+        this.quietResync = this.liveGameId;
         this.sendMsg({ Resync: { game_id: this.liveGameId } });
       }
       // Flush anything requested before the socket was open (an eager
@@ -161,6 +168,17 @@ export class GameSocket {
       }
       // The connection is proven usable — now reset the backoff counter (S3).
       this.attempt = 0;
+      // The reconnect RESYNC's answer: a STATE for that game settles it; an
+      // UNKNOWN_GAME (game live elsewhere, or gone) is swallowed, not shown.
+      if (this.quietResync != null) {
+        if ("State" in msg && msg.State.game_id === this.quietResync) {
+          this.quietResync = null;
+        } else if ("Error" in msg && msg.Error.code === ErrorCode.UnknownGame) {
+          console.info("GameSocket: reconnect RESYNC of", this.quietResync, "not served here:", msg.Error.msg);
+          this.quietResync = null;
+          return;
+        }
+      }
       if ("Matched" in msg) {
         this.matched = true;
         this.pendingSeek = null; // matched — the seek is consumed (explicit invariant)

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { GameSocket, type SocketLike } from "./GameSocket";
 import { encodeServerFrame, decodeClientFrame } from "../codec/seam";
-import type { ClientMsg, ServerMsg } from "../codec/messages";
+import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
 import { sb } from "../test/stateBody";
 
 // A fake WebSocket that captures outgoing frames and lets the test feed incoming
@@ -215,6 +215,22 @@ describe("GameSocket (fake socket, real codec)", () => {
     const sent = await afterReconnect();
     expect("Authenticate" in sent[0]!).toBe(true);
     expect(sent.some((m) => "Resync" in m && m.Resync.game_id === GID)).toBe(true);
+  });
+
+  it("an UNKNOWN_GAME answer to the reconnect RESYNC is not shown; later errors are", async () => {
+    sock = quickSock();
+    sock.connect();
+    fakes[0]!.open();
+    fakes[0]!.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [300000, 300000]) } });
+    fakes[0]!.onclose?.();
+    await afterReconnect();
+    received.length = 0;
+    // The game is live on another node: the RESYNC is answered UNKNOWN_GAME.
+    fakes[1]!.feed({ Error: { code: ErrorCode.UnknownGame, msg: "no such game" } });
+    expect(received).toEqual([]);
+    // Only that one answer is swallowed: a later error still reaches the UI.
+    fakes[1]!.feed({ Error: { code: ErrorCode.UnknownGame, msg: "no such game" } });
+    expect(received.length).toBe(1);
   });
 
   it("does NOT RESYNC on reconnect once the game has ended", async () => {

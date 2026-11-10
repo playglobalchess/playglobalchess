@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -299,4 +300,30 @@ func TestMissedEnd_FailedPushIsRetried(t *testing.T) {
 	rv := make([]uint8, 2)
 	rv[seatA], rv[seatB] = uint8(game.ResultLoss), uint8(game.ResultWin)
 	wantEnded(t, cb2.waitForServer(t, codec.SMState, 2*time.Second), gameID, seatB, game.TermResign, rv)
+}
+
+// failingLoadStore fails every stream read, like a store outage.
+type failingLoadStore struct{ game.EventStore }
+
+func (failingLoadStore) Load(context.Context, string) ([]game.Event, error) {
+	return nil, errors.New("store unavailable")
+}
+
+// A store read failure on RESYNC is a retryable INTERNAL, not "no such game"
+// (review finding: the player must not be told their game does not exist).
+func TestResyncEnded_StoreFailureIsInternal(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
+	ca.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
+	ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	cb.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+
+	h.srv.reg.store = failingLoadStore{h.store}
+	resync(t, cb, gameID)
+	e := cb.waitForServer(t, codec.SMError, 2*time.Second)
+	if e.Error.Code != codec.ECInternal {
+		t.Fatalf("error code = 0x%02x, want INTERNAL on a store failure", e.Error.Code)
+	}
 }

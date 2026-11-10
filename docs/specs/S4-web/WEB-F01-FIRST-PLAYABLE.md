@@ -161,7 +161,10 @@ On socket close, reconnect + re-AUTHENTICATE; the server auto-pushes `STATE`
 `STATE` (§4A v1.1). After every reconnect the client sends `RESYNC` for the game
 it was in (from `MATCHED` or a live `STATE`, cleared by `GAME_END` or an ended
 `STATE`), so a game that ended while it was away, or whose `GAME_END` was lost
-on the dropped socket, shows its result on any node (#102). The board rebuilds from the `STATE` fold — the client never
+on the dropped socket, shows its result on any node (#102). That RESYNC is best
+effort: an `UNKNOWN_GAME` answer to it (the game is live on another node, which
+cannot be routed yet, G-E) is dropped rather than shown as an error, and the
+RESYNC is retried on the next reconnect. The board rebuilds from the `STATE` fold — the client never
 reconstructs truth locally.
 
 ### 3.5 Accessibility & i18n

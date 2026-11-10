@@ -153,11 +153,14 @@ func (s *Server) pushMissedEnds(ctx context.Context, c Conn, uid string) {
 func (s *Server) resyncEnded(ctx context.Context, c Conn, uid, gameID string) {
 	snap, seat, seated, err := s.reg.EndedView(ctx, gameID, uid)
 	switch {
-	case !seated || errors.Is(err, errNotEnded):
-		s.send(ctx, c, errorMsg(codec.ECUnknownGame, errNoSuchGame))
-	case err != nil:
+	case err != nil && !errors.Is(err, errNotEnded):
+		// A store/fold failure is retryable, not "no such game": say INTERNAL and
+		// log it, so neither the player nor on-call mistakes an outage for a
+		// missing game. Checked first: a failed stream read also reports !seated.
 		log.Printf("transport: RESYNC ended view of %s: %v", gameID, err)
 		s.send(ctx, c, errorMsg(codec.ECInternal, "could not read game state"))
+	case !seated || errors.Is(err, errNotEnded):
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, errNoSuchGame))
 	default:
 		s.send(ctx, c, endedStateMsg(gameID, snap, seat))
 		s.clearMissedEnd(uid, gameID)
