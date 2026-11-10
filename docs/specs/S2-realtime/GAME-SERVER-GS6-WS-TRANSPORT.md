@@ -177,16 +177,21 @@ reachable. Both answer with the existing v1.3 `STATE` (`status` ENDED,
 stream without a live session (no wire change):
 - **Missed ending, pushed on AUTHENTICATE.** A seat that did not get `GAME_END`
   live (offline, or its write refused) is recorded per user. Its next
-  `AUTHENTICATE` on this node pushes that ended `STATE` once. A seat that DID see
-  `GAME_END` is not pushed the ending again (it may already be seeking a new
-  game). Retention: 24 h, at most 100 000 records (oldest dropped first), expired
+  `AUTHENTICATE` on this node pushes that ended `STATE` once; a push that fails
+  (store error, refused write) is recorded again for the next `AUTHENTICATE`. A
+  seat whose `GAME_END` write was accepted is not pushed the ending again (it may
+  already be seeking a new game). Accepted means queued, not delivered: a
+  `GAME_END` queued to a half-open socket just before it drops is lost, which is
+  why the client RESYNCs its game after every reconnect (WEB-F01 §3.4). Retention: 24 h, at most 100 000 records (oldest dropped first), expired
   in insertion order. The record is node-local, like the reconnect index; a
   reconnect to another node gets no push but can still RESYNC.
 - **RESYNC{game_id} of an ended game** the user was seated in (checked against
-  the stream's `PlayerJoined`) returns the ended `STATE` at any time, with no
-  retention window: the stream is the record. A user who was not seated, and an
-  unknown game id, both get `ERROR{UNKNOWN_GAME}`, so RESYNC cannot probe other
-  players' games. After the push window, RESYNC is the way back.
+  the stream's `PlayerJoined`, before any engine replay) returns the ended
+  `STATE` at any time, with no retention window: the stream is the record. Every
+  RESYNC the caller may not see (a live game it is not seated in, an ended game
+  it did not play, an unknown id) gets the same `ERROR{UNKNOWN_GAME, "no such
+  game"}`, so RESYNC cannot tell other players' games apart. After the push
+  window, RESYNC is the way back, on any node.
 
 ### 3.5 Heartbeat, flag-forfeit & teardown
 

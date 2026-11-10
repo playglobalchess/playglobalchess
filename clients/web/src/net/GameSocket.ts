@@ -18,7 +18,7 @@
 // secondary on-demand path the UI layer drives.
 
 import { encode, decode } from "../codec/seam";
-import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
+import { ErrorCode, Status, type ClientMsg, type ServerMsg } from "../codec/messages";
 
 /** The minimal WebSocket surface GameSocket needs — real `WebSocket` satisfies it. */
 export interface SocketLike {
@@ -65,6 +65,13 @@ export class GameSocket {
   /** The SEEK to (re)send after auth, if we are seeking and not yet matched. */
   private pendingSeek: ClientMsg | null = null;
   private matched = false;
+  /** The game we are playing, from MATCHED / a live STATE; cleared when it ends.
+   * On every reconnect we RESYNC it (#102): the server pushes STATE only for a
+   * game still live on that node, or an ending it knows we missed, and a
+   * GAME_END queued to a half-open socket just before the drop is lost. RESYNC
+   * returns the live or ENDED state on any node, so the board never stays live
+   * for a game that is over. */
+  private liveGameId: string | null = null;
   private closedByUs = false;
   private attempt = 0;
   /** True between onopen and the next (re)open/close — gates direct sends. */
@@ -123,6 +130,10 @@ export class GameSocket {
       if (this.pendingSeek != null && !this.matched) {
         this.sendMsg(this.pendingSeek);
       }
+      // Ask for the game we were in: its live state, or how it ended (#102).
+      if (this.liveGameId != null) {
+        this.sendMsg({ Resync: { game_id: this.liveGameId } });
+      }
       // Flush anything requested before the socket was open (an eager
       // seek()/move() right after connect()), in order.
       const queued = this.outbox;
@@ -153,6 +164,11 @@ export class GameSocket {
       if ("Matched" in msg) {
         this.matched = true;
         this.pendingSeek = null; // matched — the seek is consumed (explicit invariant)
+        this.liveGameId = msg.Matched.game_id;
+      } else if ("State" in msg) {
+        this.liveGameId = msg.State.state.status === Status.Ended ? null : msg.State.game_id;
+      } else if ("GameEnd" in msg) {
+        this.liveGameId = null;
       }
       // §5: an UNSUPPORTED_VERSION error is unrecoverable — the client's protocol
       // major mismatches the server. Forward it (so the UI can show "please

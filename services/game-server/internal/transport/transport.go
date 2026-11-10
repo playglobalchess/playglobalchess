@@ -279,43 +279,43 @@ func (r *Registry) loadStream(ctx context.Context, gameID string) ([]game.Event,
 // errNotEnded is EndedView's answer for a game that exists but has not ended.
 var errNotEnded = errors.New("transport: game has not ended")
 
-// EndedView rebuilds an ENDED game's projection from the durable stream (#102),
-// without standing up a live session (no actor, no ticker, nothing to drop).
-// It also returns the user seated at each seat (from PlayerJoined), so the
-// caller can check who may see it. found is false if the stream is empty (no
-// such game); errNotEnded if the game is still running.
-func (r *Registry) EndedView(ctx context.Context, gameID string) (snap session.Snapshot, seats map[string]uint8, found bool, err error) {
+// EndedView rebuilds an ENDED game's projection, as seen by user uid, from the
+// durable stream (#102), without standing up a live session (no actor, no
+// ticker, nothing to drop). seated is false, with NO engine replay, if the game
+// does not exist or uid was not seated in it (PlayerJoined), so a RESYNC for
+// someone else's game id costs one stream read, not a fold. errNotEnded if the
+// game is still running.
+func (r *Registry) EndedView(ctx context.Context, gameID, uid string) (snap session.Snapshot, seat uint8, seated bool, err error) {
 	events, err := r.loadStream(ctx, gameID)
 	if err != nil {
-		return session.Snapshot{}, nil, false, err
+		return session.Snapshot{}, 0, false, err
 	}
-	if len(events) == 0 {
-		return session.Snapshot{}, nil, false, nil
-	}
-	seats = make(map[string]uint8, 2)
 	tcID := ""
 	for _, ev := range events {
 		switch {
 		case ev.GameCreated != nil:
 			tcID = ev.GameCreated.TimeControl
-		case ev.PlayerJoined != nil:
-			seats[ev.PlayerJoined.UserID] = ev.PlayerJoined.SeatIdx
+		case ev.PlayerJoined != nil && ev.PlayerJoined.UserID == uid:
+			seat, seated = ev.PlayerJoined.SeatIdx, true
 		}
+	}
+	if !seated {
+		return session.Snapshot{}, 0, false, nil
 	}
 	tc, err := r.resolver.Resolve(tcID)
 	if err != nil {
-		return session.Snapshot{}, nil, true, err
+		return session.Snapshot{}, seat, true, err
 	}
 	st, err := game.FoldWithEngine(ctx, events, game.FoldOptions{TimeControl: tc}, r.oracle)
 	if err != nil {
-		return session.Snapshot{}, nil, true, err
+		return session.Snapshot{}, seat, true, err
 	}
 	if st.Phase != game.PhaseEnded {
-		return session.Snapshot{}, seats, true, errNotEnded
+		return session.Snapshot{}, seat, true, errNotEnded
 	}
 	now := time.Now()
 	if r.now != nil {
 		now = r.now()
 	}
-	return session.SnapshotOf(st, now, tc), seats, true, nil
+	return session.SnapshotOf(st, now, tc), seat, true, nil
 }

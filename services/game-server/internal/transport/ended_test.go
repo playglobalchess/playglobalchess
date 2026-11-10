@@ -270,3 +270,33 @@ func TestMissedEnd_RecordIsBounded(t *testing.T) {
 		t.Fatalf("newest entry dropped: %v", got)
 	}
 }
+
+// refusingConn accepts reads like fakeConn but refuses every write, like a
+// connection whose pump has already closed.
+type refusingConn struct{ *fakeConn }
+
+func (refusingConn) Write(context.Context, []byte) error { return errConnClosed }
+
+// A missed-ending push that fails is recorded again, so the next AUTHENTICATE
+// retries it instead of losing the result for good (review finding).
+func TestMissedEnd_FailedPushIsRetried(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	disconnect(cb)
+	ca.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
+	ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+
+	// The first push goes to a connection that refuses the write.
+	h.srv.pushMissedEnds(ctx, refusingConn{newFakeConn()}, "bob")
+	if got := h.srv.takeMissedEnds("bob"); got[gameID] != seatB {
+		t.Fatalf("after a refused push, missed endings = %v, want %s at seat %d", got, gameID, seatB)
+	}
+	h.srv.recordMissedEnd("bob", gameID, seatB) // put it back for the real reconnect
+
+	cb2 := reconnect(t, h, ctx, "bob")
+	rv := make([]uint8, 2)
+	rv[seatA], rv[seatB] = uint8(game.ResultLoss), uint8(game.ResultWin)
+	wantEnded(t, cb2.waitForServer(t, codec.SMState, 2*time.Second), gameID, seatB, game.TermResign, rv)
+}

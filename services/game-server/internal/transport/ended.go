@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/session"
 )
 
 // Ended games after their live session is dropped (#102, GS6 §3.4).
@@ -119,48 +120,50 @@ func (s *Server) dropOldestMissedLocked() {
 	}
 }
 
-// endedState builds the STATE for an ended game as seen by youSeat, from the
-// durable stream. ok is false if the game is unknown or not ended.
-func (s *Server) endedState(ctx context.Context, gameID string, youSeat uint8) (codec.ServerMsg, bool) {
-	snap, _, found, err := s.reg.EndedView(ctx, gameID)
-	if !found || err != nil {
-		if err != nil && !errors.Is(err, errNotEnded) {
-			log.Printf("transport: ended view of %s: %v", gameID, err)
-		}
-		return codec.ServerMsg{}, false
-	}
+// endedStateMsg wraps an ended snapshot as the STATE frame for youSeat.
+func endedStateMsg(gameID string, snap session.Snapshot, youSeat uint8) codec.ServerMsg {
 	return codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
 		GameID: gameID, State: snapshotToStateBody(snap, youSeat),
-	}}, true
+	}}
 }
 
-// pushMissedEnds sends each of uid's missed endings once (on AUTHENTICATE).
+// pushMissedEnds sends each of uid's missed endings once (on AUTHENTICATE). An
+// ending whose push fails (a store error, or a write the connection refused)
+// is recorded again, so the next AUTHENTICATE retries it rather than losing it.
 func (s *Server) pushMissedEnds(ctx context.Context, c Conn, uid string) {
 	for gid, seat := range s.takeMissedEnds(uid) {
-		if msg, ok := s.endedState(ctx, gid, seat); ok {
-			s.send(ctx, c, msg)
+		snap, _, seated, err := s.reg.EndedView(ctx, gid, uid)
+		switch {
+		case errors.Is(err, errNotEnded) || (err == nil && !seated):
+			continue // cannot happen for a recorded ending; nothing to retry
+		case err != nil:
+			log.Printf("transport: missed-ending push of %s for %s: %v", gid, uid, err)
+			s.recordMissedEnd(uid, gid, seat)
+		case !s.send(ctx, c, endedStateMsg(gid, snap, seat)):
+			s.recordMissedEnd(uid, gid, seat)
 		}
 	}
 }
 
 // resyncEnded answers a RESYNC for a game that is not live on this node: an
 // ENDED STATE if the stream says the game ended and uid was seated in it, else
-// ERROR{UNKNOWN_GAME}. Not being seated and the game not existing get the same
-// error, so a RESYNC cannot probe other players' game ids.
+// ERROR{UNKNOWN_GAME} with the same message handleResync uses for a live game
+// the caller is not seated in, so a RESYNC cannot tell other players' games
+// (live, ended or unknown) apart.
 func (s *Server) resyncEnded(ctx context.Context, c Conn, uid, gameID string) {
-	snap, seats, found, err := s.reg.EndedView(ctx, gameID)
-	if err != nil && !errors.Is(err, errNotEnded) {
+	snap, seat, seated, err := s.reg.EndedView(ctx, gameID, uid)
+	switch {
+	case !seated || errors.Is(err, errNotEnded):
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, errNoSuchGame))
+	case err != nil:
 		log.Printf("transport: RESYNC ended view of %s: %v", gameID, err)
 		s.send(ctx, c, errorMsg(codec.ECInternal, "could not read game state"))
-		return
+	default:
+		s.send(ctx, c, endedStateMsg(gameID, snap, seat))
+		s.clearMissedEnd(uid, gameID)
 	}
-	seat, seated := seats[uid]
-	if !found || !seated || err != nil {
-		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "no such game"))
-		return
-	}
-	s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
-		GameID: gameID, State: snapshotToStateBody(snap, seat),
-	}})
-	s.clearMissedEnd(uid, gameID)
 }
+
+// errNoSuchGame is the one UNKNOWN_GAME message for every RESYNC the caller may
+// not see (not seated, not ended here, or no such game).
+const errNoSuchGame = "no such game"

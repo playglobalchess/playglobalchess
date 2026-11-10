@@ -452,7 +452,7 @@ func (s *Server) handleResync(ctx context.Context, c Conn, st *connState, gameID
 	}
 	seat, seated := s.seatOf(c, gameID)
 	if !seated {
-		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "not seated in this game"))
+		s.send(ctx, c, errorMsg(codec.ECUnknownGame, errNoSuchGame))
 		return true
 	}
 	snap, err := sess.StateSnapshot(ctx)
