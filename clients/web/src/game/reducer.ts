@@ -1,6 +1,6 @@
 // The pure game reducer — the correctness heart of the client. It is a pure
 // function (state, action) -> state with NO side effects (no socket, no DOM, no
-// time): the GameSocket feeds it decoded ServerMsg; the UI feeds it local move
+// clock read: the time an action happened arrives IN the action, as `at`): the GameSocket feeds it decoded ServerMsg; the UI feeds it local move
 // intents; React renders the result. Purity is what makes it exhaustively
 // unit-testable (SPEC-S4-WEB-F01 §6).
 //
@@ -34,6 +34,12 @@ export interface DrawOffer {
   by: number;
 }
 
+export interface ClockRun {
+  seat: number;
+  /** Local monotonic ms at which clocks[seat] was valid. */
+  since: number;
+}
+
 export interface GameState {
   phase: Phase;
   gameId: string | null;
@@ -42,10 +48,25 @@ export interface GameState {
   position: Position | null;
   /** Authoritative current ply (server). The next MOVE sends ply_expected = ply + 1. */
   ply: number;
-  /** Per-seat remaining clock ms (index = seat). */
+  /** Per-seat remaining clock ms (index = seat), as last set by the server (or
+   * frozen locally, see clockRun). For the running seat the value is valid at
+   * clockRun.since; use displayClocks() to read what to show now. */
   clocks: number[];
-  /** A move shown optimistically, awaiting the server's accept/reject. */
-  pendingMove: { uci: string; prevPosition: Position; prevPly: number } | null;
+  /** The clock that is running (#112): `seat` ticks down from clocks[seat],
+   * which was valid at local monotonic time `since` (ms, the action's `at`).
+   * null when no clock runs (before the server starts it, after our own move
+   * until it is accepted, and once the game is over). Display only: the server
+   * stays authoritative and the client never flags. */
+  clockRun: ClockRun | null;
+  /** A move shown optimistically, awaiting the server's accept/reject. Holds
+   * the clocks from before it, so a reject can restart our clock. */
+  pendingMove: {
+    uci: string;
+    prevPosition: Position;
+    prevPly: number;
+    prevClocks: number[];
+    prevClockRun: ClockRun | null;
+  } | null;
   /** A pending draw offer FROM the opponent (DRAW_OFFERED), awaiting our accept/decline. */
   drawOffer: DrawOffer | null;
   /** Our own draw offer is pending (GS-7 §6.4). */
@@ -83,6 +104,7 @@ export const initialState: GameState = {
   position: null,
   ply: 0,
   clocks: [],
+  clockRun: null,
   pendingMove: null,
   drawOffer: null,
   myDrawOffered: false,
@@ -106,8 +128,10 @@ export type Action =
   | { kind: "localDeclineDraw" }
   | { kind: "localRequestTakeback" }
   | { kind: "localDeclineTakeback" }
-  | { kind: "localMove"; uci: string } // user made a board move (optimistic)
-  | { kind: "server"; msg: ServerMsg }; // a decoded ServerMsg arrived
+  // `at` is the local monotonic time (ms) the action happened: the clock anchor
+  // (#112). Optional so callers that do not care about clocks can omit it (0).
+  | { kind: "localMove"; uci: string; at?: number } // user made a board move (optimistic)
+  | { kind: "server"; msg: ServerMsg; at?: number }; // a decoded ServerMsg arrived
 
 /** Pure reducer. */
 export function reduce(state: GameState, action: Action): GameState {
@@ -155,20 +179,47 @@ export function reduce(state: GameState, action: Action): GameState {
         // have produced it; never crash the reducer).
         return state;
       }
+      // Our clock stops the moment we move, as on chess.com (#112): freeze the
+      // shown value until MOVE_ACCEPTED sets the authoritative one.
       return {
         ...state,
         position: optimistic,
-        pendingMove: { uci: action.uci, prevPosition, prevPly },
+        clocks: displayClocks(state, action.at ?? 0),
+        clockRun: null,
+        pendingMove: {
+          uci: action.uci,
+          prevPosition,
+          prevPly,
+          prevClocks: state.clocks,
+          prevClockRun: state.clockRun,
+        },
         lastReject: null,
       };
     }
 
     case "server":
-      return reduceServer(state, action.msg);
+      return reduceServer(state, action.msg, action.at ?? 0);
   }
 }
 
-function reduceServer(state: GameState, msg: ServerMsg): GameState {
+/** The clocks to SHOW at local monotonic time `now`: the running seat's value
+ * minus the time since its anchor, clamped at 0. Display only (#112). */
+export function displayClocks(s: Pick<GameState, "clocks" | "clockRun">, now: number): number[] {
+  const out = s.clocks.slice();
+  const run = s.clockRun;
+  if (run != null && run.seat < out.length) {
+    out[run.seat] = Math.max(0, (out[run.seat] ?? 0) - Math.max(0, now - run.since));
+  }
+  return out;
+}
+
+/** The anchor a server body (MATCHED / STATE) gives: running_seat from `at`. */
+function runFromBody(b: StateBody, at: number): ClockRun | null {
+  if (b.running_seat === NO_SEAT || b.running_seat >= b.clocks.length) return null;
+  return { seat: b.running_seat, since: at };
+}
+
+function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
   const tag = serverTag(msg);
   switch (tag) {
     case "Matched": {
@@ -184,6 +235,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         // v1.3: the server's ply is in the body (no FEN inference).
         ply: m.start_state.ply,
         clocks: m.start_state.clocks.slice(),
+        clockRun: runFromBody(m.start_state, at),
       };
     }
 
@@ -210,6 +262,10 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         // and ask for a resync when we are behind (a gap), not on a stale replay.
         return {
           ...state,
+          // A moot optimistic move froze our clock; restart it from before.
+          ...(state.pendingMove != null
+            ? { clocks: state.pendingMove.prevClocks, clockRun: state.pendingMove.prevClockRun }
+            : {}),
           pendingMove: null,
           needsResync: a.ply > basePly + 1 ? true : state.needsResync,
         };
@@ -228,11 +284,16 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       // Mover seat from PLY PARITY (race-proof, independent of board state):
       // ply 1 = white's first move, so odd ply ⇒ white (seat 0) just moved.
       // Seat↔color: seat 0 = white, seat 1 = black (§4A.8 v1 2-seat).
-      const clocks = state.clocks.slice();
+      const clocks = (state.pendingMove != null ? state.pendingMove.prevClocks : state.clocks).slice();
       const moverSeat = a.ply % 2 === 1 ? 0 : 1;
       if (moverSeat < clocks.length) {
         clocks[moverSeat] = a.clock_after_ms;
       }
+      // The mover's clock stops; the other seat's starts now (#112). Not after
+      // the game is over (a GAME_END that overtook this frame, #92).
+      const nextSeat = (moverSeat + 1) % 2;
+      const clockRun: ClockRun | null =
+        state.phase === "playing" && nextSeat < clocks.length ? { seat: nextSeat, since: at } : null;
       // GS-7 §6.4: a NEW move by the opponent declines our pending prompts; a
       // new move by us declines theirs. (A duplicate MOVE_ACCEPTED, a re-ack,
       // returned above without clearing anything.)
@@ -242,6 +303,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         position,
         ply: a.ply,
         clocks,
+        clockRun,
         pendingMove: null,
         lastReject: null,
         lastMove: { uci: a.uci, moverSeat },
@@ -264,6 +326,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
           ...state,
           position: state.pendingMove.prevPosition,
           ply: state.pendingMove.prevPly,
+          // Our clock never stopped on the server: restart it from its anchor.
+          clocks: state.pendingMove.prevClocks,
+          clockRun: state.pendingMove.prevClockRun,
           pendingMove: null,
           lastReject: r.reason,
           needsResync: stale ? true : state.needsResync,
@@ -305,6 +370,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         // rejected StalePly forever. v1.3 STATE carries the server ply directly.
         ply: s.state.ply,
         clocks: s.state.clocks.slice(),
+        clockRun: ended ? null : runFromBody(b, at),
         pendingMove: null,
         needsResync: false,
         // A fresh authoritative STATE means the connection is healthy again.
@@ -338,6 +404,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       return {
         ...state,
         phase: "game_over",
+        // Freeze the shown clocks where they are; nothing runs any more.
+        clocks: displayClocks(state, at),
+        clockRun: null,
         pendingMove: null,
         drawOffer: null,
         myDrawOffered: false,

@@ -114,6 +114,19 @@ board + both clocks from `start_state`.
   REVERT the optimistic move and surface the reason. Legal-move highlighting uses
   the engine binding for UX only (NFR-5 — the server still validates).
 - Opponent `MOVE_ACCEPTED` (for the other seat) applies their move + clock.
+- **Clocks tick (#112).** The side to move's clock counts down locally from the
+  last server value; the server stays authoritative and the client never flags.
+  `MATCHED`/`STATE` start `running_seat`; `MOVE_ACCEPTED` sets the mover's
+  `clock_after_ms` and starts the other side; our own move stops our clock at
+  once (a reject restarts it from its anchor); `GAME_END` freezes both. The
+  anchor is the local monotonic time a frame ARRIVES, not `server_t`: the client
+  sends no `PING`, so it has no offset to map `server_t`, and `MOVE_ACCEPTED`
+  carries none. The display is therefore up to one network latency generous,
+  and every server frame corrects it. The clock keeps ticking while
+  disconnected, because the server keeps charging that time (GS6 §3.4); the
+  reconnect `STATE` resyncs it. The running clock is marked by a visible ▶ and
+  the text "running", each clock is labelled You / Opponent, and clocks are
+  `role="timer"` (not live regions); low-time warnings are #142.
 - `RESIGN`/`OFFER_DRAW` buttons send the client messages; a received
   `DRAW_OFFERED{by}` shows an accept/decline affordance (accept = send
   `OFFER_DRAW`, the mutual-offer agreement; decline = `DECLINE_DRAW`, §4A v1.3);
@@ -137,8 +150,8 @@ board + both clocks from `start_state`.
   labelled "Decline draw" and "Decline takeback", and both prompts are announced
   when both are pending.
 - On STATE the client clears the screen-reader `lastMove` instead of setting it
-  from `last_move_uci`, and does not yet store the clock anchor (see GS-7 §7.4
-  amendment; ticking clocks are #112).
+  from `last_move_uci` (GS-7 §7.4 amendment). It stores the clock anchor from
+  `running_seat`, anchored at arrival rather than `server_t` (§3.3, #112).
 
 ### 3.4 Reconnection
 
