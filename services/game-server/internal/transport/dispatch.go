@@ -56,6 +56,10 @@ type Server struct {
 	writeDeadline time.Duration
 	// pools is the SEEK allow-list: pool id -> its time-control id (#93).
 	pools PoolCatalog
+	// missedEnds: user -> game -> the seat that did not get GAME_END live, pushed
+	// on the next AUTHENTICATE (#102, ended.go). missedOrder is its expiry FIFO.
+	missedEnds  map[string]map[string]missedEnd
+	missedOrder []missedKey
 }
 
 type gameSeAT struct {
@@ -78,6 +82,7 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 		outboundQueue: defaultOutboundQueue,
 		writeDeadline: defaultWriteDeadline,
 		pools:         DefaultPools(),
+		missedEnds:    make(map[string]map[string]missedEnd),
 	}
 }
 
@@ -181,6 +186,8 @@ func (s *Server) resyncUser(ctx context.Context, c Conn, st *connState) {
 			GameID: gid, State: snapshotToStateBody(snap, seat),
 		}})
 	}
+	// Games that ended while this user was offline: their ended STATE, once (#102).
+	s.pushMissedEnds(ctx, c, st.userID)
 }
 
 // route dispatches one authenticated client message. Returns false only on a
@@ -225,7 +232,7 @@ func (s *Server) route(ctx context.Context, c Conn, st *connState, msg codec.Cli
 		}})
 		return true
 	case codec.CMResync:
-		return s.handleResync(ctx, c, msg.GameID)
+		return s.handleResync(ctx, c, st, msg.GameID)
 	default:
 		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "unknown message type"))
 		return true
@@ -297,11 +304,12 @@ func (s *Server) unbindAll(st *connState, c Conn) {
 	}
 }
 
-// send encodes and writes one authoritative server message. A write error is not
-// fatal to the server (the connection's Read loop will see the close); it is
-// swallowed here so one dead connection does not break a MATCHED fan-out to the
-// other seat.
-func (s *Server) send(ctx context.Context, c Conn, msg codec.ServerMsg) {
+// send encodes and writes one authoritative server message, reporting whether
+// the write was accepted (the connection's pump enqueued it). A write error is
+// not fatal to the server (the connection's Read loop will see the close), so
+// most callers ignore the result and one dead connection does not break a
+// fan-out to the other seat; broadcastGameEnd uses it to note a missed ending.
+func (s *Server) send(ctx context.Context, c Conn, msg codec.ServerMsg) bool {
 	frame, err := codec.EncodeServer(msg)
 	if err != nil {
 		// Encoding our OWN message failed — a server bug (an out-of-domain
@@ -309,9 +317,9 @@ func (s *Server) send(ctx context.Context, c Conn, msg codec.ServerMsg) {
 		// Do not loop; drop it, but LOG it: the client never gets this frame and
 		// would otherwise hang with nothing for on-call to find.
 		log.Printf("transport: dropped unencodable server message (type %d): %v", msg.Type, err)
-		return
+		return false
 	}
-	_ = c.Write(ctx, frame)
+	return c.Write(ctx, frame) == nil
 }
 
 // errorMsg builds an ERROR server message.

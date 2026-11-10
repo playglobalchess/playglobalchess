@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/clock"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 )
 
@@ -34,14 +35,20 @@ type Snapshot struct {
 
 // snapshot reads s.st at the session clock's now. Actor goroutine only.
 func (s *Session) snapshot() Snapshot {
-	st := s.st
-	now := s.now()
+	return SnapshotOf(s.st, s.now(), s.opts.TimeControl)
+}
+
+// SnapshotOf projects a folded state at `now`. It is the one projection the
+// live session and the transport's ended-game view (#102, which folds the
+// durable stream without standing up a session) both use, so a STATE for an
+// ended game is built exactly like a live one.
+func SnapshotOf(st game.State, now time.Time, tc clock.TimeControl) Snapshot {
 	snap := Snapshot{
 		FEN:             st.CurFEN,
 		Ply:             st.Ply,
 		Turn:            st.TurnIdx,
 		Phase:           st.Phase,
-		RemainingMs:     st.ClocksAt(uint64(now.UnixMilli()), s.opts.TimeControl),
+		RemainingMs:     st.ClocksAt(uint64(now.UnixMilli()), tc),
 		Ended:           st.Phase == game.PhaseEnded,
 		Terminal:        st.Termination,
 		LastMoveUCI:     st.LastMoveUCI(),

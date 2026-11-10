@@ -275,3 +275,47 @@ func (r *Registry) CloseAll() {
 func (r *Registry) loadStream(ctx context.Context, gameID string) ([]game.Event, error) {
 	return r.store.Load(ctx, game.StreamIDFor(gameID))
 }
+
+// errNotEnded is EndedView's answer for a game that exists but has not ended.
+var errNotEnded = errors.New("transport: game has not ended")
+
+// EndedView rebuilds an ENDED game's projection, as seen by user uid, from the
+// durable stream (#102), without standing up a live session (no actor, no
+// ticker, nothing to drop). seated is false, with NO engine replay, if the game
+// does not exist or uid was not seated in it (PlayerJoined), so a RESYNC for
+// someone else's game id costs one stream read, not a fold. errNotEnded if the
+// game is still running.
+func (r *Registry) EndedView(ctx context.Context, gameID, uid string) (snap session.Snapshot, seat uint8, seated bool, err error) {
+	events, err := r.loadStream(ctx, gameID)
+	if err != nil {
+		return session.Snapshot{}, 0, false, err
+	}
+	tcID := ""
+	for _, ev := range events {
+		switch {
+		case ev.GameCreated != nil:
+			tcID = ev.GameCreated.TimeControl
+		case ev.PlayerJoined != nil && ev.PlayerJoined.UserID == uid:
+			seat, seated = ev.PlayerJoined.SeatIdx, true
+		}
+	}
+	if !seated {
+		return session.Snapshot{}, 0, false, nil
+	}
+	tc, err := r.resolver.Resolve(tcID)
+	if err != nil {
+		return session.Snapshot{}, seat, true, err
+	}
+	st, err := game.FoldWithEngine(ctx, events, game.FoldOptions{TimeControl: tc}, r.oracle)
+	if err != nil {
+		return session.Snapshot{}, seat, true, err
+	}
+	if st.Phase != game.PhaseEnded {
+		return session.Snapshot{}, seat, true, errNotEnded
+	}
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	return session.SnapshotOf(st, now, tc), seat, true, nil
+}

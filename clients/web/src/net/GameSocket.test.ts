@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { GameSocket, type SocketLike } from "./GameSocket";
 import { encodeServerFrame, decodeClientFrame } from "../codec/seam";
-import type { ClientMsg, ServerMsg } from "../codec/messages";
+import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
 import { sb } from "../test/stateBody";
 
 // A fake WebSocket that captures outgoing frames and lets the test feed incoming
@@ -178,12 +178,70 @@ describe("GameSocket (fake socket, real codec)", () => {
     return new Promise<void>((resolve) => {
       setTimeout(() => {
         fakes[1]!.open();
-        // Frame 0 = AUTHENTICATE; there must be NO second (SEEK) frame — we are matched,
-        // the server auto-pushes STATE on re-auth (Option A).
-        expect(fakes[1]!.sent.length).toBe(1);
+        // Frame 0 = AUTHENTICATE, and there must be NO SEEK — we are matched. The
+        // only other frame is the RESYNC for the game we were in (#102).
+        const sent = fakes[1]!.sent.map((_, i) => fakes[1]!.decodeSent(i));
+        expect("Authenticate" in sent[0]!).toBe(true);
+        expect(sent.some((m) => "Seek" in m)).toBe(false);
         resolve();
       }, 10);
     });
+  });
+
+  /** A socket with a 1 ms reconnect backoff; the reconnect then runs on a timer. */
+  function quickSock(): GameSocket {
+    return new GameSocket({
+      url: "ws://test", token: "t", onServerMsg: (m) => received.push(m),
+      factory: () => { const f = new FakeSocket(); fakes.push(f); return f; },
+      backoffMs: 1,
+    });
+  }
+  /** Frames the client sent on the reconnected socket, after the reconnect timer. */
+  function afterReconnect(): Promise<ClientMsg[]> {
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        fakes[1]!.open();
+        resolve(fakes[1]!.sent.map((_, i) => fakes[1]!.decodeSent(i)));
+      }, 10);
+    });
+  }
+
+  it("on reconnect mid-game, sends RESYNC for the game after AUTHENTICATE (#102)", async () => {
+    sock = quickSock();
+    sock.connect();
+    fakes[0]!.open();
+    fakes[0]!.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [300000, 300000]) } });
+    fakes[0]!.onclose?.();
+    const sent = await afterReconnect();
+    expect("Authenticate" in sent[0]!).toBe(true);
+    expect(sent.some((m) => "Resync" in m && m.Resync.game_id === GID)).toBe(true);
+  });
+
+  it("an UNKNOWN_GAME answer to the reconnect RESYNC is not shown; later errors are", async () => {
+    sock = quickSock();
+    sock.connect();
+    fakes[0]!.open();
+    fakes[0]!.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [300000, 300000]) } });
+    fakes[0]!.onclose?.();
+    await afterReconnect();
+    received.length = 0;
+    // The game is live on another node: the RESYNC is answered UNKNOWN_GAME.
+    fakes[1]!.feed({ Error: { code: ErrorCode.UnknownGame, msg: "no such game" } });
+    expect(received).toEqual([]);
+    // Only that one answer is swallowed: a later error still reaches the UI.
+    fakes[1]!.feed({ Error: { code: ErrorCode.UnknownGame, msg: "no such game" } });
+    expect(received.length).toBe(1);
+  });
+
+  it("does NOT RESYNC on reconnect once the game has ended", async () => {
+    sock = quickSock();
+    sock.connect();
+    fakes[0]!.open();
+    fakes[0]!.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [300000, 300000]) } });
+    fakes[0]!.feed({ GameEnd: { game_id: GID, result_vector: [2, 0], termination: 0x02, rating_delta: [] } });
+    fakes[0]!.onclose?.();
+    const sent = await afterReconnect();
+    expect(sent.some((m) => "Resync" in m)).toBe(false);
   });
 
   it("close() is deliberate — no reconnect", () => {
