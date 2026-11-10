@@ -171,8 +171,8 @@ func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error)
 	seats := []game.Seat{{SeatIdx: 0, Color: 0}, {SeatIdx: 1, Color: 1}}
 	players := map[uint8]string{0: whiteSeeker.UserID, 1: blackSeeker.UserID}
 
-	// Both seekers share a pool, so pool_id/rated/time_control are consistent;
-	// use the new seeker's (a) as the authority.
+	// bestMatch pairs only identical pool_id/rated/time_control (#93), so the
+	// new seeker's (a) values are both seekers' values.
 	opening := []game.Event{
 		{Type: game.EvGameCreated, GameCreated: &game.GameCreated{
 			PoolID: a.PoolID, Rated: a.Rated, Seats: seats,

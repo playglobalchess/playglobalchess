@@ -54,6 +54,8 @@ type Server struct {
 	// write deadline. Past either, the connection is closed.
 	outboundQueue int
 	writeDeadline time.Duration
+	// pools is the SEEK allow-list: pool id -> its time-control id (#93).
+	pools PoolCatalog
 }
 
 type gameSeAT struct {
@@ -75,6 +77,7 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 		endBroadcast:  make(map[string]bool),
 		outboundQueue: defaultOutboundQueue,
 		writeDeadline: defaultWriteDeadline,
+		pools:         DefaultPools(),
 	}
 }
 

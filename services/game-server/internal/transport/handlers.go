@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
@@ -28,10 +29,32 @@ func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec
 		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "empty SEEK"))
 		return true
 	}
+	// The pool decides the clock, not the client (#93): refuse an unknown pool or
+	// a time_control other than the pool's, and check the control resolves,
+	// all BEFORE enqueue, so a bad value can never create a durable game.
+	tcID, known := s.pools[p.PoolID]
+	if !known {
+		log.Printf("transport: SEEK refused for user %s: unknown pool %q", st.userID, p.PoolID)
+		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "unknown pool"))
+		return true
+	}
+	if p.TimeControl != tcID {
+		log.Printf("transport: SEEK refused for user %s: time_control %q does not match pool %q (%q)", st.userID, p.TimeControl, p.PoolID, tcID)
+		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "time_control does not match the pool"))
+		return true
+	}
+	if _, err := s.reg.resolver.Resolve(tcID); err != nil {
+		// The client sent exactly the pool's control, so a catalogue entry the
+		// resolver rejects is a SERVER misconfiguration, not a client error:
+		// INTERNAL to the client, and a log line for on-call.
+		log.Printf("transport: pool catalogue misconfigured: pool %q time control %q: %v", p.PoolID, tcID, err)
+		s.send(ctx, c, errorMsg(codec.ECInternal, "pool time control is invalid"))
+		return true
+	}
 	seeker := matchmaking.Seeker{
 		UserID:      st.userID,
 		PoolID:      p.PoolID,
-		TimeControl: p.TimeControl,
+		TimeControl: tcID,
 		Rated:       p.Rated,
 	}
 	match, paired, err := s.mm.Seek(ctx, seeker)

@@ -195,6 +195,7 @@ func (p *fakePool) Cancel(_ context.Context, _, id string) error {
 // --- test harness -----------------------------------------------------------
 
 type harness struct {
+	pool   *fakePool
 	srv    *Server
 	store  game.EventStore
 	cancel context.CancelFunc
@@ -237,14 +238,17 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("engine.New: %v", err)
 	}
 	store := game.NewMemStore()
-	mm := matchmaking.New(newFakePool(), store, nil)
+	fp := newFakePool()
+	mm := matchmaking.New(fp, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	reg := NewRegistry(ctx, store, o, ConventionResolver{})
 	srv := NewServer(DevAuthenticator{}, mm, reg)
+	// Test pools: "blitz" (authAndSeek) and "tiny" (seekTC, an 80 ms clock).
+	srv.pools = PoolCatalog{"blitz": "blitz-5+3", "tiny": "custom-80+0"}
 	clk := &fakeClock{t: time.UnixMilli(1_728_000_000_000)}
 	reg.now = clk.now
 	srv.now = clk.now
-	return &harness{srv: srv, store: store, cancel: cancel, clk: clk}
+	return &harness{srv: srv, store: store, pool: fp, cancel: cancel, clk: clk}
 }
 
 func (h *harness) handle(ctx context.Context, c *fakeConn) {

@@ -1,6 +1,7 @@
 package matchmaking
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -75,8 +76,8 @@ func TestBestMatch_TieBreakOldestThenID(t *testing.T) {
 		t.Fatalf("tie-break: matched %q, want older", got.SeekID)
 	}
 	// Exactly equal rating AND age → lowest SeekID wins (deterministic).
-	eqA := Seeker{SeekID: "a", PoolID: "blitz-5+3", Rating: 1480, Rated: true, EnqueuedAt: now.Add(-5 * time.Second)}
-	eqB := Seeker{SeekID: "b", PoolID: "blitz-5+3", Rating: 1480, Rated: true, EnqueuedAt: now.Add(-5 * time.Second)}
+	eqA := Seeker{SeekID: "a", PoolID: "blitz-5+3", TimeControl: "blitz-5+3", Rating: 1480, Rated: true, EnqueuedAt: now.Add(-5 * time.Second)}
+	eqB := Seeker{SeekID: "b", PoolID: "blitz-5+3", TimeControl: "blitz-5+3", Rating: 1480, Rated: true, EnqueuedAt: now.Add(-5 * time.Second)}
 	got2, _ := bestMatch(newS, []Seeker{eqB, eqA}, DefaultWindow, now)
 	if got2.SeekID != "a" {
 		t.Fatalf("full-tie: matched %q, want a (lowest SeekID)", got2.SeekID)
@@ -88,5 +89,35 @@ func TestSeedRatingSource(t *testing.T) {
 	r, err := rs.RatingFor(nil, "u", "p")
 	if err != nil || r != 1500 {
 		t.Fatalf("seed rating = %d, %v; want 1500, nil", r, err)
+	}
+}
+
+// #93: a candidate with a different time control never pairs, even in the same
+// pool and at the closest rating (second line of defence behind the transport's
+// pool catalogue).
+func TestBestMatch_TimeControlMustMatch(t *testing.T) {
+	newS := sk("new", 1500, 0, true)
+	odd := sk("odd", 1500, 0, true)
+	odd.TimeControl = "custom-1+0"
+	got, ok := bestMatch(newS, []Seeker{odd, sk("same", 1550, 0, true)}, DefaultWindow, now)
+	if !ok || got.SeekID != "same" {
+		t.Fatalf("matched %+v ok=%v, want same (the only same-clock candidate)", got, ok)
+	}
+	if _, ok := bestMatch(newS, []Seeker{odd}, DefaultWindow, now); ok {
+		t.Fatal("paired across different time controls")
+	}
+}
+
+// The in-memory pool applies the same rule.
+func TestMemoryPool_TimeControlMustMatch(t *testing.T) {
+	p := NewMemoryPool()
+	ctx := context.Background()
+	odd := sk("odd", 1500, 0, true)
+	odd.TimeControl = "custom-1+0"
+	if err := p.Enqueue(ctx, odd); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := p.TryClaim(ctx, sk("new", 1500, 0, true), DefaultWindow, now); ok {
+		t.Fatal("MemoryPool paired across different time controls")
 	}
 }
