@@ -110,9 +110,12 @@ a 5 s write deadline. A slow consumer is disconnected, not waited on: a full
 queue, or a write that fails or passes its deadline, closes the connection. The
 game keeps running under the clock and the player reconnects (STATE resyncs), so
 a peer that stops reading can never stall the opponent's handler or the flag
-ticker. On `Handle` return the queue is flushed (the whole flush under one
-deadline) before the close, so a final frame such as the auth-failure `ERROR`
-still reaches the client.
+ticker. Closing never blocks the caller: the connection is marked closed at
+once and the socket's closing handshake runs on its own goroutine. On `Handle`
+return the queue is flushed before the close, so a final frame such as the
+auth-failure `ERROR` still reaches the client; the frame in flight keeps its own
+deadline and the rest of the flush shares one, so a stalled peer's teardown
+takes at most two deadlines.
 
 ### 3.2 Dispatch & matchmaking
 

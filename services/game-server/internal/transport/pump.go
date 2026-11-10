@@ -83,28 +83,48 @@ func (p *pumpedConn) Write(_ context.Context, frame []byte) error {
 	}
 }
 
-// Close stops the writer and closes the underlying connection. Idempotent.
+// Close marks the connection closed at once (later Writes are refused, the
+// writer stops) and closes the underlying socket on its own goroutine. The
+// socket close can block for seconds (coder/websocket's closing handshake waits
+// for the write lock and the peer's close frame), and Close is reached from
+// Write's overflow path, i.e. on the OPPONENT's handler or the flag ticker, so
+// it must not wait for it. Idempotent; it never blocks.
 func (p *pumpedConn) Close() error {
-	var err error
 	p.once.Do(func() {
 		close(p.done)
-		err = p.Conn.Close()
+		go func() { _ = p.Conn.Close() }()
 	})
-	return err
+	return nil
 }
 
 // CloseAfterFlush closes the connection once the frames already queued are
-// written (the whole flush under one deadline). Handle uses it on return, so a final
-// frame (the ERROR before an auth-failure close) still reaches the client.
-// Frames written after it are refused. Idempotent; it does not block.
+// written. Handle uses it on return, so a final frame (the ERROR before an
+// auth-failure close) still reaches the client. Frames written after it are
+// refused. Bounded: the frame in flight when it is called keeps its own
+// deadline, and the rest of the flush shares ONE deadline, so teardown of a
+// stalled peer takes at most two deadlines. Idempotent; it does not block.
 func (p *pumpedConn) CloseAfterFlush() {
 	p.drainOnce.Do(func() { close(p.drain) })
 }
 
 func (p *pumpedConn) writer() {
 	for {
+		// Check drain FIRST: once CloseAfterFlush is called, no further frame may
+		// be taken on the per-frame path (a select over both ready channels picks
+		// at random, which would leave the flush unbounded).
 		select {
 		case <-p.done:
+			return
+		case <-p.drain:
+			p.flush()
+			return
+		default:
+		}
+		select {
+		case <-p.done:
+			return
+		case <-p.drain:
+			p.flush()
 			return
 		case frame := <-p.queue:
 			ctx, cancel := context.WithTimeout(context.Background(), p.deadline)
@@ -113,21 +133,23 @@ func (p *pumpedConn) writer() {
 			if !ok {
 				return
 			}
-		case <-p.drain:
-			// One deadline bounds the whole flush, not each frame.
-			ctx, cancel := context.WithTimeout(context.Background(), p.deadline)
-			defer cancel()
-			for {
-				select {
-				case frame := <-p.queue:
-					if !p.write(ctx, frame) {
-						return
-					}
-				default:
-					_ = p.Close()
-					return
-				}
+		}
+	}
+}
+
+// flush writes the frames still queued under ONE shared deadline, then closes.
+func (p *pumpedConn) flush() {
+	ctx, cancel := context.WithTimeout(context.Background(), p.deadline)
+	defer cancel()
+	for {
+		select {
+		case frame := <-p.queue:
+			if !p.write(ctx, frame) {
+				return
 			}
+		default:
+			_ = p.Close()
+			return
 		}
 	}
 }

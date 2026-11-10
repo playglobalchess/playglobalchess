@@ -73,9 +73,7 @@ func TestPump_QueueOverflowClosesWithoutBlocking(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("writes blocked for %v", d)
 	}
-	if !f.isClosed() {
-		t.Fatal("connection not closed on overflow")
-	}
+	waitUntil(t, time.Second, "close on overflow", f.isClosed)
 	if err := p.Write(context.Background(), []byte{0}); !errors.Is(err, errConnClosed) {
 		t.Fatalf("write after close = %v, want errConnClosed", err)
 	}
@@ -113,16 +111,78 @@ func TestPump_CloseAfterFlushDeliversQueued(t *testing.T) {
 	}
 }
 
-// The flush is bounded by one deadline even if the peer never reads.
-func TestPump_CloseAfterFlushBoundedForStalledPeer(t *testing.T) {
-	f := newFakeConn()
-	f.stall.Store(true)
-	p := newPumpedConn(f, 8, 50*time.Millisecond)
-	for i := 0; i < 8; i++ {
+// slowConn writes each frame after a fixed delay (a slow but live peer),
+// honouring the write's ctx.
+type slowConn struct {
+	*fakeConn
+	delay time.Duration
+}
+
+func (s *slowConn) Write(ctx context.Context, frame []byte) error {
+	select {
+	case <-time.After(s.delay):
+		return s.fakeConn.Write(ctx, frame)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// The flush after CloseAfterFlush shares ONE deadline: a slow peer whose every
+// frame fits the per-frame deadline is still cut off once the flush deadline
+// passes, instead of being given a deadline per queued frame.
+func TestPump_CloseAfterFlushSharesOneDeadline(t *testing.T) {
+	f := &slowConn{fakeConn: newFakeConn(), delay: 30 * time.Millisecond}
+	p := newPumpedConn(f, 16, 50*time.Millisecond) // each frame fits; 16 do not
+	for i := 0; i < 16; i++ {
 		_ = p.Write(context.Background(), []byte{byte(i)})
 	}
 	p.CloseAfterFlush()
-	waitUntil(t, 500*time.Millisecond, "bounded close of a stalled peer", f.isClosed)
+	start := time.Now()
+	waitUntil(t, 2*time.Second, "close after the flush deadline", f.isClosed)
+	// Per-frame deadlines would write all 16 (~480 ms); one shared deadline
+	// stops it after the in-flight frame plus about one more.
+	if n := f.outLen(); n >= 16 {
+		t.Fatalf("flushed all %d frames in %v: the flush is not bounded by one deadline", n, time.Since(start))
+	}
+}
+
+// blockingCloseConn's Close blocks, like coder/websocket's closing handshake
+// with a peer that does not answer.
+type blockingCloseConn struct {
+	*fakeConn
+	release chan struct{}
+}
+
+func (b *blockingCloseConn) Close() error {
+	<-b.release
+	return b.fakeConn.Close()
+}
+
+// The overflow path runs on the WRITER's caller (the opponent's handler or the
+// flag ticker), so it must not wait for the socket close.
+func TestPump_OverflowDoesNotWaitForSocketClose(t *testing.T) {
+	f := &blockingCloseConn{fakeConn: newFakeConn(), release: make(chan struct{})}
+	defer close(f.release)
+	f.stall.Store(true)
+	p := newPumpedConn(f, 2, time.Hour)
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		for i := 0; i < 10 && err == nil; i++ {
+			err = p.Write(context.Background(), []byte{byte(i)})
+		}
+		// A second Close (e.g. Handle teardown) must not wait either.
+		_ = p.Close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errSlowConsumer) {
+			t.Fatalf("err = %v, want errSlowConsumer", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write blocked on the socket close")
+	}
 }
 
 // Handle's final frame (ERROR before an auth-failure close) still reaches the
