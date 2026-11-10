@@ -223,3 +223,35 @@ var errForced = &forcedErr{}
 type forcedErr struct{}
 
 func (*forcedErr) Error() string { return "forced append failure" }
+
+// #90 contract on MemoryPool: a claimer that is no longer waiting (withdrawn,
+// or already matched and removed, since its Enqueue) must not pair.
+func TestMemoryPool_ClaimerMustStillBeWaiting(t *testing.T) {
+	p := NewMemoryPool()
+	ctx := context.Background()
+	partner := Seeker{SeekID: "mp", UserID: "partner", PoolID: "blitz-5+3", TimeControl: "blitz-5+3"}
+	claimer := Seeker{SeekID: "mc", UserID: "claimer", PoolID: "blitz-5+3", TimeControl: "blitz-5+3"}
+	if err := p.Enqueue(ctx, partner); err != nil {
+		t.Fatal(err)
+	}
+	// Never enqueued (or removed): refused, and the partner stays claimable.
+	if _, ok, _ := p.TryClaim(ctx, claimer, DefaultWindow, time.Now()); ok {
+		t.Fatal("a claimer that is not waiting paired")
+	}
+	if err := p.Enqueue(ctx, claimer); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Remove(ctx, claimer.PoolID, claimer.SeekID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := p.TryClaim(ctx, claimer, DefaultWindow, time.Now()); ok {
+		t.Fatal("a removed claimer paired")
+	}
+	// Waiting again: pairs with the partner.
+	if err := p.Enqueue(ctx, claimer); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, _ := p.TryClaim(ctx, claimer, DefaultWindow, time.Now()); !ok || got.SeekID != "mp" {
+		t.Fatalf("claim = %+v ok=%v, want the partner", got, ok)
+	}
+}

@@ -69,10 +69,13 @@ func TestRedis_EnqueueAndClaim(t *testing.T) {
 	}
 }
 
-// THE concurrency guarantee: two seekers race to claim the SAME single waiting
-// partner; exactly one may win (no double-match). This is what the Lua
-// compare-and-set exists for.
-func TestRedis_ConcurrentClaimExactlyOneWins(t *testing.T) {
+// THE concurrency guarantee: two newcomers race while one partner waits. All
+// three are enqueued (Seek's contract), so the newcomers may also pair with each
+// other; what must hold is that no seeker is in two pairs (no double-match) and
+// that some pair forms (no lost match). It no longer asserts a single winner:
+// n1+n2 pairing while the partner keeps waiting is a correct outcome. This is
+// what the Lua compare-and-set exists for.
+func TestRedis_ConcurrentClaimNoDoubleMatch(t *testing.T) {
 	p := redisPool(t)
 	ctx := context.Background()
 	pool := "it-race-" + t.Name()
