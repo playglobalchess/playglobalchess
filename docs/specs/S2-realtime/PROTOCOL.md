@@ -6,7 +6,7 @@
 | Owner | S2 Real-time (stream lead — fill in); co-reviewed by S3 Platform + PE Platform-Eng + Architecture group |
 | Status | RATIFIED |
 | Version | 1.3 (wire) |
-| Last updated | 2026-11-10 (§4A v1.3 per ADR-19 folded in: new codes, event types, §4A.10 status and the v1.3 STATE body. The v1.3 §5 behaviour rows fold in with the GS-7 server reducer; see PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md §7.) |
+| Last updated | 2026-11-10 (§4A v1.3 per ADR-19 fully folded in: codes, event types, §4A.10 status, the v1.3 STATE body, and the §5 behaviour rows now that the GS-7 server reducer implements them.) |
 | Implements (master IDs) | X-2, X-13, ADR-10, NFR-5, NFR-7, NFR-10; MASTER §VIII (VIII.1–VIII.4), §IX.1 |
 | Depends on | SPEC-S1-ENGINE-CORE (G-A, GREEN) — the server validates intents via the engine |
 | Gates it feeds | **G-D** (API/protocol contract frozen v1). Per owner decision Q-P1=(b), G-D is green only when **this spec AND `PE/API-CONTRACT.md` (REST surface, X-13) are frozen together** — this is the realtime half of the v1 surface, not the whole gate. |
@@ -306,7 +306,11 @@ All enum spaces leave unused codes reserved for v1-additive events/variants (§5
 | **Illegal move** | Engine rejects → `MOVE_REJECTED {reason=ILLEGAL}`. No event appended. |
 | **Move arrives after game ended** | `MOVE_REJECTED {reason=GAME_OVER}`. |
 | **Reconnect** | Client re-auths; the server pushes `S STATE` (§4A.6: seat, ply, status, result, last move, pending draw, clock anchor) for the user's live game after `AUTHENTICATE` (NFR-2 no game loss). A client can also ask with `C RESYNC` (v1.1). STATE is a fold of the event stream, authoritative. |
-| **Duplicate MOVE (client retry)** | Idempotent on `(game_id, ply_expected)`: if that ply is already persisted, re-send `MOVE_ACCEPTED` for it (echoing the persisted `uci`, v1.2) rather than appending a second event. (Protects the NFR-7 persist-before-ack window on a flaky socket.) |
+| **Duplicate MOVE** (v1.3) | After a takeback a ply number can recur, so `(game_id, ply_expected)` alone no longer identifies a move. For `1 <= ply_expected <= ply`: same seat and same `uci` as the move live at that ply → re-send `MOVE_ACCEPTED` to the sender only (and `GAME_END` again if that move ended the game); same seat, different `uci` → `MOVE_REJECTED{STALE_PLY}`; different seat → `NOT_YOUR_SEAT`. This applies even after the game ended (v1.2 answered `GAME_OVER`). |
+| **Takeback request / accept / decline** (v1.3) | `TAKEBACK` requests; it needs a live unrated 2-seat game with both seats moved and nothing pending, and the server pushes `TAKEBACK_OFFERED` to the opponent. `TAKEBACK_ACCEPT{at_ply}` rewinds and the server pushes `STATE` to both seats; `TAKEBACK_DECLINE{at_ply}` (decline, or cancel by the proposer) pushes `TAKEBACK_DECLINED` to the other seat. An accept or decline that matches no pending request changes nothing and the server pushes `STATE` to the sender (no `ERROR`). The responder's move declines a pending request. Rated game or seat count ≠ 2 → `ERROR{PROTOCOL_VIOLATION}`. |
+| **Draw offer / decline** (v1.3) | An `OFFER_DRAW` while the other seat's offer is pending is the acceptance. A new offer needs ply ≥ 2 and none by the same seat in the last 20 plies; otherwise nothing changes and the server pushes `STATE` to the sender. `DECLINE_DRAW` (decline, or withdraw by the offerer) pushes `DRAW_DECLINED` to the other seat; with nothing pending the server pushes `STATE`. Only the responder's move declines a pending offer. |
+| **Client must not retransmit MOVE** (v1.3) | A client MUST NOT resend a `MOVE` frame it has already sent; a lost ack is recovered with `RESYNC`/`STATE`. |
+| **Undecodable server frame at a client** (v1.3) | A client MUST drop and log any server frame it cannot decode (unknown type, wrong direction, malformed) and keep the connection. Only `ERROR{UNSUPPORTED_VERSION}` is fatal. This does not make changes to existing frames safe, so v1.3 server and clients ship together. |
 | **Unknown/zero `game_id`** | `ERROR {code=UNKNOWN_GAME}`. |
 | **Unsupported protocol version** | `ERROR {code=UNSUPPORTED_VERSION}`, socket closed. |
 | **Wrong-direction / malformed frame** | `ERROR {code=PROTOCOL_VIOLATION}`. |
@@ -374,7 +378,7 @@ Owner directive (2026-10-12): **correctness and highest quality over speed.** Th
 | 1.1 | 2026-10-16 | `C RESYNC 0x0A`, `S DRAW_OFFERED 0x87` (additive) | ADR-17; slice `PROTOCOL-V1.1-RESYNC-DRAWOFFERED.md`, merged #56 |
 | 1.2 | 2026-10-16 | `MOVE_ACCEPTED` gains `uci` and goes to both seats (mutates a frozen frame) | ADR-18; slice `PROTOCOL-V1.2-MOVEACCEPTED-UCI.md`, merged #61 |
 | text | 2026-11-09 | v1.1/v1.2 folded into this document; §4A physical encoding corrected to postcard; stale Q-P2/ADR-14 PROPOSED text removed (#106). No wire change. | none (doc correction) |
-| 1.3 | 2026-11-10 | Takeback accept/decline, draw decline, five new events, §4A.10 status, v1.3 STATE body (mutates `0x81` and `0x84`). Wire and tables folded in; the §5 behaviour rows fold in with the GS-7 reducer. | ADR-19; slice `PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md` |
+| 1.3 | 2026-11-10 | Takeback accept/decline, draw decline, five new events, §4A.10 status, v1.3 STATE body (mutates `0x81` and `0x84`), duplicate-MOVE rule with recurring plies, two client rules. Wire and tables folded in with the codec (#161); §5 rows with the GS-7 reducer. | ADR-19; slice `PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md` |
 
 The major `ver` byte stays `0x01` for v1.x. Version numbers here are document versions of the v1 wire.
 

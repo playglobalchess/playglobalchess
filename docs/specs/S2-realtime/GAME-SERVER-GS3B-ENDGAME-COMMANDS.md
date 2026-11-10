@@ -10,6 +10,14 @@
 | Implements (master IDs) | X-2, F-01 (the non-move game-ending actions), NFR-5 (session owns game truth; no chess logic in the transport), NFR-7 (persist-before-ack — the ending event is durable before the session reports ended) |
 | Depends on | GS-3 (the live `Session` actor + command pattern), GS-4 (durable store + atomic `appendBatchAtHead`), the §4A event model (`EvResigned`/`EvAborted`/`EvDrawOffered`/`EvDrawAccepted` already defined). All merged. |
 | Gates it feeds | None directly. Completes the F-01 game-ending action set so GS-6 (the WS transport) can route the full client message surface to real session commands rather than returning `ERROR`. Makes no lettered gate green. |
+| Amended by | **SPEC-S2-GAME-SERVER-GS7** (RATIFIED 2026-11-09, implemented 2026-11-10). GS-7 supersedes this slice where they differ; read GS-7 §5–§6 first. |
+
+> **Superseded parts (GS-7).** Kept below for history; GS-7 governs:
+> - **Q-EG5 reversed.** A mutual agreement is `DrawOffered{a} [MovePlayed by a] DrawAccepted{b} GameEnded{DRAW_AGREE}`. The second seat's `OFFER_DRAW` IS the acceptance; no extra `DrawOffered{b}` is written. The old shape is what made the stream unfoldable (#85).
+> - **Q-EG2 reversed.** A pending draw offer is part of the folded state and is rebuilt from the stream (#159). Only the RESPONDER's move declines it; the offerer's own move leaves it standing.
+> - **§3.3 rules changed.** An offer needs ply ≥ 2 and none by the same seat in the last 20 plies; `DECLINE_DRAW` (new) declines or withdraws; a takeback rewind clears a pending offer.
+> - **§6 test plan.** The mutual-offer stream-shape test now expects the GS-7 shape above.
+> - **Takeback** (only touched here as the `Takeback` command) is now propose/accept/decline with consent (GS-7 §5).
 
 > **Why this slice exists — a gap GS-6 surfaced.** The wire protocol has
 > `RESIGN`, `ABORT`, `OFFER_DRAW` client messages (§4A.2) and the event model has

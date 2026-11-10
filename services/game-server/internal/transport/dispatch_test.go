@@ -190,6 +190,36 @@ type harness struct {
 	srv    *Server
 	store  game.EventStore
 	cancel context.CancelFunc
+	clk    *fakeClock
+}
+
+// fakeClock is the ONE shared test clock (GS-7 §9 test 4): newHarness injects
+// it into the Registry (so every session) and the Server. Time moves only when
+// a test advances it. The Matchmaker's own `now` is unexported (package
+// matchmaking) and only stamps seek enqueue / window checks, never a stream
+// event, so it cannot make a stream timestamp differ from this clock.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (f *fakeClock) now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.t
+}
+
+func (f *fakeClock) add(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.t = f.t.Add(d)
+}
+
+// useRealClock switches the harness back to wall-clock time, for the tests
+// that rely on real elapsed time (the idle flag ticker). Call before pairing.
+func (h *harness) useRealClock() {
+	h.srv.now = time.Now
+	h.srv.reg.now = time.Now
 }
 
 func newHarness(t *testing.T) *harness {
@@ -203,7 +233,10 @@ func newHarness(t *testing.T) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	reg := NewRegistry(ctx, store, o, ConventionResolver{})
 	srv := NewServer(DevAuthenticator{}, mm, reg)
-	return &harness{srv: srv, store: store, cancel: cancel}
+	clk := &fakeClock{t: time.UnixMilli(1_728_000_000_000)}
+	reg.now = clk.now
+	srv.now = clk.now
+	return &harness{srv: srv, store: store, cancel: cancel, clk: clk}
 }
 
 func (h *harness) handle(ctx context.Context, c *fakeConn) {

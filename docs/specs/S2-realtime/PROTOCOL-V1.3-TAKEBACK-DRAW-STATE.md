@@ -19,11 +19,10 @@
 > [GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md](GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md).
 > This document pins only bytes, codes, tables and client rules.
 >
-> **Wire implemented; behaviour pending.** Approved 2026-11-09. The codec, every
-> binding, the Go seams and the web mirror implement §2–§6, and §2–§6 are folded
-> into `PROTOCOL.md` (2026-11-10). The server still behaves as v1.2 for takeback,
-> draw decline and duplicate MOVE: the §7 rows describe the GS-7 reducer and fold
-> into `PROTOCOL.md` §5 with it.
+> **Implemented on the server; fully folded into `PROTOCOL.md`.** Approved
+> 2026-11-09. The codec, bindings, Go seams and web mirror implement §2–§6
+> (#161), and the GS-7 server reducer implements §7. `PROTOCOL.md` carries all of
+> it. Open: the web client's handling of the new messages (client contract tests).
 
 ## 1. Summary of changes
 
@@ -159,7 +158,8 @@ the new codes are in `PROTOCOL.md` §4A.2.
 - [x] Golden corpus per §8, reproduced byte-for-byte by Rust, Go and wasm; v1.2 vectors other than the three STATE-body vectors (`state`, `state_max_fen`, `matched`) unchanged.
 - [x] Swift and Kotlin host parity read the v1.3 STATE fields through the generated bindings and round-trip the frame. The Android instrumented and iOS XCTest suites carry the same check but only run on a device or Simulator (P2).
 - [x] §2–§6 folded into `PROTOCOL.md` (wire 1.3); docs-check green.
-- [ ] §7 rows (takeback, decline, duplicate MOVE, the two client rules) folded into `PROTOCOL.md` §5. Lands with the GS-7 reducer and web reducer, with client contract tests.
+- [x] §7 rows (takeback, decline, duplicate MOVE, the two client rules) folded into `PROTOCOL.md` §5, with the GS-7 server reducer.
+- [ ] Web client handles the new messages, with client contract tests for the §7 client rules.
 
 ## 11. Open questions
 

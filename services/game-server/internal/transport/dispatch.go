@@ -181,13 +181,25 @@ func (s *Server) route(ctx context.Context, c Conn, st *connState, msg codec.Cli
 	case codec.CMMove:
 		return s.handleMove(ctx, c, st, msg.Move)
 	case codec.CMResign:
-		return s.handleEnding(ctx, c, msg.GameID, endingResign)
+		return s.handleEnding(ctx, c, msg.GameID, endingResign, 0)
 	case codec.CMAbort:
-		return s.handleEnding(ctx, c, msg.GameID, endingAbort)
+		return s.handleEnding(ctx, c, msg.GameID, endingAbort, 0)
 	case codec.CMOfferDraw:
-		return s.handleEnding(ctx, c, msg.GameID, endingOfferDraw)
+		return s.handleEnding(ctx, c, msg.GameID, endingOfferDraw, 0)
+	case codec.CMDeclineDraw:
+		return s.handleEnding(ctx, c, msg.GameID, endingDeclineDraw, 0)
 	case codec.CMTakeback:
-		return s.handleEnding(ctx, c, msg.GameID, endingTakeback)
+		return s.handleEnding(ctx, c, msg.GameID, endingTakeback, 0)
+	case codec.CMTakebackAccept, codec.CMTakebackDecline:
+		if msg.TakebackReply == nil {
+			s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "empty takeback reply"))
+			return true
+		}
+		kind := endingTakebackAccept
+		if msg.Type == codec.CMTakebackDecline {
+			kind = endingTakebackDecline
+		}
+		return s.handleEnding(ctx, c, msg.TakebackReply.GameID, kind, msg.TakebackReply.AtPly)
 	case codec.CMRematch:
 		// Rematch is a new-game flow (matchmaking concern) — out of scope for GS-6.
 		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "rematch not supported yet"))
@@ -299,14 +311,11 @@ func rejectMove(gameID string, plyExpected uint32, reason uint8) codec.ServerMsg
 	}}
 }
 
-// snapshotToStateBody maps a session Snapshot to the §4A.6 (v1.3) STATE body
-// for ONE recipient: youSeat is that connection's seat (codec.NoSeat if none),
-// so STATE is built per recipient.
-//
-// Until the GS-7 reducer lands, the server has no takeback request state of
-// the v1.3 kind (takeback_by is always NoSeat) and no ClockStarted event: from
-// the first move on, the side to move's clock runs from the anchor (the last
-// move); at ply 0 no clock is reported running.
+// snapshotToStateBody is the one STATE builder (GS-7 §7.4 stateFor): it maps a
+// session Snapshot to the v1.3 body for ONE recipient (youSeat is that
+// connection's seat, codec.NoSeat if none). Clocks are charged up to server_t
+// for the running seat (the session did that at snap.ServerT), so a client
+// ticks running_seat down from server_t (#123).
 func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 	clocks := make([]uint32, len(snap.RemainingMs))
 	for i, ms := range snap.RemainingMs {
@@ -314,6 +323,12 @@ func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 			ms = 0
 		}
 		clocks[i] = uint32(ms)
+	}
+	seatByte := func(seat int) uint8 {
+		if seat < 0 {
+			return codec.NoSeat
+		}
+		return uint8(seat)
 	}
 	body := codec.StateBody{
 		FEN:           snap.FEN,
@@ -324,13 +339,11 @@ func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 		Status:        codec.StatusMatched,
 		ResultVector:  []uint8{},
 		LastMoveUCI:   snap.LastMoveUCI,
-		PendingDrawBy: codec.NoSeat,
-		TakebackBy:    codec.NoSeat,
-		RunningSeat:   codec.NoSeat,
-		ServerT:       uint64(snap.ClockAnchor.UnixMilli()),
-	}
-	if snap.DrawOfferBy >= 0 {
-		body.PendingDrawBy = uint8(snap.DrawOfferBy)
+		PendingDrawBy: seatByte(snap.DrawOfferBy),
+		TakebackBy:    seatByte(snap.TakebackBy),
+		TakebackAtPly: snap.TakebackAtPly,
+		RunningSeat:   seatByte(snap.RunningSeat),
+		ServerT:       uint64(snap.ServerT.UnixMilli()),
 	}
 	switch {
 	case snap.Ended:
@@ -340,16 +353,8 @@ func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 		for i, r := range snap.ResultVector {
 			body.ResultVector[i] = uint8(r)
 		}
-		body.PendingDrawBy = codec.NoSeat
 	case snap.Phase == game.PhaseLive:
 		body.Status = codec.StatusLive
-		// No clock runs before the first move: the anchor at ply 0 is session
-		// construction (or a rebuild), not a real clock start, so claiming a
-		// running clock would charge the first mover for that time. GS-7's
-		// ClockStarted event will define when the first clock starts.
-		if snap.Ply > 0 {
-			body.RunningSeat = snap.Turn
-		}
 	}
 	return body
 }

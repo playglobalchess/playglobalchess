@@ -53,6 +53,26 @@ func moveAndAwaitBoth(t *testing.T, mover, opponent *fakeConn, gameID string, pl
 	return acc
 }
 
+// playTwoPlies plays 1.e4 e5 (draw offers and takebacks need ply >= 2, GS-7)
+// and drains both acks on both conns.
+func playTwoPlies(t *testing.T, white, black *fakeConn, gameID string) {
+	t.Helper()
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	moveAndAwaitBoth(t, black, white, gameID, 2, "e7e5")
+}
+
+// count returns how many frames of type ty the conn has been sent so far.
+func count(t *testing.T, c *fakeConn, ty codec.ServerMsgType) int {
+	t.Helper()
+	n := 0
+	for _, m := range c.sent(t) {
+		if m.Type == ty {
+			n++
+		}
+	}
+	return n
+}
+
 // TestMoveAcceptedAndRejected drives the move hot path.
 func TestMoveAcceptedAndRejected(t *testing.T) {
 	h := newHarness(t)
@@ -138,7 +158,9 @@ func TestDrawOfferAndAccept(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
 	ctx := context.Background()
-	ca, cb, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
 
 	ca.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
 	time.Sleep(20 * time.Millisecond) // let the offer land
@@ -302,29 +324,258 @@ func TestJoinedThenBothDisconnectNotAborted(t *testing.T) {
 	}
 }
 
-// TestTakebackPushesStateToBoth is the S2 regression: a successful TAKEBACK does
-// not end the game and §4A has no takeback frame, so the transport must push
-// STATE to BOTH seats (else each client's board silently diverges). The default
-// pool is unrated (authAndSeek sets Rated:false), so Takeback is allowed.
-func TestTakebackPushesStateToBoth(t *testing.T) {
+// seatOfConn maps a conn to its seat given the pair() results.
+func seatOfConn(c, ca *fakeConn, seatA, seatB uint8) uint8 {
+	if c == ca {
+		return seatA
+	}
+	return seatB
+}
+
+// lastState returns the most recent STATE body a conn was sent.
+func lastState(t *testing.T, c *fakeConn) codec.StateBody {
+	t.Helper()
+	var got *codec.StateBody
+	for _, m := range c.sent(t) {
+		if m.Type == codec.SMState {
+			b := m.State.State
+			got = &b
+		}
+	}
+	if got == nil {
+		t.Fatal("conn received no STATE")
+	}
+	return *got
+}
+
+// TestTakebackOfferedToOpponent: TAKEBACK (a request, GS-7 §5.2 step 1) pushes
+// TAKEBACK_OFFERED{seat, at_ply} to the OTHER seat only and rewinds nothing.
+func TestTakebackOfferedToOpponent(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
 	ctx := context.Background()
 	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 	white, black := whiteBlack(ca, cb, seatA, seatB)
-	// Play two plies so there is a move to take back.
-	move(t, white, gameID, 1, "e2e4")
-	white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-	move(t, black, gameID, 2, "e7e5")
-	black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-	// Black requests a takeback (its move e5 is undone).
+	playTwoPlies(t, white, black, gameID)
+	blackSeat := seatOfConn(black, ca, seatA, seatB)
+
 	black.feedClient(t, codec.ClientMsg{Type: codec.CMTakeback, GameID: gameID})
-	// BOTH seats must receive a STATE reflecting the rolled-back position.
+	off := white.waitForServer(t, codec.SMTakebackOffered, 2*time.Second)
+	if off.TakebackOffered.GameID != gameID || off.TakebackOffered.SeatIdx != blackSeat || off.TakebackOffered.AtPly != 2 {
+		t.Fatalf("TAKEBACK_OFFERED = %+v, want {game %s seat %d at_ply 2}", off.TakebackOffered, gameID, blackSeat)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n := count(t, black, codec.SMTakebackOffered); n != 0 {
+		t.Fatalf("requester received %d TAKEBACK_OFFERED, want 0", n)
+	}
+	// Nothing was rewound.
+	if snap, _ := h.srv.reg.sessions[gameID].s.StateSnapshot(ctx); snap.Ply != 2 {
+		t.Fatalf("ply after a mere request = %d, want 2", snap.Ply)
+	}
+}
+
+// TestTakebackAcceptPushesStateToBoth (was TestTakebackPushesStateToBoth, the S2
+// regression, reshaped for the two-step v1.3 flow): TAKEBACK_ACCEPT{at_ply}
+// rewinds and pushes STATE to BOTH seats, each with its own you_seat and the
+// rewound ply and last_move_uci.
+func TestTakebackAcceptPushesStateToBoth(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
+	whiteSeat, blackSeat := seatOfConn(white, ca, seatA, seatB), seatOfConn(black, ca, seatA, seatB)
+
+	black.feedClient(t, codec.ClientMsg{Type: codec.CMTakeback, GameID: gameID})
+	off := white.waitForServer(t, codec.SMTakebackOffered, 2*time.Second)
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMTakebackAccept, TakebackReply: &codec.TakebackReplyPayload{GameID: gameID, AtPly: off.TakebackOffered.AtPly}})
 	stW := white.waitForServer(t, codec.SMState, 2*time.Second)
 	stB := black.waitForServer(t, codec.SMState, 2*time.Second)
+	for name, c := range map[string]struct {
+		st   codec.StateBody
+		seat uint8
+	}{"white": {stW.State.State, whiteSeat}, "black": {stB.State.State, blackSeat}} {
+		if c.st.YouSeat != c.seat {
+			t.Fatalf("%s: you_seat = %d, want %d", name, c.st.YouSeat, c.seat)
+		}
+		// Black asked about its own e5 (ply 2): rewound to ply 1, last move e2e4.
+		if c.st.Ply != 1 || c.st.LastMoveUCI != "e2e4" || c.st.Turn != 1 {
+			t.Fatalf("%s: STATE ply/last/turn = %d/%q/%d, want 1/e2e4/1", name, c.st.Ply, c.st.LastMoveUCI, c.st.Turn)
+		}
+		if c.st.TakebackBy != codec.NoSeat {
+			t.Fatalf("%s: takeback_by = %d after the rewind, want none", name, c.st.TakebackBy)
+		}
+	}
 	if stW.State.GameID != gameID || stB.State.GameID != gameID {
 		t.Fatalf("takeback STATE game mismatch: %s / %s", stW.State.GameID, stB.State.GameID)
 	}
+}
+
+// TestTakebackDeclinePushesDeclined: TAKEBACK_DECLINE{at_ply} by the responder
+// pushes TAKEBACK_DECLINED{seat} to the requester.
+func TestTakebackDeclinePushesDeclined(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
+	whiteSeat := seatOfConn(white, ca, seatA, seatB)
+
+	black.feedClient(t, codec.ClientMsg{Type: codec.CMTakeback, GameID: gameID})
+	off := white.waitForServer(t, codec.SMTakebackOffered, 2*time.Second)
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMTakebackDecline, TakebackReply: &codec.TakebackReplyPayload{GameID: gameID, AtPly: off.TakebackOffered.AtPly}})
+	d := black.waitForServer(t, codec.SMTakebackDeclined, 2*time.Second)
+	if d.SeatNotice.GameID != gameID || d.SeatNotice.SeatIdx != whiteSeat {
+		t.Fatalf("TAKEBACK_DECLINED = %+v, want {game %s seat %d}", d.SeatNotice, gameID, whiteSeat)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n := count(t, white, codec.SMTakebackDeclined); n != 0 {
+		t.Fatalf("decliner received %d TAKEBACK_DECLINED, want 0", n)
+	}
+	if snap, _ := h.srv.reg.sessions[gameID].s.StateSnapshot(ctx); snap.Ply != 2 || snap.TakebackBy != game.NoSeat {
+		t.Fatalf("after decline ply/takebackBy = %d/%d, want 2/none", snap.Ply, snap.TakebackBy)
+	}
+}
+
+// TestStaleTakebackAcceptPushesStateToSenderOnly: a TAKEBACK_ACCEPT with the
+// wrong at_ply is ignored by the session; the transport resyncs the SENDER with
+// a STATE (its own you_seat) and sends no ERROR and nothing to the other seat.
+func TestStaleTakebackAcceptPushesStateToSenderOnly(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
+	whiteSeat := seatOfConn(white, ca, seatA, seatB)
+
+	black.feedClient(t, codec.ClientMsg{Type: codec.CMTakeback, GameID: gameID})
+	off := white.waitForServer(t, codec.SMTakebackOffered, 2*time.Second)
+	stateBefore := count(t, black, codec.SMState)
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMTakebackAccept, TakebackReply: &codec.TakebackReplyPayload{GameID: gameID, AtPly: off.TakebackOffered.AtPly + 7}})
+	st := white.waitForServer(t, codec.SMState, 2*time.Second)
+	if st.State.State.YouSeat != whiteSeat || st.State.State.Ply != 2 {
+		t.Fatalf("stale-accept STATE = you_seat %d ply %d, want %d / 2", st.State.State.YouSeat, st.State.State.Ply, whiteSeat)
+	}
+	// The pending request is still visible in that STATE.
+	if st.State.State.TakebackAtPly != off.TakebackOffered.AtPly {
+		t.Fatalf("stale-accept STATE takeback_at_ply = %d, want %d", st.State.State.TakebackAtPly, off.TakebackOffered.AtPly)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n := count(t, white, codec.SMError); n != 0 {
+		t.Fatalf("stale accept produced %d ERROR frames, want 0", n)
+	}
+	if n := count(t, black, codec.SMState) - stateBefore; n != 0 {
+		t.Fatalf("the other seat got %d STATE frames from a stale accept, want 0", n)
+	}
+	if n := count(t, black, codec.SMError); n != 0 {
+		t.Fatalf("the other seat got %d ERROR frames, want 0", n)
+	}
+}
+
+// TestDeclineDrawPushesDrawDeclined: DECLINE_DRAW by the responder pushes
+// DRAW_DECLINED{seat} to the offerer.
+func TestDeclineDrawPushesDrawDeclined(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
+	blackSeat := seatOfConn(black, ca, seatA, seatB)
+
+	white.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
+	black.waitForServer(t, codec.SMDrawOffered, 2*time.Second)
+	black.feedClient(t, codec.ClientMsg{Type: codec.CMDeclineDraw, GameID: gameID})
+	d := white.waitForServer(t, codec.SMDrawDeclined, 2*time.Second)
+	if d.SeatNotice.GameID != gameID || d.SeatNotice.SeatIdx != blackSeat {
+		t.Fatalf("DRAW_DECLINED = %+v, want {game %s seat %d}", d.SeatNotice, gameID, blackSeat)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n := count(t, black, codec.SMDrawDeclined); n != 0 {
+		t.Fatalf("decliner received %d DRAW_DECLINED, want 0", n)
+	}
+}
+
+// TestResentMoveReackedToSenderOnly: a MOVE resent with the same ply and uci is
+// re-acked to the SENDER only (GS-7 §4); the opponent is not told again.
+func TestResentMoveReackedToSenderOnly(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	oppBefore := count(t, black, codec.SMMoveAccepted)
+
+	move(t, white, gameID, 1, "e2e4")
+	re := white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	if re.MoveAccepted.UCI != "e2e4" || re.MoveAccepted.Ply != 1 {
+		t.Fatalf("re-ack = %+v, want e2e4 at ply 1", re.MoveAccepted)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n := count(t, black, codec.SMMoveAccepted) - oppBefore; n != 0 {
+		t.Fatalf("opponent received %d MOVE_ACCEPTED for a re-ack, want 0", n)
+	}
+}
+
+// TestReconnectDerivesEverythingFromState is the #101 acceptance test: seat A
+// plays a move, drops the socket, reconnects on a FRESH connection, and derives
+// its seat, the turn, the ply and the status from the decoded STATE alone (no
+// MATCHED on the new connection).
+func TestReconnectDerivesEverythingFromState(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	// Alice is whichever seat she got; make a move for seat A's side, whichever
+	// colour it is: if A is black, white plays first.
+	if ca == white {
+		moveAndAwaitBoth(t, ca, cb, gameID, 1, "e2e4")
+	} else {
+		moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+		moveAndAwaitBoth(t, ca, cb, gameID, 2, "e7e5")
+	}
+	wantPly := uint32(1)
+	if ca != white {
+		wantPly = 2
+	}
+	ca.Close()
+	time.Sleep(20 * time.Millisecond)
+	h.clk.add(2 * time.Second) // time passes while A is away
+
+	ca2 := newFakeConn()
+	h.handle(ctx, ca2)
+	ca2.feedClient(t, codec.ClientMsg{Type: codec.CMAuthenticate, Authenticate: &codec.AuthenticatePayload{Token: "alice"}})
+	st := ca2.waitForServer(t, codec.SMState, 2*time.Second)
+	for _, m := range ca2.sent(t) {
+		if m.Type == codec.SMMatched {
+			t.Fatal("a fresh connection must not need MATCHED")
+		}
+	}
+	b := st.State.State
+	if st.State.GameID != gameID {
+		t.Fatalf("STATE game = %s, want %s", st.State.GameID, gameID)
+	}
+	if b.YouSeat != seatA {
+		t.Fatalf("you_seat = %d, want %d", b.YouSeat, seatA)
+	}
+	if b.Ply != wantPly || b.Status != codec.StatusLive {
+		t.Fatalf("ply/status = %d/%d, want %d/LIVE", b.Ply, b.Status, wantPly)
+	}
+	if wantTurn := uint8(wantPly % 2); b.Turn != wantTurn {
+		t.Fatalf("turn = %d, want %d", b.Turn, wantTurn)
+	}
+	if b.RunningSeat != b.Turn {
+		t.Fatalf("running_seat = %d, want the side to move %d", b.RunningSeat, b.Turn)
+	}
+	if b.LastMoveUCI == "" || b.ServerT != uint64(h.clk.now().UnixMilli()) {
+		t.Fatalf("last_move_uci/server_t = %q/%d", b.LastMoveUCI, b.ServerT)
+	}
+	_ = seatB
 }
 
 // TestFlagForfeitOnIdle is the regression for the missing TickFlagCheck driver:
@@ -337,6 +588,7 @@ func TestFlagForfeitOnIdle(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
 	h.srv.flagInterval = 20 * time.Millisecond
+	h.useRealClock() // the idle flag needs real elapsed time
 	ctx := context.Background()
 
 	// Pair two conns on a tiny-clock pool so the first idle period flags.
@@ -470,6 +722,7 @@ func TestOfferDrawPushesDrawOfferedToOpponent(t *testing.T) {
 	ctx := context.Background()
 	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
 	whiteSeat := seatA
 	if seatA != 0 {
 		whiteSeat = seatB
@@ -498,6 +751,7 @@ func TestRepeatOfferDrawNoDuplicateNotify(t *testing.T) {
 	ctx := context.Background()
 	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
 	// White offers once → black gets exactly one DRAW_OFFERED.
 	white.feedClient(t, codec.ClientMsg{Type: codec.CMOfferDraw, GameID: gameID})
 	black.waitForServer(t, codec.SMDrawOffered, 2*time.Second)
@@ -549,11 +803,10 @@ func TestMoveBroadcastToBothSeats(t *testing.T) {
 	}
 }
 
-// TestReAckEchoesPersistedUCI: a duplicate MOVE on an already-persisted ply that
-// carries a DIFFERENT uci must re-ack the PERSISTED move's uci, never the
-// retry's — the §4A v1.2 server-authoritative re-ack (the pipeline reads
-// mv.UCI, the transport reads out.UCI, not p.UCI). Regression against the
-// blank/stale-field class of bug.
+// TestReAckEchoesPersistedUCI (behaviour reversed by GS-7 §5): a duplicate MOVE
+// on an already-persisted ply that carries a DIFFERENT uci is no longer re-acked
+// with the persisted uci; it is MOVE_REJECTED{STALE_PLY} to the sender. The same
+// uci is still re-acked (TestResentMoveReackedToSenderOnly).
 func TestReAckEchoesPersistedUCI(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
@@ -564,14 +817,14 @@ func TestReAckEchoesPersistedUCI(t *testing.T) {
 	// White plays the real move e2e4 at ply 1 (both seats ack).
 	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
 
-	// White re-sends ply 1 but with a DIFFERENT uci (a buggy/garbled retry). The
-	// move is already persisted as e2e4; the re-ack must echo e2e4, not d2d4.
+	// White re-sends ply 1 but with a DIFFERENT uci.
 	move(t, white, gameID, 1, "d2d4")
-	reack := white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-	if reack.MoveAccepted.UCI != "e2e4" {
-		t.Fatalf("re-ack uci = %q, want the PERSISTED e2e4 (not the retry's d2d4)", reack.MoveAccepted.UCI)
+	rej := white.waitForServer(t, codec.SMMoveRejected, 2*time.Second)
+	if rej.MoveRejected.Reason != codec.ReasonStalePly {
+		t.Fatalf("reject reason = 0x%02x, want STALE_PLY(0x%02x)", rej.MoveRejected.Reason, codec.ReasonStalePly)
 	}
-	if reack.MoveAccepted.Ply != 1 {
-		t.Fatalf("re-ack ply = %d, want 1", reack.MoveAccepted.Ply)
+	time.Sleep(30 * time.Millisecond)
+	if n := count(t, white, codec.SMMoveAccepted); n != 1 {
+		t.Fatalf("sender has %d MOVE_ACCEPTED, want only the original 1 (no re-ack of a different uci)", n)
 	}
 }
