@@ -170,6 +170,24 @@ game `FLAG` (or `TIMEOUT_VS_INSUFFICIENT`) if it flags first. The
 MATCHED-but-never-joined case (GS-5 ghost-claim residual) uses the join-timeout →
 abort path.
 
+**Ended games (#102).** `GAME_END` reaches only the connections bound when the
+game ends, and the live session is then dropped, so two paths keep the result
+reachable. Both answer with the existing v1.3 `STATE` (`status` ENDED,
+`result_vector`, `termination`, no running clock), rebuilt from the durable
+stream without a live session (no wire change):
+- **Missed ending, pushed on AUTHENTICATE.** A seat that did not get `GAME_END`
+  live (offline, or its write refused) is recorded per user. Its next
+  `AUTHENTICATE` on this node pushes that ended `STATE` once. A seat that DID see
+  `GAME_END` is not pushed the ending again (it may already be seeking a new
+  game). Retention: 24 h, at most 100 000 records (oldest dropped first), expired
+  in insertion order. The record is node-local, like the reconnect index; a
+  reconnect to another node gets no push but can still RESYNC.
+- **RESYNC{game_id} of an ended game** the user was seated in (checked against
+  the stream's `PlayerJoined`) returns the ended `STATE` at any time, with no
+  retention window: the stream is the record. A user who was not seated, and an
+  unknown game id, both get `ERROR{UNKNOWN_GAME}`, so RESYNC cannot probe other
+  players' games. After the push window, RESYNC is the way back.
+
 ### 3.5 Heartbeat, flag-forfeit & teardown
 
 The transport drives the idle/disconnect **forfeit** path, which GS-3 delegates
@@ -252,6 +270,7 @@ closed by) the §4A v1.1 amendment:
 | MOVE on a game this conn is not seated in | `MOVE_REJECTED{NOT_YOUR_SEAT}` (the session/pipeline already enforces; the transport routes by its seat map). |
 | Persist fails (pipeline error) | NO ack; `ERROR{INTERNAL}` — the move did not happen (NFR-7). |
 | Disconnect mid-game | seat unbound, clock keeps running; reconnect → `STATE`; flag if the clock expires first. |
+| Game ends while a seat is offline | that seat's next `AUTHENTICATE` (within 24 h, same node) pushes `STATE{status=ENDED, result}` once; `RESYNC` returns it at any time (§3.4, #102). |
 | MATCHED seat never joins (ghost-claim) | join-timeout → abort the game (resolves the GS-5 residual). |
 | SEEK into an unknown pool, or with another pool's time control | `ERROR{PROTOCOL_VIOLATION}`, logged, no enqueue, no game (#93). |
 | Catalogue pool whose time control does not resolve (misconfiguration) | `ERROR{INTERNAL}`, logged, no enqueue, no game (#93). |

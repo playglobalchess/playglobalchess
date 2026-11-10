@@ -442,15 +442,17 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 // connection is seated in the game, reply with the authoritative STATE folded
 // from the durable stream (same path as the auth-time server push); else
 // ERROR{UNKNOWN_GAME}. The complement to the Option-A auto-push.
-func (s *Server) handleResync(ctx context.Context, c Conn, gameID string) bool {
+func (s *Server) handleResync(ctx context.Context, c Conn, st *connState, gameID string) bool {
+	sess, live := s.reg.Get(gameID)
+	if !live {
+		// Not live here: an ended game (its session was dropped at GAME_END) is
+		// rebuilt from the stream for a player who was seated in it (#102).
+		s.resyncEnded(ctx, c, st.userID, gameID)
+		return true
+	}
 	seat, seated := s.seatOf(c, gameID)
 	if !seated {
 		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "not seated in this game"))
-		return true
-	}
-	sess, ok := s.reg.Get(gameID)
-	if !ok {
-		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "no such live game"))
 		return true
 	}
 	snap, err := sess.StateSnapshot(ctx)
@@ -513,15 +515,22 @@ func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
 	if err != nil || !sp.Ended {
 		return
 	}
-	rv, term := s.endingResult(ctx, gameID, sp)
+	rv, term, users := s.endingResult(ctx, gameID, sp)
 	msg := gameEndMsg(gameID, rv, term)
 	for seat := uint8(0); seat < 2; seat++ {
-		if cc, present := s.connFor(gameID, seat); present {
-			s.send(ctx, cc, msg)
+		if cc, present := s.connFor(gameID, seat); present && s.send(ctx, cc, msg) {
+			continue
+		}
+		// This seat did not get GAME_END (offline, or its write was refused): note
+		// it, so its next AUTHENTICATE pushes the ended STATE once (#102). A seat
+		// that got GAME_END live is never sent the ending again unasked.
+		if uid := users[seat]; uid != "" {
+			s.recordMissedEnd(uid, gameID, seat)
 		}
 	}
-	// The game is over; drop the live session so the node reclaims it (the stream
-	// persists in the store; a late reconnect rebuilds a read-only ended view).
+	// The game is over; drop the live session so the node reclaims it. The stream
+	// persists in the store, and endedState rebuilds a read-only ended view from
+	// it for a late reconnect (missed ending) or a RESYNC (#102).
 	s.dropGame(gameID)
 }
 
@@ -564,18 +573,26 @@ func (s *Server) dropGame(gameID string) {
 
 // endingResult reads the authoritative result vector + termination from the
 // stream's final GameEnded (the snapshot carries the termination; the result
-// vector lives in the event).
-func (s *Server) endingResult(ctx context.Context, gameID string, sp session.Snapshot) ([]game.Result, game.Termination) {
+// vector lives in the event), and the user seated at each seat (PlayerJoined),
+// which the missed-ending record needs (#102).
+func (s *Server) endingResult(ctx context.Context, gameID string, sp session.Snapshot) ([]game.Result, game.Termination, map[uint8]string) {
 	events, err := s.reg.loadStream(ctx, gameID)
-	if err == nil {
-		for i := len(events) - 1; i >= 0; i-- {
-			if events[i].Type == game.EvGameEnded && events[i].GameEnded != nil {
-				return events[i].GameEnded.ResultVector, events[i].GameEnded.Termination
-			}
+	if err != nil {
+		// Fallback: the snapshot's terminal with an empty result vector.
+		return nil, sp.Terminal, nil
+	}
+	users := make(map[uint8]string, 2)
+	for _, ev := range events {
+		if ev.PlayerJoined != nil {
+			users[ev.PlayerJoined.SeatIdx] = ev.PlayerJoined.UserID
 		}
 	}
-	// Fallback: the snapshot's terminal with an empty result vector.
-	return nil, sp.Terminal
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == game.EvGameEnded && events[i].GameEnded != nil {
+			return events[i].GameEnded.ResultVector, events[i].GameEnded.Termination, users
+		}
+	}
+	return nil, sp.Terminal, users
 }
 
 // --- small helpers on Match -------------------------------------------------

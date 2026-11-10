@@ -64,6 +64,8 @@ a pending offer.
 - **RESYNC:** route `CMResync` → if the conn is seated in the game, reply `STATE`
   from `StateSnapshot` (the same path as the Option-A auto-push); else
   `ERROR{UNKNOWN_GAME}`. On-demand complement to the auth-time push.
+  (Amended by #102: a RESYNC of an ENDED game the user was seated in returns a
+  v1.3 `STATE` with `status=ENDED`, rebuilt from the stream; see GS-6 §3.4.)
 - **DRAW_OFFERED:** in `handleEnding`'s OFFER_DRAW branch, when the offer is a
   first (non-ending) pending offer, push `DRAW_OFFERED{game_id, by}` to the
   OPPONENT's connection (if present on this node). The mutual-offer /
