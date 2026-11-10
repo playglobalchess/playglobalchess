@@ -47,16 +47,19 @@ type ClientMsgType uint8
 // ClientMsg enum in message.rs), NOT the §4A.2 type code. Named so a Rust
 // reorder is caught by the golden parity test with a clear mapping.
 const (
-	CMAuthenticate ClientMsgType = iota // 0
-	CMSeek                              // 1
-	CMMove                              // 2
-	CMOfferDraw                         // 3
-	CMResign                            // 4
-	CMAbort                             // 5
-	CMTakeback                          // 6
-	CMRematch                           // 7
-	CMPing                              // 8
-	CMResync                            // 9 (§4A v1.1, ADR-17)
+	CMAuthenticate    ClientMsgType = iota // 0
+	CMSeek                                 // 1
+	CMMove                                 // 2
+	CMOfferDraw                            // 3
+	CMResign                               // 4
+	CMAbort                                // 5
+	CMTakeback                             // 6
+	CMRematch                              // 7
+	CMPing                                 // 8
+	CMResync                               // 9 (§4A v1.1, ADR-17)
+	CMTakebackAccept                       // 10 (§4A v1.3, ADR-19 — appended after Resync)
+	CMTakebackDecline                      // 11 (§4A v1.3)
+	CMDeclineDraw                          // 12 (§4A v1.3)
 )
 
 // ClientMsg is a decoded client->server message. Exactly one payload pointer is
@@ -66,9 +69,19 @@ type ClientMsg struct {
 	Authenticate *AuthenticatePayload
 	Seek         *SeekPayload
 	Move         *MovePayload
-	// OfferDraw/Resign/Abort/Takeback/Rematch/Resync all carry only a game id.
+	// OfferDraw/Resign/Abort/Takeback/Rematch/Resync/DeclineDraw all carry only
+	// a game id.
 	GameID string
 	Ping   *PingPayload
+	// TakebackAccept / TakebackDecline (§4A v1.3): game_id, at_ply.
+	TakebackReply *TakebackReplyPayload
+}
+
+// TakebackReplyPayload — §4A v1.3 TAKEBACK_ACCEPT / TAKEBACK_DECLINE:
+// game_id:str, at_ply:u32.
+type TakebackReplyPayload struct {
+	GameID string
+	AtPly  uint32
 }
 
 // AuthenticatePayload — §4A.3 AUTHENTICATE: token:str.
@@ -122,22 +135,61 @@ const (
 // Server message discriminants — serde VARIANT INDEX (declaration order of the
 // ServerMsg enum in message.rs), NOT the §4A.2 type code.
 const (
-	SMMatched      ServerMsgType = iota // 0
-	SMMoveAccepted                      // 1
-	SMMoveRejected                      // 2
-	SMState                             // 3
-	SMGameEnd                           // 4
-	SMPong                              // 5
-	SMDrawOffered                       // 6 (§4A v1.1, ADR-17 — before Error, matching the Rust enum order)
-	SMError                             // 7
+	SMMatched          ServerMsgType = iota // 0
+	SMMoveAccepted                          // 1
+	SMMoveRejected                          // 2
+	SMState                                 // 3
+	SMGameEnd                               // 4
+	SMPong                                  // 5
+	SMDrawOffered                           // 6 (§4A v1.1, ADR-17 — before Error, matching the Rust enum order)
+	SMTakebackOffered                       // 7 (§4A v1.3, ADR-19 — before Error)
+	SMTakebackDeclined                      // 8 (§4A v1.3)
+	SMDrawDeclined                          // 9 (§4A v1.3)
+	SMError                                 // 10
 )
 
-// StateBody — §4A.6 shared state format: fen:str, turn:u8, clocks:[u32].
-// Reused verbatim as Matched.StartState (one state format, Q-P4).
+// Frozen §4A.10 STATE status codes (v1.3).
+const (
+	StatusMatched uint8 = 0x01
+	StatusLive    uint8 = 0x02
+	StatusEnded   uint8 = 0x03
+)
+
+// NoSeat is the "no seat" sentinel for the STATE seat fields (§4A.6 v1.3).
+const NoSeat uint8 = 0xFF
+
+// StateBody — §4A.6 (v1.3) shared state format, reused verbatim as
+// Matched.StartState (one state format, Q-P4). Field order mirrors types.rs
+// StateBody; the Rust codec enforces the §4A.6 decode invariants on encode, so
+// a body that breaks one is refused by EncodeServer.
 type StateBody struct {
-	FEN    string
-	Turn   uint8
-	Clocks []uint32
+	FEN           string
+	Turn          uint8
+	Clocks        []uint32
+	YouSeat       uint8 // NoSeat = none
+	Ply           uint32
+	Status        uint8   // §4A.10
+	ResultVector  []uint8 // non-empty iff Status == StatusEnded
+	Termination   uint8   // §4A.5 code iff ended, else 0
+	LastMoveUCI   string  // empty iff Ply == 0
+	PendingDrawBy uint8   // NoSeat = none
+	TakebackBy    uint8   // NoSeat = none
+	TakebackAtPly uint32  // 0 iff TakebackBy == NoSeat
+	RunningSeat   uint8   // NoSeat = no clock running
+	ServerT       uint64  // epoch ms at which Clocks are valid
+}
+
+// TakebackOfferedPayload — §4A v1.3 TAKEBACK_OFFERED: game_id, seat_idx:u8, at_ply:u32.
+type TakebackOfferedPayload struct {
+	GameID  string
+	SeatIdx uint8
+	AtPly   uint32
+}
+
+// SeatNoticePayload — §4A v1.3 TAKEBACK_DECLINED / DRAW_DECLINED: game_id, seat_idx:u8.
+type SeatNoticePayload struct {
+	GameID  string
+	SeatIdx uint8
 }
 
 // ServerMsg is a server->client message to encode. Exactly one payload pointer
@@ -151,7 +203,11 @@ type ServerMsg struct {
 	GameEnd      *GameEndPayload
 	Pong         *PongPayload
 	DrawOffered  *DrawOfferedPayload
-	Error        *ErrorPayload
+	// v1.3 (ADR-19).
+	TakebackOffered *TakebackOfferedPayload
+	// TakebackDeclined and DrawDeclined share one payload shape.
+	SeatNotice *SeatNoticePayload
+	Error      *ErrorPayload
 }
 
 // DrawOfferedPayload — §4A v1.1 (ADR-17) DRAW_OFFERED: game_id, by:u8.
@@ -306,13 +362,19 @@ func marshalClientIntermediate(m ClientMsg) ([]byte, error) {
 		w.str(m.Move.GameID)
 		w.uvarint(uint64(m.Move.PlyExpected))
 		w.str(m.Move.UCI)
-	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch, CMResync:
+	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch, CMResync, CMDeclineDraw:
 		w.str(m.GameID)
 	case CMPing:
 		if m.Ping == nil {
 			return nil, errNilPayload("Ping")
 		}
 		w.uvarint(m.Ping.T)
+	case CMTakebackAccept, CMTakebackDecline:
+		if m.TakebackReply == nil {
+			return nil, errNilPayload("TakebackReply")
+		}
+		w.str(m.TakebackReply.GameID)
+		w.uvarint(uint64(m.TakebackReply.AtPly))
 	default:
 		return nil, fmt.Errorf("codec: unknown client message type %d", m.Type)
 	}
@@ -362,12 +424,22 @@ func unmarshalClientIntermediate(b []byte) (ClientMsg, error) {
 			return ClientMsg{}, err
 		}
 		m = ClientMsg{Type: CMMove, Move: &MovePayload{GameID: gid, PlyExpected: uint32(ply), UCI: uci}}
-	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch, CMResync:
+	case CMOfferDraw, CMResign, CMAbort, CMTakeback, CMRematch, CMResync, CMDeclineDraw:
 		gid, err := r.str()
 		if err != nil {
 			return ClientMsg{}, err
 		}
 		m = ClientMsg{Type: ClientMsgType(variant), GameID: gid}
+	case CMTakebackAccept, CMTakebackDecline:
+		gid, err := r.str()
+		if err != nil {
+			return ClientMsg{}, err
+		}
+		ply, err := r.u32()
+		if err != nil {
+			return ClientMsg{}, err
+		}
+		m = ClientMsg{Type: ClientMsgType(variant), TakebackReply: &TakebackReplyPayload{GameID: gid, AtPly: ply}}
 	case CMPing:
 		t, err := r.uvarint()
 		if err != nil {
@@ -447,6 +519,19 @@ func marshalServerIntermediate(m ServerMsg) ([]byte, error) {
 		}
 		w.str(m.DrawOffered.GameID)
 		w.u8(m.DrawOffered.By)
+	case SMTakebackOffered:
+		if m.TakebackOffered == nil {
+			return nil, errNilPayload("TakebackOffered")
+		}
+		w.str(m.TakebackOffered.GameID)
+		w.u8(m.TakebackOffered.SeatIdx)
+		w.uvarint(uint64(m.TakebackOffered.AtPly))
+	case SMTakebackDeclined, SMDrawDeclined:
+		if m.SeatNotice == nil {
+			return nil, errNilPayload("SeatNotice")
+		}
+		w.str(m.SeatNotice.GameID)
+		w.u8(m.SeatNotice.SeatIdx)
 	case SMError:
 		if m.Error == nil {
 			return nil, errNilPayload("Error")
@@ -583,6 +668,30 @@ func unmarshalServerIntermediate(b []byte) (ServerMsg, error) {
 			return ServerMsg{}, err
 		}
 		m = ServerMsg{Type: SMDrawOffered, DrawOffered: &DrawOfferedPayload{GameID: gid, By: by}}
+	case SMTakebackOffered:
+		gid, err := r.str()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		seat, err := r.u8()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		ply, err := r.u32()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		m = ServerMsg{Type: SMTakebackOffered, TakebackOffered: &TakebackOfferedPayload{GameID: gid, SeatIdx: seat, AtPly: ply}}
+	case SMTakebackDeclined, SMDrawDeclined:
+		gid, err := r.str()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		seat, err := r.u8()
+		if err != nil {
+			return ServerMsg{}, err
+		}
+		m = ServerMsg{Type: ServerMsgType(variant), SeatNotice: &SeatNoticePayload{GameID: gid, SeatIdx: seat}}
 	case SMError:
 		code, err := r.u8()
 		if err != nil {
@@ -602,8 +711,8 @@ func unmarshalServerIntermediate(b []byte) (ServerMsg, error) {
 	return m, nil
 }
 
-// stateBody serializes a StateBody inline (postcard nests with no framing):
-// fen:str, turn:u8, clocks:Vec<u32>. Matches types.rs StateBody field order.
+// stateBody serializes a StateBody inline (postcard nests with no framing), in
+// types.rs StateBody field order (§4A.6 v1.3).
 func (w *pcWriter) stateBody(s StateBody) {
 	w.str(s.FEN)
 	w.u8(s.Turn)
@@ -611,30 +720,88 @@ func (w *pcWriter) stateBody(s StateBody) {
 	for _, c := range s.Clocks {
 		w.uvarint(uint64(c))
 	}
+	w.u8(s.YouSeat)
+	w.uvarint(uint64(s.Ply))
+	w.u8(s.Status)
+	w.uvarint(uint64(len(s.ResultVector)))
+	for _, v := range s.ResultVector {
+		w.u8(v)
+	}
+	w.u8(s.Termination)
+	w.str(s.LastMoveUCI)
+	w.u8(s.PendingDrawBy)
+	w.u8(s.TakebackBy)
+	w.uvarint(uint64(s.TakebackAtPly))
+	w.u8(s.RunningSeat)
+	w.uvarint(s.ServerT)
 }
 
 func (r *pcReader) stateBody() (StateBody, error) {
-	fen, err := r.str()
-	if err != nil {
+	var s StateBody
+	var err error
+	if s.FEN, err = r.str(); err != nil {
 		return StateBody{}, err
 	}
-	turn, err := r.u8()
-	if err != nil {
+	if s.Turn, err = r.u8(); err != nil {
 		return StateBody{}, err
 	}
 	n, err := r.uvarint()
 	if err != nil {
 		return StateBody{}, err
 	}
-	clocks := make([]uint32, 0, n)
 	for i := uint64(0); i < n; i++ {
-		c, err := r.uvarint()
+		c, err := r.u32()
 		if err != nil {
 			return StateBody{}, err
 		}
-		clocks = append(clocks, uint32(c))
+		s.Clocks = append(s.Clocks, c)
 	}
-	return StateBody{FEN: fen, Turn: turn, Clocks: clocks}, nil
+	if s.Clocks == nil {
+		s.Clocks = []uint32{}
+	}
+	if s.YouSeat, err = r.u8(); err != nil {
+		return StateBody{}, err
+	}
+	if s.Ply, err = r.u32(); err != nil {
+		return StateBody{}, err
+	}
+	if s.Status, err = r.u8(); err != nil {
+		return StateBody{}, err
+	}
+	nr, err := r.uvarint()
+	if err != nil {
+		return StateBody{}, err
+	}
+	s.ResultVector = []uint8{}
+	for i := uint64(0); i < nr; i++ {
+		v, err := r.u8()
+		if err != nil {
+			return StateBody{}, err
+		}
+		s.ResultVector = append(s.ResultVector, v)
+	}
+	if s.Termination, err = r.u8(); err != nil {
+		return StateBody{}, err
+	}
+	if s.LastMoveUCI, err = r.str(); err != nil {
+		return StateBody{}, err
+	}
+	if s.PendingDrawBy, err = r.u8(); err != nil {
+		return StateBody{}, err
+	}
+	if s.TakebackBy, err = r.u8(); err != nil {
+		return StateBody{}, err
+	}
+	if s.TakebackAtPly, err = r.u32(); err != nil {
+		return StateBody{}, err
+	}
+	if s.RunningSeat, err = r.u8(); err != nil {
+		return StateBody{}, err
+	}
+	if s.ServerT, err = r.uvarint(); err != nil {
+		return StateBody{}, err
+	}
+	return s, nil
 }
 
 func errNilPayload(name string) error {

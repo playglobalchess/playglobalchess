@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/clock"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
@@ -22,6 +23,13 @@ type Snapshot struct {
 	RemainingMs []int64 // per-seat clock remaining
 	Ended       bool
 	Terminal    game.Termination // meaningful only when Ended
+	// v1.3 STATE fields (§4A.6).
+	LastMoveUCI  string        // the last live move; empty iff Ply == 0
+	ResultVector []game.Result // set iff Ended
+	DrawOfferBy  int           // seat with a pending draw offer, or -1
+	// ClockAnchor is the instant RemainingMs is valid at: the side to move's
+	// clock has been running since then (the last move, or session start).
+	ClockAnchor time.Time
 }
 
 // --- SubmitMove -------------------------------------------------------------
@@ -130,6 +138,7 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		s.curFEN = out.NewFEN
 		s.priorKeys = append(s.priorKeys, out.NewZobrist)
 		s.ply = out.Ply
+		s.lastMoveUCI = c.uci
 		s.turn = uint8((int(s.turn) + 1) % s.seatCount)
 		// Advance the owned clock incrementally from the pipeline's authoritative
 		// post-move remaining (out.ClockAfterMs, which already includes delay +
@@ -147,11 +156,12 @@ func (c *submitCmd) apply(ctx context.Context, s *Session) {
 		if out.Terminal != nil {
 			// Engine-detected terminal (mate / stalemate / insufficient /
 			// automatic draw). Append GameEnded; the game is over.
-			if err := s.appendGameEnded(ctx, *out.Terminal, winnerFromMover(c.seat, *out.Terminal, s.seatCount)); err != nil {
+			rv := winnerFromMover(c.seat, *out.Terminal, s.seatCount)
+			if err := s.appendGameEnded(ctx, *out.Terminal, rv); err != nil {
 				c.err = err
 				return
 			}
-			s.endGame(*out.Terminal)
+			s.endGame(*out.Terminal, rv)
 		}
 	case out.Flagged:
 		// The mover ran out of time on this move. Append ClockFlagged then
@@ -239,14 +249,22 @@ func (c *snapCmd) apply(_ context.Context, s *Session) {
 	defer close(c.done)
 	rem := make([]int64, len(s.clocks.RemainingMs))
 	copy(rem, s.clocks.RemainingMs)
+	drawBy := -1
+	if s.drawOfferBy != nil {
+		drawBy = int(*s.drawOfferBy)
+	}
 	c.snap = Snapshot{
-		FEN:         s.curFEN,
-		Ply:         s.ply,
-		Turn:        s.turn,
-		Phase:       s.phase,
-		RemainingMs: rem,
-		Ended:       s.ended,
-		Terminal:    s.terminal,
+		FEN:          s.curFEN,
+		Ply:          s.ply,
+		Turn:         s.turn,
+		Phase:        s.phase,
+		RemainingMs:  rem,
+		Ended:        s.ended,
+		Terminal:     s.terminal,
+		LastMoveUCI:  s.lastMoveUCI,
+		ResultVector: append([]game.Result(nil), s.resultVector...),
+		DrawOfferBy:  drawBy,
+		ClockAnchor:  s.lastMoveAt,
 	}
 }
 
@@ -282,7 +300,7 @@ func (s *Session) flag(ctx context.Context, flaggedSeat uint8) error {
 	}); err != nil {
 		return fmt.Errorf("session: append flag ending: %w", err)
 	}
-	s.endGame(term)
+	s.endGame(term, rv)
 	return nil
 }
 
@@ -307,9 +325,10 @@ func flagResultVector(term game.Termination, flaggedSeat uint8, seatCount int) [
 // so no code path can set one and forget another (the stale-phase bug: ended=true
 // with phase still Live produced a contradictory snapshot). Every terminal path
 // — move-produced, flag, and construction-time recovery — calls this.
-func (s *Session) endGame(term game.Termination) {
+func (s *Session) endGame(term game.Termination, rv []game.Result) {
 	s.ended = true
 	s.terminal = term
+	s.resultVector = append([]game.Result(nil), rv...)
 	s.phase = game.PhaseEnded
 }
 
@@ -428,6 +447,7 @@ func (c *takebackCmd) apply(ctx context.Context, s *Session) {
 	s.priorKeys = eng.PriorKeys
 	s.clocks = eng.Clock
 	s.ply = eng.Ply
+	s.lastMoveUCI = eng.LastMoveUCI
 	s.turn = eng.TurnIdx
 	s.phase = eng.Phase
 	s.lastMoveAt = s.now()

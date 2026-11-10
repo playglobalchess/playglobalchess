@@ -195,8 +195,7 @@ fn oversize_frame_is_rejected_on_encode() {
         game_id: GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
         state: pgc_protocol::StateBody {
             fen: huge_fen,
-            turn: 0,
-            clocks: vec![1000, 1000],
+            ..valid_state()
         },
     };
     let res = encode_server(&msg);
@@ -551,6 +550,331 @@ fn game_event_serde_variant_index_is_frozen() {
         }),
         11
     );
+    // v1.3 variants append (the Go event seam mirrors these indices).
+    assert_eq!(index_of(&GameEvent::TakebackProposed { seat_idx: 0 }), 12);
+    assert_eq!(
+        index_of(&GameEvent::TakebackRewound {
+            seat_idx: 0,
+            to_ply: 0,
+            server_ts: 0
+        }),
+        13
+    );
+    assert_eq!(index_of(&GameEvent::TakebackDeclined { seat_idx: 0 }), 14);
+    assert_eq!(index_of(&GameEvent::DrawDeclined { seat_idx: 0 }), 15);
+    assert_eq!(index_of(&GameEvent::ClockStarted { server_ts: 0 }), 16);
+}
+
+/// Same pin for the GS-6a message intermediates: the Go message seam mirrors
+/// the serde variant order of ClientMsg and ServerMsg (spec §2: new client
+/// variants append after Resync, new server variants go before Error).
+#[test]
+fn message_serde_variant_index_is_frozen() {
+    let g = || GameId::from("g");
+    let ci = |m: ClientMsg| postcard::to_allocvec(&m).unwrap()[0];
+    let si = |m: ServerMsg| postcard::to_allocvec(&m).unwrap()[0];
+    assert_eq!(ci(ClientMsg::Resync { game_id: g() }), 9);
+    assert_eq!(
+        ci(ClientMsg::TakebackAccept {
+            game_id: g(),
+            at_ply: 0
+        }),
+        10
+    );
+    assert_eq!(
+        ci(ClientMsg::TakebackDecline {
+            game_id: g(),
+            at_ply: 0
+        }),
+        11
+    );
+    assert_eq!(ci(ClientMsg::DeclineDraw { game_id: g() }), 12);
+    assert_eq!(
+        si(ServerMsg::DrawOffered {
+            game_id: g(),
+            by: 0
+        }),
+        6
+    );
+    assert_eq!(
+        si(ServerMsg::TakebackOffered {
+            game_id: g(),
+            seat_idx: 0,
+            at_ply: 0
+        }),
+        7
+    );
+    assert_eq!(
+        si(ServerMsg::TakebackDeclined {
+            game_id: g(),
+            seat_idx: 0
+        }),
+        8
+    );
+    assert_eq!(
+        si(ServerMsg::DrawDeclined {
+            game_id: g(),
+            seat_idx: 0
+        }),
+        9
+    );
+    assert_eq!(
+        si(ServerMsg::Error {
+            code: ErrorCode::INTERNAL,
+            msg: String::new()
+        }),
+        10
+    );
+}
+
+// --- v1.3 STATE-body invariants (§4A.6), one negative per invariant ---------
+
+fn valid_state() -> pgc_protocol::StateBody {
+    pgc_protocol::StateBody {
+        fen: "8/8/8/8/8/8/8/8 w - - 0 1".into(),
+        turn: 0,
+        clocks: vec![1000, 1000],
+        you_seat: 0,
+        ply: 2,
+        status: pgc_protocol::Status::LIVE,
+        result_vector: vec![],
+        termination: 0,
+        last_move_uci: "e7e5".into(),
+        pending_draw_by: pgc_protocol::NO_SEAT,
+        takeback_by: pgc_protocol::NO_SEAT,
+        takeback_at_ply: 0,
+        running_seat: 0,
+        server_t: 1,
+    }
+}
+
+fn ended_state() -> pgc_protocol::StateBody {
+    pgc_protocol::StateBody {
+        status: pgc_protocol::Status::ENDED,
+        result_vector: vec![2, 0],
+        termination: Termination::MATE.value(),
+        running_seat: pgc_protocol::NO_SEAT,
+        ..valid_state()
+    }
+}
+
+/// Assert an invalid body is refused in both directions: `encode_server`
+/// refuses it, and a hand-built STATE / MATCHED frame carrying it is rejected
+/// by `decode_server`.
+fn assert_state_rejected(name: &str, state: pgc_protocol::StateBody) {
+    let gid = GameId::from("f47ac10b-58cc-4372-a567-0e02b2c3d479");
+    let msg = ServerMsg::State {
+        game_id: gid.clone(),
+        state: state.clone(),
+    };
+    assert!(
+        matches!(encode_server(&msg), Err(CodecError::MalformedPayload(_))),
+        "{name}: encode must refuse"
+    );
+    // Hand-build the frame: ver | STATE | postcard(game_id, body). The STATE
+    // payload is positional, so postcard of the (game_id, body) tuple IS it.
+    let mut frame = vec![0x01, 0x84];
+    frame.extend(postcard::to_allocvec(&(gid.clone(), state.clone())).unwrap());
+    assert!(
+        matches!(decode_server(&frame), Err(CodecError::MalformedPayload(_))),
+        "{name}: decode must reject"
+    );
+    // Same body as MATCHED.start_state.
+    let mut frame = vec![0x01, 0x81];
+    frame.extend(postcard::to_allocvec(&(gid, 0u8, "o".to_string(), state)).unwrap());
+    assert!(
+        matches!(decode_server(&frame), Err(CodecError::MalformedPayload(_))),
+        "{name}: MATCHED decode must reject"
+    );
+}
+
+#[test]
+fn valid_v13_states_round_trip() {
+    for s in [valid_state(), ended_state()] {
+        let msg = ServerMsg::State {
+            game_id: GameId::from("g"),
+            state: s,
+        };
+        assert_eq!(decode_server(&encode_server(&msg).unwrap()).unwrap(), msg);
+    }
+}
+
+#[test]
+fn state_status_out_of_domain_rejected() {
+    for v in [0x00, 0x04, 0xFF] {
+        assert_state_rejected(
+            &format!("status 0x{v:02x}"),
+            pgc_protocol::StateBody {
+                status: pgc_protocol::Status(v),
+                ..valid_state()
+            },
+        );
+    }
+}
+
+#[test]
+fn state_invariant_1_result_vector_iff_ended() {
+    assert_state_rejected(
+        "result on LIVE",
+        pgc_protocol::StateBody {
+            result_vector: vec![2, 0],
+            ..valid_state()
+        },
+    );
+    assert_state_rejected(
+        "no result on ENDED",
+        pgc_protocol::StateBody {
+            result_vector: vec![],
+            ..ended_state()
+        },
+    );
+    assert_state_rejected(
+        "result length != seats",
+        pgc_protocol::StateBody {
+            result_vector: vec![2],
+            ..ended_state()
+        },
+    );
+    assert_state_rejected(
+        "result out of domain",
+        pgc_protocol::StateBody {
+            result_vector: vec![3, 0],
+            ..ended_state()
+        },
+    );
+}
+
+#[test]
+fn state_invariant_2_termination_iff_ended() {
+    assert_state_rejected(
+        "termination on LIVE",
+        pgc_protocol::StateBody {
+            termination: Termination::MATE.value(),
+            ..valid_state()
+        },
+    );
+    assert_state_rejected(
+        "no termination on ENDED",
+        pgc_protocol::StateBody {
+            termination: 0,
+            ..ended_state()
+        },
+    );
+    assert_state_rejected(
+        "unknown termination",
+        pgc_protocol::StateBody {
+            termination: 0x0B,
+            ..ended_state()
+        },
+    );
+}
+
+#[test]
+fn state_invariant_3_seat_fields_in_range() {
+    let bad = 2; // clocks.len() == 2
+    for (name, s) in [
+        (
+            "you_seat",
+            pgc_protocol::StateBody {
+                you_seat: bad,
+                ..valid_state()
+            },
+        ),
+        (
+            "pending_draw_by",
+            pgc_protocol::StateBody {
+                pending_draw_by: bad,
+                ..valid_state()
+            },
+        ),
+        (
+            "takeback_by",
+            pgc_protocol::StateBody {
+                takeback_by: bad,
+                takeback_at_ply: 2,
+                ..valid_state()
+            },
+        ),
+        (
+            "running_seat",
+            pgc_protocol::StateBody {
+                running_seat: bad,
+                ..valid_state()
+            },
+        ),
+    ] {
+        assert_state_rejected(name, s);
+    }
+}
+
+#[test]
+fn state_invariant_4_takeback_ply_iff_pending() {
+    assert_state_rejected(
+        "ply without request",
+        pgc_protocol::StateBody {
+            takeback_at_ply: 2,
+            ..valid_state()
+        },
+    );
+    assert_state_rejected(
+        "request without ply",
+        pgc_protocol::StateBody {
+            takeback_by: 1,
+            ..valid_state()
+        },
+    );
+}
+
+#[test]
+fn state_invariant_5_last_move_iff_ply() {
+    assert_state_rejected(
+        "move at ply 0",
+        pgc_protocol::StateBody {
+            ply: 0,
+            ..valid_state()
+        },
+    );
+    assert_state_rejected(
+        "no move after ply 0",
+        pgc_protocol::StateBody {
+            last_move_uci: String::new(),
+            ..valid_state()
+        },
+    );
+    assert_state_rejected(
+        "uci too long",
+        pgc_protocol::StateBody {
+            last_move_uci: "e7e8qq".into(),
+            ..valid_state()
+        },
+    );
+}
+
+#[test]
+fn state_invariant_6_no_running_clock_when_ended() {
+    assert_state_rejected(
+        "running on ENDED",
+        pgc_protocol::StateBody {
+            running_seat: 0,
+            ..ended_state()
+        },
+    );
+}
+
+#[test]
+fn v13_client_codes_on_server_path_are_wrong_direction() {
+    for code in [0x0B, 0x0C, 0x0D] {
+        assert!(matches!(
+            decode_server(&[0x01, code]),
+            Err(CodecError::WrongDirection(_, _))
+        ));
+    }
+    for code in [0x88, 0x89, 0x8A] {
+        assert!(matches!(
+            decode_client(&[0x01, code]),
+            Err(CodecError::WrongDirection(_, _))
+        ));
+    }
 }
 
 // --- a frame exactly at the cap is accepted (boundary) ----------------------
@@ -566,8 +890,7 @@ fn frame_at_cap_boundary_encodes() {
             game_id: gid.clone(),
             state: pgc_protocol::StateBody {
                 fen: "y".repeat(fen_len),
-                turn: 0,
-                clocks: vec![1, 1],
+                ..valid_state()
             },
         };
         match encode_server(&msg) {

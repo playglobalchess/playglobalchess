@@ -20,6 +20,8 @@ final class CodecParityTests: XCTestCase {
         "01032466343761633130622d353863632d343337322d613536372d30653032623263336434373967056537653871"
     private let serverGameEndHex =
         "01852466343761633130622d353863632d343337322d613536372d3065303262326333643437390202000a021817"
+    private let serverStatePendingHex =
+        "01842466343761633130622d353863632d343337322d613536372d3065303262326333643437393b726e62716b626e722f70707070707070702f382f382f3450332f382f50505050315050502f524e42514b424e522062204b516b7120653320302031010290a10fa0ef0f0112020000046731663300011201f483cea6a532"
     private let eventRatingAppliedHex =
         "2967616d652f66343761633130622d353863632d343337322d613536372d3065303262326333643437390c0c008080cea6a5320e626c69747a2d7374616e646172640200b817d0173c8fc2753d01b817a0173c8fc2753d"
 
@@ -42,6 +44,23 @@ final class CodecParityTests: XCTestCase {
     func testServerDecodeReencodeIdentity() throws {
         let b = fromHex(serverGameEndHex)
         XCTAssertEqual(try encodeServer(msg: decodeServer(frame: b)), b)
+    }
+
+    /// §4A v1.3 STATE: the new fields are read through the binding, not just
+    /// round-tripped, so a shape change breaks this test.
+    func testStateV13FieldsAndIdentity() throws {
+        let b = fromHex(serverStatePendingHex)
+        let msg = try decodeServer(frame: b)
+        guard case let .state(_, body) = msg else { return XCTFail("expected .state") }
+        XCTAssertEqual(body.youSeat, 1)
+        XCTAssertEqual(body.ply, 18)
+        XCTAssertEqual(body.status, 2)
+        XCTAssertEqual(body.lastMoveUci, "g1f3")
+        XCTAssertEqual(body.pendingDrawBy, 0)
+        XCTAssertEqual(body.takebackBy, 1)
+        XCTAssertEqual(body.takebackAtPly, 18)
+        XCTAssertEqual(body.runningSeat, 1)
+        XCTAssertEqual(try encodeServer(msg: msg), b)
     }
 
     func testEventDecodeReencodeIdentity() throws {

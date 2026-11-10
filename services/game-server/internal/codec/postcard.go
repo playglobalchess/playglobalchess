@@ -70,6 +70,18 @@ func (r *pcReader) uvarint() (uint64, error) {
 	return v, nil
 }
 
+// u32 reads a varint and rejects a value past u32 (postcard would too).
+func (r *pcReader) u32() (uint32, error) {
+	v, err := r.uvarint()
+	if err != nil {
+		return 0, err
+	}
+	if v > math.MaxUint32 {
+		return 0, fmt.Errorf("codec: u32 varint %d out of range at offset %d", v, r.off)
+	}
+	return uint32(v), nil
+}
+
 func (r *pcReader) u8() (uint8, error) {
 	if r.off >= len(r.buf) {
 		return 0, fmt.Errorf("codec: truncated u8 at offset %d", r.off)

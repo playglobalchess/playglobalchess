@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
@@ -162,7 +163,7 @@ func (s *Server) resyncUser(ctx context.Context, c Conn, st *connState) {
 		// Rebind the seat to this new connection (the old one may be dead).
 		s.bindSeat(c, st, gid, seat)
 		s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
-			GameID: gid, State: snapshotToStateBody(snap),
+			GameID: gid, State: snapshotToStateBody(snap, seat),
 		}})
 	}
 }
@@ -276,9 +277,11 @@ func (s *Server) unbindAll(st *connState, c Conn) {
 func (s *Server) send(ctx context.Context, c Conn, msg codec.ServerMsg) {
 	frame, err := codec.EncodeServer(msg)
 	if err != nil {
-		// Encoding our OWN message failed — a server bug (e.g. an out-of-domain
-		// discriminant). Do not loop; drop it. (The GS-6a encode guards make this
-		// unreachable for well-formed messages.)
+		// Encoding our OWN message failed — a server bug (an out-of-domain
+		// discriminant, or a STATE/MATCHED body that breaks a §4A.6 invariant).
+		// Do not loop; drop it, but LOG it: the client never gets this frame and
+		// would otherwise hang with nothing for on-call to find.
+		log.Printf("transport: dropped unencodable server message (type %d): %v", msg.Type, err)
 		return
 	}
 	_ = c.Write(ctx, frame)
@@ -296,8 +299,15 @@ func rejectMove(gameID string, plyExpected uint32, reason uint8) codec.ServerMsg
 	}}
 }
 
-// snapshotToStateBody maps a session Snapshot to the §4A STATE body.
-func snapshotToStateBody(snap session.Snapshot) codec.StateBody {
+// snapshotToStateBody maps a session Snapshot to the §4A.6 (v1.3) STATE body
+// for ONE recipient: youSeat is that connection's seat (codec.NoSeat if none),
+// so STATE is built per recipient.
+//
+// Until the GS-7 reducer lands, the server has no takeback request state of
+// the v1.3 kind (takeback_by is always NoSeat) and no ClockStarted event: from
+// the first move on, the side to move's clock runs from the anchor (the last
+// move); at ply 0 no clock is reported running.
+func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 	clocks := make([]uint32, len(snap.RemainingMs))
 	for i, ms := range snap.RemainingMs {
 		if ms < 0 {
@@ -305,7 +315,43 @@ func snapshotToStateBody(snap session.Snapshot) codec.StateBody {
 		}
 		clocks[i] = uint32(ms)
 	}
-	return codec.StateBody{FEN: snap.FEN, Turn: snap.Turn, Clocks: clocks}
+	body := codec.StateBody{
+		FEN:           snap.FEN,
+		Turn:          snap.Turn,
+		Clocks:        clocks,
+		YouSeat:       youSeat,
+		Ply:           snap.Ply,
+		Status:        codec.StatusMatched,
+		ResultVector:  []uint8{},
+		LastMoveUCI:   snap.LastMoveUCI,
+		PendingDrawBy: codec.NoSeat,
+		TakebackBy:    codec.NoSeat,
+		RunningSeat:   codec.NoSeat,
+		ServerT:       uint64(snap.ClockAnchor.UnixMilli()),
+	}
+	if snap.DrawOfferBy >= 0 {
+		body.PendingDrawBy = uint8(snap.DrawOfferBy)
+	}
+	switch {
+	case snap.Ended:
+		body.Status = codec.StatusEnded
+		body.Termination = uint8(snap.Terminal)
+		body.ResultVector = make([]uint8, len(snap.ResultVector))
+		for i, r := range snap.ResultVector {
+			body.ResultVector[i] = uint8(r)
+		}
+		body.PendingDrawBy = codec.NoSeat
+	case snap.Phase == game.PhaseLive:
+		body.Status = codec.StatusLive
+		// No clock runs before the first move: the anchor at ply 0 is session
+		// construction (or a rebuild), not a real clock start, so claiming a
+		// running clock would charge the first mover for that time. GS-7's
+		// ClockStarted event will define when the first clock starts.
+		if snap.Ply > 0 {
+			body.RunningSeat = snap.Turn
+		}
+	}
+	return body
 }
 
 // gameEndFromSnapshot builds a GAME_END from an ended session snapshot. The

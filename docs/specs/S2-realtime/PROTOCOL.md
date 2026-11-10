@@ -5,8 +5,8 @@
 | Spec ID | SPEC-S2-PROTOCOL |
 | Owner | S2 Real-time (stream lead — fill in); co-reviewed by S3 Platform + PE Platform-Eng + Architecture group |
 | Status | RATIFIED |
-| Version | 1.2 |
-| Last updated | 2026-11-09 (text brought current with the shipped codec: §4A v1.1 per ADR-17, §4A v1.2 per ADR-18, postcard payload framing per ADR-14; issue #106. No new protocol decision.) |
+| Version | 1.3 (wire) |
+| Last updated | 2026-11-10 (§4A v1.3 per ADR-19 folded in: new codes, event types, §4A.10 status and the v1.3 STATE body. The v1.3 §5 behaviour rows fold in with the GS-7 server reducer; see PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md §7.) |
 | Implements (master IDs) | X-2, X-13, ADR-10, NFR-5, NFR-7, NFR-10; MASTER §VIII (VIII.1–VIII.4), §IX.1 |
 | Depends on | SPEC-S1-ENGINE-CORE (G-A, GREEN) — the server validates intents via the engine |
 | Gates it feeds | **G-D** (API/protocol contract frozen v1). Per owner decision Q-P1=(b), G-D is green only when **this spec AND `PE/API-CONTRACT.md` (REST surface, X-13) are frozen together** — this is the realtime half of the v1 surface, not the whole gate. |
@@ -72,13 +72,19 @@ This spec covers exactly **three artifacts**, matching the `protocol/` folder's 
 | `0x08` | C | REMATCH | `game_id` |
 | `0x09` | C | PING | `t: u64` (client monotonic ms) |
 | `0x0A` | C | RESYNC | `game_id` (v1.1, ADR-17: ask for a fresh STATE) |
+| `0x0B` | C | TAKEBACK_ACCEPT | `game_id, at_ply: u32` (v1.3, ADR-19) |
+| `0x0C` | C | TAKEBACK_DECLINE | `game_id, at_ply: u32` (v1.3: decline, or cancel by the proposer) |
+| `0x0D` | C | DECLINE_DRAW | `game_id` (v1.3: decline, or withdraw by the offerer) |
 | `0x81` | S | MATCHED | `game_id, seat_idx: u8, opponent, start_state` |
 | `0x82` | S | MOVE_ACCEPTED | `game_id, ply: u32, uci: str, clock_after_ms: u32` (v1.2, ADR-18: carries `uci`, sent to both seats) |
 | `0x83` | S | MOVE_REJECTED | `game_id, ply_expected: u32, reason: enum` |
-| `0x84` | S | STATE | `game_id, fen: str, turn: u8, clocks` (full resync) |
+| `0x84` | S | STATE | `game_id, STATE-body` (full resync; v1.3 body in §4A.6, built per recipient) |
 | `0x85` | S | GAME_END | `game_id, result_vector, termination: enum, rating_delta` |
 | `0x86` | S | PONG | `t: u64, server_t: u64` (clock sync, NFR-1 drift budget) |
 | `0x87` | S | DRAW_OFFERED | `game_id, by: u8` (v1.1, ADR-17: pushed to the opponent on a new offer) |
+| `0x88` | S | TAKEBACK_OFFERED | `game_id, seat_idx: u8, at_ply: u32` (v1.3, ADR-19) |
+| `0x89` | S | TAKEBACK_DECLINED | `game_id, seat_idx: u8` (v1.3) |
+| `0x8A` | S | DRAW_DECLINED | `game_id, seat_idx: u8` (v1.3) |
 | `0x8F` | S | ERROR | `code: enum, msg: str` |
 
 **Payload encoding — DECIDED (ADR-14).** One schema-defined binary codec in the shared Rust core (`protocol/codec`), bound into every client and the Go server. Payloads are **postcard**-encoded; the two header bytes are written raw (§4A.1). The concrete byte rules are in §4A.
@@ -94,7 +100,7 @@ This spec covers exactly **three artifacts**, matching the `protocol/` folder's 
 
 A game is the stream `game/{id}`: an ordered, append-only sequence of immutable events. Board state, PGN and the `Move` projection are **folds** of this stream (never written directly). Anti-cheat (ADR-2) subscribes to the same stream.
 
-**Canonical event set (v1).** Exactly MASTER §VIII.3; no additions:
+**Canonical event set (v1).** Exactly MASTER §VIII.3 as amended by ADR-19 (v1.3 adds the last five rows; a v1.3 server never writes `TakebackReq`/`TakebackAccepted`, which stay decodable):
 
 | Event | Schema |
 |---|---|
@@ -110,6 +116,11 @@ A game is the stream `game/{id}`: an ordered, append-only sequence of immutable 
 | `ClockFlagged` | `{seat_idx}` |
 | `GameEnded` | `{result_vector, termination}` |
 | `RatingApplied` | `{pool_id, per_seat: [{seat_idx, before, after, rd, vol}]}` |
+| `TakebackProposed` | `{seat_idx}` (v1.3) |
+| `TakebackRewound` | `{seat_idx, to_ply: u32, server_ts: u64}` (v1.3) |
+| `TakebackDeclined` | `{seat_idx}` (v1.3) |
+| `DrawDeclined` | `{seat_idx}` (v1.3) |
+| `ClockStarted` | `{server_ts: u64}` (v1.3) |
 
 **Event envelope.** Each persisted event carries metadata around the body:
 ```
@@ -180,10 +191,13 @@ Client→server `0x01–0x7F`; server→client `0x80–0xFF` (high bit = directi
 | 0x06 | C | ABORT | | 0x86 | S | PONG |
 | 0x07 | C | TAKEBACK | | 0x8F | S | ERROR |
 | 0x08 | C | REMATCH | | 0x87 | S | DRAW_OFFERED |
-| 0x09 | C | PING | | | | |
-| 0x0A | C | RESYNC | | | | |
+| 0x09 | C | PING | | 0x88 | S | TAKEBACK_OFFERED |
+| 0x0A | C | RESYNC | | 0x89 | S | TAKEBACK_DECLINED |
+| 0x0B | C | TAKEBACK_ACCEPT | | 0x8A | S | DRAW_DECLINED |
+| 0x0C | C | TAKEBACK_DECLINE | | | | |
+| 0x0D | C | DECLINE_DRAW | | | | |
 
-v1.1 (ADR-17) added `0x0A RESYNC` and `0x87 DRAW_OFFERED` in reserved slots; no existing code moved.
+v1.1 (ADR-17) added `0x0A RESYNC` and `0x87 DRAW_OFFERED`; v1.3 (ADR-19) added `0x0B–0x0D` and `0x88–0x8A`. All in reserved slots; no existing code moved. In v1.3 `0x07 TAKEBACK` means "request" only.
 
 ### 4A.3 Payload field layouts (field order fixed)
 `game_id` = `str36` (UUID text); `uci` = `str5` max; `token` = `str` (≤ 4096); `time_control` = `str` id (Q-A4); `fen` = `str` (≤ 90).
@@ -192,15 +206,18 @@ v1.1 (ADR-17) added `0x0A RESYNC` and `0x87 DRAW_OFFERED` in reserved slots; no 
 AUTHENTICATE   token:str
 SEEK           pool_id:str, time_control:str, rated:bool
 MOVE           game_id:str36, ply_expected:u32, uci:str5
-OFFER_DRAW/RESIGN/ABORT/TAKEBACK/REMATCH/RESYNC   game_id:str36
+OFFER_DRAW/RESIGN/ABORT/TAKEBACK/REMATCH/RESYNC/DECLINE_DRAW   game_id:str36
+TAKEBACK_ACCEPT/TAKEBACK_DECLINE   game_id:str36, at_ply:u32
 PING           t:u64
 MATCHED        game_id:str36, seat_idx:u8, opponent:str(handle), start_state:STATE-body(§4A.6)
 MOVE_ACCEPTED  game_id:str36, ply:u32, uci:str5, clock_after_ms:u32
 MOVE_REJECTED  game_id:str36, ply_expected:u32, reason:enum8(§4A.4)
-STATE          game_id:str36, fen:str, turn:u8, clocks:[u32; seat_count]
+STATE          game_id:str36, STATE-body(§4A.6)
 GAME_END       game_id:str36, result_vector:[u8; seat_count], termination:enum8(§4A.5), rating_delta:[i16; seat_count]
 PONG           t:u64, server_t:u64
 DRAW_OFFERED   game_id:str36, by:u8
+TAKEBACK_OFFERED   game_id:str36, seat_idx:u8, at_ply:u32
+TAKEBACK_DECLINED/DRAW_DECLINED   game_id:str36, seat_idx:u8
 ERROR          code:enum8(§4A.7), msg:str
 ```
 `MOVE_ACCEPTED.uci` (v1.2, ADR-18) is the move just applied, in the same position as in the `MovePlayed` event body; the server sends it to BOTH seats for every accepted move (and then `GAME_END` if that move ended the game). On a duplicate `MOVE` it echoes the persisted move's `uci`. `RESYNC` shares the bare `game_id` payload with the ending commands.
@@ -214,8 +231,37 @@ ERROR          code:enum8(§4A.7), msg:str
 
 (Matches `Game.termination` enum in SPEC-S3-DATA-MODEL §3.4.)
 
-### 4A.6 `STATE`-body (reused by MATCHED.start_state — Q-P4 DECIDED)
-The `start_state` field of `MATCHED` is **exactly the STATE payload from `fen` onward** (`fen:str, turn:u8, clocks:[u32; seat_count]`) — one state format, no second encoding (resolves Q-P4).
+### 4A.6 `STATE`-body (reused by MATCHED.start_state — Q-P4 DECIDED; v1.3)
+The `start_state` field of `MATCHED` is **exactly the STATE payload after `game_id`** — one state format, no second encoding (resolves Q-P4). v1.3 (ADR-19) body:
+```
+fen:str, turn:u8, clocks:[u32; seat_count],
+you_seat:u8, ply:u32, status:enum8(§4A.10),
+result_vector:[u8], termination:u8,
+last_move_uci:str5,
+pending_draw_by:u8, takeback_by:u8, takeback_at_ply:u32,
+running_seat:u8, server_t:u64
+```
+| Field | Meaning |
+|---|---|
+| `you_seat` | the recipient's seat; `0xFF` = none |
+| `ply` | server ply; the next `MOVE.ply_expected` is `ply + 1` |
+| `result_vector` | §4A.3 result codes when `ENDED`, empty otherwise |
+| `termination` | §4A.5 code when `ENDED`, `0x00` otherwise |
+| `last_move_uci` | the last live move; empty iff `ply == 0` |
+| `pending_draw_by` | seat with a pending draw offer, `0xFF` none |
+| `takeback_by`, `takeback_at_ply` | pending takeback request; `0xFF` / `0` when none |
+| `running_seat` | seat whose clock runs, `0xFF` if none |
+| `server_t` | server epoch ms at which `clocks` are valid; the running seat's clock runs from it |
+
+**Decode-time invariants** (a frame violating one is malformed; enforced on encode and decode by the Rust codec, so every binding and the Go seams inherit them):
+1. `result_vector` non-empty iff `status == ENDED`, and then `len == clocks.len()`.
+2. `termination != 0x00` iff `status == ENDED`.
+3. `you_seat`, `pending_draw_by`, `takeback_by`, `running_seat` each `< clocks.len()` or `0xFF`.
+4. `takeback_at_ply == 0` iff `takeback_by == 0xFF`.
+5. `last_move_uci` ≤ 5 bytes, empty iff `ply == 0`.
+6. `running_seat == 0xFF` when `status == ENDED`.
+
+`STATE` is built **per recipient** (`you_seat` differs per connection). An old (v1.2) client cannot decode this body, so v1.3 server and clients ship together.
 
 ### 4A.7 `error code` enum (ERROR) — u8, frozen
 | 0x01 UNSUPPORTED_VERSION | 0x02 PROTOCOL_VIOLATION | 0x03 UNKNOWN_GAME | 0x04 UNAUTHENTICATED | 0x05 RATE_LIMITED | 0x06 INTERNAL |
@@ -234,11 +280,21 @@ DrawOffered/DrawAccepted/Resigned/TakebackReq/TakebackAccepted/ClockFlagged   se
 Aborted          by:u8   (0xFF = system)
 GameEnded        result_vector:[u8], termination:enum8(§4A.5)
 RatingApplied    pool_id:str, per_seat:[{seat_idx:u8, before:i16, after:i16, rd:u16, vol:f32}]
+TakebackProposed/TakebackDeclined/DrawDeclined   seat_idx:u8   (v1.3)
+TakebackRewound  seat_idx:u8, to_ply:u32, server_ts:u64   (v1.3)
+ClockStarted     server_ts:u64   (v1.3)
 ```
 `color` u8: `0=white, 1=black` (N-seat variants extend).
 
 ### 4A.9 Event `type` enum — u8, frozen
-| 0x01 GameCreated | 0x02 PlayerJoined | 0x03 MovePlayed | 0x04 DrawOffered | 0x05 DrawAccepted | 0x06 Resigned | 0x07 Aborted | 0x08 TakebackReq | 0x09 TakebackAccepted | 0x0A ClockFlagged | 0x0B GameEnded | 0x0C RatingApplied |
+| 0x01 GameCreated | 0x02 PlayerJoined | 0x03 MovePlayed | 0x04 DrawOffered | 0x05 DrawAccepted | 0x06 Resigned | 0x07 Aborted | 0x08 TakebackReq | 0x09 TakebackAccepted | 0x0A ClockFlagged | 0x0B GameEnded | 0x0C RatingApplied | 0x0D TakebackProposed | 0x0E TakebackRewound | 0x0F TakebackDeclined | 0x10 DrawDeclined | 0x11 ClockStarted |
+
+`0x08`/`0x09` are frozen: decodable, never written by a v1.3 server.
+
+### 4A.10 `status` enum (STATE) — u8, frozen (v1.3)
+| 0x01 MATCHED | 0x02 LIVE | 0x03 ENDED |
+
+`0x00` and unlisted values are rejected on decode.
 
 All enum spaces leave unused codes reserved for v1-additive events/variants (§5 extensibility); a code is never reused for a different meaning across a version.
 
@@ -249,7 +305,7 @@ All enum spaces leave unused codes reserved for v1-additive events/variants (§5
 | **Stale/racing move** (`ply_expected` ≠ server ply) | `S MOVE_REJECTED {ply_expected = server's current, reason=STALE_PLY}`. `ply_expected` on the `C MOVE` is the race guard (MASTER §VIII.4). |
 | **Illegal move** | Engine rejects → `MOVE_REJECTED {reason=ILLEGAL}`. No event appended. |
 | **Move arrives after game ended** | `MOVE_REJECTED {reason=GAME_OVER}`. |
-| **Reconnect** | Client re-auths; the server pushes `S STATE {fen, turn, clocks}` for the user's live game after `AUTHENTICATE` (NFR-2 no game loss). A client can also ask with `C RESYNC` (v1.1). STATE is a fold of the event stream, authoritative. |
+| **Reconnect** | Client re-auths; the server pushes `S STATE` (§4A.6: seat, ply, status, result, last move, pending draw, clock anchor) for the user's live game after `AUTHENTICATE` (NFR-2 no game loss). A client can also ask with `C RESYNC` (v1.1). STATE is a fold of the event stream, authoritative. |
 | **Duplicate MOVE (client retry)** | Idempotent on `(game_id, ply_expected)`: if that ply is already persisted, re-send `MOVE_ACCEPTED` for it (echoing the persisted `uci`, v1.2) rather than appending a second event. (Protects the NFR-7 persist-before-ack window on a flaky socket.) |
 | **Unknown/zero `game_id`** | `ERROR {code=UNKNOWN_GAME}`. |
 | **Unsupported protocol version** | `ERROR {code=UNSUPPORTED_VERSION}`, socket closed. |
@@ -318,6 +374,7 @@ Owner directive (2026-10-12): **correctness and highest quality over speed.** Th
 | 1.1 | 2026-10-16 | `C RESYNC 0x0A`, `S DRAW_OFFERED 0x87` (additive) | ADR-17; slice `PROTOCOL-V1.1-RESYNC-DRAWOFFERED.md`, merged #56 |
 | 1.2 | 2026-10-16 | `MOVE_ACCEPTED` gains `uci` and goes to both seats (mutates a frozen frame) | ADR-18; slice `PROTOCOL-V1.2-MOVEACCEPTED-UCI.md`, merged #61 |
 | text | 2026-11-09 | v1.1/v1.2 folded into this document; §4A physical encoding corrected to postcard; stale Q-P2/ADR-14 PROPOSED text removed (#106). No wire change. | none (doc correction) |
+| 1.3 | 2026-11-10 | Takeback accept/decline, draw decline, five new events, §4A.10 status, v1.3 STATE body (mutates `0x81` and `0x84`). Wire and tables folded in; the §5 behaviour rows fold in with the GS-7 reducer. | ADR-19; slice `PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md` |
 
 The major `ver` byte stays `0x01` for v1.x. Version numbers here are document versions of the v1 wire.
 

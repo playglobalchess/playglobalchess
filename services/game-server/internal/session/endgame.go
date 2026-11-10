@@ -80,7 +80,7 @@ func (c *resignCmd) apply(ctx context.Context, s *Session) {
 		c.err = fmt.Errorf("session: append resign ending: %w", err)
 		return
 	}
-	s.endGame(game.TermResign)
+	s.endGame(game.TermResign, rv)
 }
 
 // --- Abort ------------------------------------------------------------------
@@ -124,7 +124,7 @@ func (c *abortCmd) apply(ctx context.Context, s *Session) {
 		c.err = fmt.Errorf("session: append abort ending: %w", err)
 		return
 	}
-	s.endGame(game.TermAbort)
+	s.endGame(game.TermAbort, rv)
 }
 
 // --- Draw offer / accept ----------------------------------------------------
@@ -194,7 +194,7 @@ func (c *offerDrawCmd) apply(ctx context.Context, s *Session) {
 			return
 		}
 		s.drawOfferBy = nil
-		s.endGame(game.TermDrawAgree)
+		s.endGame(game.TermDrawAgree, rv)
 		return
 	}
 	// A repeat offer by the same seat is a no-op (offer already pending).
@@ -257,7 +257,7 @@ func (c *acceptDrawCmd) apply(ctx context.Context, s *Session) {
 		return
 	}
 	s.drawOfferBy = nil
-	s.endGame(game.TermDrawAgree)
+	s.endGame(game.TermDrawAgree, rv)
 }
 
 // --- result-vector helpers (2-seat, Q-EG4) ----------------------------------

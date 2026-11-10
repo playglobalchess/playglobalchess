@@ -19,8 +19,11 @@
 > [GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md](GAME-SERVER-GS7-FOLD-TAKEBACK-DRAW.md).
 > This document pins only bytes, codes, tables and client rules.
 >
-> **Ratified, not implemented.** Approved 2026-11-09. The shipped codec is still
-> v1.2; this text is folded into `PROTOCOL.md` only by the PR that implements it.
+> **Wire implemented; behaviour pending.** Approved 2026-11-09. The codec, every
+> binding, the Go seams and the web mirror implement §2–§6, and §2–§6 are folded
+> into `PROTOCOL.md` (2026-11-10). The server still behaves as v1.2 for takeback,
+> draw decline and duplicate MOVE: the §7 rows describe the GS-7 reducer and fold
+> into `PROTOCOL.md` §5 with it.
 
 ## 1. Summary of changes
 
@@ -152,10 +155,11 @@ the new codes are in `PROTOCOL.md` §4A.2.
 ## 10. Acceptance criteria
 
 - [x] ADR-19 reviewed by S2, S4, PE, S6 and the architecture group; this document RATIFIED (2026-11-09).
-- [ ] Codec, all bindings and the Go seams implement §2–§6; decode invariants enforced in each.
-- [ ] Golden corpus per §8; all consumers byte-identical; v1.2 vectors other than `state`/`matched` unchanged.
-- [ ] Client rules (§7) covered by client contract tests (web now; iOS/Android in P2).
-- [ ] Folded into `PROTOCOL.md` (text version 1.3) in the implementing PR; docs-check green.
+- [x] Codec, UniFFI, wasm, the Go seams and the web mirror implement §2–§6; the decode invariants are enforced in the Rust codec on encode and decode, which every binding and the Go seams call.
+- [x] Golden corpus per §8, reproduced byte-for-byte by Rust, Go and wasm; v1.2 vectors other than the three STATE-body vectors (`state`, `state_max_fen`, `matched`) unchanged.
+- [x] Swift and Kotlin host parity read the v1.3 STATE fields through the generated bindings and round-trip the frame. The Android instrumented and iOS XCTest suites carry the same check but only run on a device or Simulator (P2).
+- [x] §2–§6 folded into `PROTOCOL.md` (wire 1.3); docs-check green.
+- [ ] §7 rows (takeback, decline, duplicate MOVE, the two client rules) folded into `PROTOCOL.md` §5. Lands with the GS-7 reducer and web reducer, with client contract tests.
 
 ## 11. Open questions
 

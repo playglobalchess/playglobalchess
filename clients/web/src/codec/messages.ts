@@ -64,11 +64,30 @@ export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];
 export type SeatResult = 0 | 1 | 2;
 
 // --- shared value structs (§4A.6) ------------------------------------------
-/** STATE body / MATCHED.start_state (§4A.6): fen, turn, clocks. */
+// STATE status (§4A.10, v1.3).
+export const Status = { Matched: 1, Live: 2, Ended: 3 } as const;
+export type StatusValue = (typeof Status)[keyof typeof Status];
+
+/** "No seat" sentinel for the STATE seat fields (§4A.6 v1.3). */
+export const NO_SEAT = 0xff;
+
+/** STATE body / MATCHED.start_state (§4A.6, v1.3). Field order is the Rust
+ * StateBody order; the codec enforces the §4A.6 invariants on both sides. */
 export interface StateBody {
   fen: string;
   turn: number; // side-to-move seat index (u8)
   clocks: number[]; // per-seat remaining ms ([u32; seat_count])
+  you_seat: number; // the recipient's seat, NO_SEAT if none
+  ply: number; // server ply; the next MOVE.ply_expected is ply + 1
+  status: StatusValue;
+  result_vector: SeatResult[]; // non-empty iff status is Ended
+  termination: number; // TerminationCode iff Ended, else 0
+  last_move_uci: string; // empty iff ply is 0
+  pending_draw_by: number; // NO_SEAT if none
+  takeback_by: number; // NO_SEAT if none
+  takeback_at_ply: number; // 0 iff takeback_by is NO_SEAT
+  running_seat: number; // NO_SEAT if no clock runs
+  server_t: bigint; // server epoch ms at which clocks are valid (u64)
 }
 
 // --- client → server messages (§4A.2, externally tagged) -------------------
@@ -82,7 +101,10 @@ export type ClientMsg =
   | { Takeback: { game_id: GameId } }
   | { Rematch: { game_id: GameId } }
   | { Ping: { t: bigint } }
-  | { Resync: { game_id: GameId } }; // §4A v1.1 (ADR-17)
+  | { Resync: { game_id: GameId } } // §4A v1.1 (ADR-17)
+  | { TakebackAccept: { game_id: GameId; at_ply: number } } // §4A v1.3 (ADR-19)
+  | { TakebackDecline: { game_id: GameId; at_ply: number } } // §4A v1.3
+  | { DeclineDraw: { game_id: GameId } }; // §4A v1.3
 
 // --- server → client messages (§4A.2, externally tagged) -------------------
 export type ServerMsg =
@@ -107,6 +129,9 @@ export type ServerMsg =
     }
   | { Pong: { t: bigint; server_t: bigint } }
   | { DrawOffered: { game_id: GameId; by: number } } // §4A v1.1 (ADR-17)
+  | { TakebackOffered: { game_id: GameId; seat_idx: number; at_ply: number } } // §4A v1.3 (ADR-19)
+  | { TakebackDeclined: { game_id: GameId; seat_idx: number } } // §4A v1.3
+  | { DrawDeclined: { game_id: GameId; seat_idx: number } } // §4A v1.3
   | { Error: { code: ErrorCodeValue; msg: string } };
 
 // --- discriminant helpers (externally-tagged tag extraction) ---------------

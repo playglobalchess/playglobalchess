@@ -20,6 +20,8 @@ let SERVER_GAME_END_HEX =
     "01852466343761633130622d353863632d343337322d613536372d3065303262326333643437390202000a021817"
 let SERVER_MOVE_ACCEPTED_HEX =
     "01822466343761633130622d353863632d343337322d613536372d3065303262326333643437391204653265349c9412"
+let SERVER_STATE_PENDING_HEX =
+    "01842466343761633130622d353863632d343337322d613536372d3065303262326333643437393b726e62716b626e722f70707070707070702f382f382f3450332f382f50505050315050502f524e42514b424e522062204b516b7120653320302031010290a10fa0ef0f0112020000046731663300011201f483cea6a532"
 let EVENT_RATING_APPLIED_HEX =
     "2967616d652f66343761633130622d353863632d343337322d613536372d3065303262326333643437390c0c008080cea6a5320e626c69747a2d7374616e646172640200b817d0173c8fc2753d01b817a0173c8fc2753d"
 
@@ -54,6 +56,19 @@ do {
     let ma = fromHex(SERVER_MOVE_ACCEPTED_HEX)
     let maMsg = try decodeServer(frame: ma)
     check(try encodeServer(msg: maMsg) == ma, "server move_accepted (§4A v1.2, carries uci) decode→re-encode identical")
+
+    // Server: §4A v1.3 STATE (pending draw + takeback). Decode, READ the new
+    // fields through the binding, and re-encode identically.
+    let st = fromHex(SERVER_STATE_PENDING_HEX)
+    let stMsg = try decodeServer(frame: st)
+    if case let .state(_, body) = stMsg {
+        check(body.youSeat == 1 && body.ply == 18 && body.status == 2 && body.lastMoveUci == "g1f3"
+            && body.pendingDrawBy == 0 && body.takebackBy == 1 && body.takebackAtPly == 18
+            && body.runningSeat == 1, "server state (§4A v1.3) v1.3 fields read through the binding")
+    } else {
+        check(false, "server state (§4A v1.3) decodes as .state")
+    }
+    check(try encodeServer(msg: stMsg) == st, "server state (§4A v1.3) decode→re-encode identical")
 
     // Event.
     let e = fromHex(EVENT_RATING_APPLIED_HEX)

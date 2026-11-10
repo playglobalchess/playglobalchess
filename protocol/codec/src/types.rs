@@ -217,8 +217,34 @@ enum8!(
         GameEnded = 0x0B,
         /// 0x0C
         RatingApplied = 0x0C,
+        /// 0x0D (v1.3, ADR-19)
+        TakebackProposed = 0x0D,
+        /// 0x0E (v1.3)
+        TakebackRewound = 0x0E,
+        /// 0x0F (v1.3)
+        TakebackDeclined = 0x0F,
+        /// 0x10 (v1.3)
+        DrawDeclined = 0x10,
+        /// 0x11 (v1.3)
+        ClockStarted = 0x11,
     }
 );
+
+enum8!(
+    /// `STATE.status` — §4A.10 (v1.3). `0x00` and unlisted values are rejected.
+    Status {
+        /// 0x01 — matched, no clock running yet.
+        MATCHED = 0x01,
+        /// 0x02 — live.
+        LIVE = 0x02,
+        /// 0x03 — ended.
+        ENDED = 0x03,
+    }
+);
+
+/// "No seat" sentinel for the STATE seat fields (`you_seat`, `pending_draw_by`,
+/// `takeback_by`, `running_seat`), §4A.6 v1.3.
+pub const NO_SEAT: u8 = 0xFF;
 
 // --- shared value structs (§4A.3, §4A.6, §4A.8) -----------------------------
 
@@ -265,9 +291,12 @@ pub fn is_known_color(c: Color) -> bool {
 /// `Aborted.by` sentinel for a system-initiated abort (§4A.8): `0xFF`.
 pub const ABORT_BY_SYSTEM: u8 = 0xFF;
 
-/// The `STATE` body from `fen` onward (§4A.6). Reused verbatim as
+/// The `STATE` body from `fen` onward (§4A.6, v1.3). Reused verbatim as
 /// `MATCHED.start_state` (Q-P4 DECIDED) — one state format, no second encoding.
-/// Field order: `fen, turn, clocks`.
+/// Field order IS the wire contract: `fen, turn, clocks, you_seat, ply, status,
+/// result_vector, termination, last_move_uci, pending_draw_by, takeback_by,
+/// takeback_at_ply, running_seat, server_t`. The six §4A.6 decode invariants are
+/// enforced by `codec::check_state_body` on encode and decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateBody {
     /// Full-position FEN (`str`, ≤ 90). Only ever carried in STATE resync,
@@ -279,6 +308,28 @@ pub struct StateBody {
     /// 2-seat and ADR-3 N-seat both encode as the postcard length-prefixed
     /// sequence the spec names (`[u32; seat_count]`).
     pub clocks: Vec<u32>,
+    /// The recipient's seat; [`NO_SEAT`] = none.
+    pub you_seat: u8,
+    /// Server ply; the next `MOVE.ply_expected` is `ply + 1`.
+    pub ply: u32,
+    /// §4A.10.
+    pub status: Status,
+    /// §4A.3 result codes when `ENDED`, empty otherwise.
+    pub result_vector: Vec<SeatResult>,
+    /// §4A.5 code when `ENDED`, `0x00` otherwise (so a raw `u8`, not `Termination`).
+    pub termination: u8,
+    /// The last live move (≤ 5 bytes); empty iff `ply == 0`.
+    pub last_move_uci: String,
+    /// Seat with a pending draw offer, [`NO_SEAT`] none.
+    pub pending_draw_by: u8,
+    /// Seat with a pending takeback request, [`NO_SEAT`] none.
+    pub takeback_by: u8,
+    /// Ply of the pending takeback request; `0` iff none.
+    pub takeback_at_ply: u32,
+    /// Seat whose clock runs, [`NO_SEAT`] if none.
+    pub running_seat: u8,
+    /// Server epoch ms at which `clocks` are valid.
+    pub server_t: u64,
 }
 
 /// One seat descriptor inside `GameCreated.seats` (§4A.8): `{seat_idx, color}`.
