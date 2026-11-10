@@ -129,9 +129,10 @@ export type Action =
   | { kind: "localRequestTakeback" }
   | { kind: "localDeclineTakeback" }
   // `at` is the local monotonic time (ms) the action happened: the clock anchor
-  // (#112). Optional so callers that do not care about clocks can omit it (0).
-  | { kind: "localMove"; uci: string; at?: number } // user made a board move (optimistic)
-  | { kind: "server"; msg: ServerMsg; at?: number }; // a decoded ServerMsg arrived
+  // (#112). REQUIRED, so a dispatch path that forgets it is a type error rather
+  // than an anchor at 0 that silently shows the running clock as 0:00.
+  | { kind: "localMove"; uci: string; at: number } // user made a board move (optimistic)
+  | { kind: "server"; msg: ServerMsg; at: number }; // a decoded ServerMsg arrived
 
 /** Pure reducer. */
 export function reduce(state: GameState, action: Action): GameState {
@@ -184,7 +185,7 @@ export function reduce(state: GameState, action: Action): GameState {
       return {
         ...state,
         position: optimistic,
-        clocks: displayClocks(state, action.at ?? 0),
+        clocks: displayClocks(state, action.at),
         clockRun: null,
         pendingMove: {
           uci: action.uci,
@@ -198,7 +199,7 @@ export function reduce(state: GameState, action: Action): GameState {
     }
 
     case "server":
-      return reduceServer(state, action.msg, action.at ?? 0);
+      return reduceServer(state, action.msg, action.at);
   }
 }
 
@@ -262,7 +263,9 @@ function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
         // and ask for a resync when we are behind (a gap), not on a stale replay.
         return {
           ...state,
-          // A moot optimistic move froze our clock; restart it from before.
+          // A moot optimistic move (a duplicate or gap accept superseded it)
+          // froze our clock; restart it from its anchor, as on a reject, so it
+          // does not stand still until the resync STATE arrives.
           ...(state.pendingMove != null
             ? { clocks: state.pendingMove.prevClocks, clockRun: state.pendingMove.prevClockRun }
             : {}),

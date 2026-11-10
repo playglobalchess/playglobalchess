@@ -105,6 +105,34 @@ describe("ticking clocks (#112)", () => {
     expect(displayClocks(s, 5000)).toEqual([296000, 300000]);
   });
 
+  // A pending move made moot by a duplicate or gap accept: the board waits (for
+  // nothing, or for the resync STATE), and our clock must keep running from its
+  // anchor rather than stay frozen at the moment we moved.
+  function afterE4E5AsWhite(): GameState {
+    let s = matched(0, 0);
+    s = accepted(s, 1, "e2e4", 299000, 1000); // Black runs from 1000
+    return accepted(s, 2, "e7e5", 297000, 4000); // White runs from 4000
+  }
+
+  it("a duplicate accept over our pending move restarts our clock", () => {
+    let s = afterE4E5AsWhite();
+    s = reduce(s, { kind: "localMove", uci: "g1f3", at: 6000 });
+    expect(s.clockRun).toBeNull();
+    s = accepted(s, 2, "e7e5", 297000, 6100); // re-ack of ply 2: moot
+    expect(s.pendingMove).toBeNull();
+    expect(s.clockRun).toEqual({ seat: 0, since: 4000 });
+    expect(displayClocks(s, 9000)).toEqual([294000, 297000]);
+  });
+
+  it("a gap accept over our pending move restarts our clock and asks for a resync", () => {
+    let s = afterE4E5AsWhite();
+    s = reduce(s, { kind: "localMove", uci: "g1f3", at: 6000 });
+    s = accepted(s, 4, "b8c6", 290000, 6100); // ply 3 never arrived
+    expect(s.needsResync).toBe(true);
+    expect(s.clockRun).toEqual({ seat: 0, since: 4000 });
+    expect(displayClocks(s, 9000)).toEqual([294000, 297000]);
+  });
+
   it("a MOVE_ACCEPTED after GAME_END (#92 reordering) does not restart a clock", () => {
     let s = matched(0, 0);
     s = server(s, { GameEnd: { game_id: GID, result_vector: [2, 0], termination: 0x02, rating_delta: [] } }, 1000);

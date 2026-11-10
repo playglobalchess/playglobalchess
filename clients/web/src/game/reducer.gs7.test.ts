@@ -9,7 +9,7 @@ import { sb } from "../test/stateBody";
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const GID = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
 
-const server = (s: GameState, msg: ServerMsg): GameState => reduce(s, { kind: "server", msg });
+const server = (s: GameState, msg: ServerMsg): GameState => reduce(s, { kind: "server", at: 0, msg });
 
 /** Seat `seat` in an unrated game at the start position. */
 function matched(seat: number, rated = false): GameState {
@@ -131,7 +131,7 @@ describe("GS-7 reducer: STATE v1.3 drives everything (§7.4, #101)", () => {
     // White at ply 2 requests a takeback, then makes an optimistic move that is
     // still awaiting its ack when the rewind STATE (ply 1) arrives.
     let s = reduce(afterTwoPlies(0), { kind: "localRequestTakeback" });
-    s = reduce(s, { kind: "localMove", uci: "g1f3" });
+    s = reduce(s, { kind: "localMove", at: 0, uci: "g1f3" });
     expect(s.pendingMove?.uci).toBe("g1f3"); // really pending (white to move)
     const fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
     s = server(s, { State: { game_id: GID, state: sb(fen, 1, [301000, 300000], { ply: 1, last_move_uci: "e2e4" }) } });

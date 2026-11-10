@@ -118,7 +118,8 @@ board + both clocks from `start_state`.
   last server value; the server stays authoritative and the client never flags.
   `MATCHED`/`STATE` start `running_seat`; `MOVE_ACCEPTED` sets the mover's
   `clock_after_ms` and starts the other side; our own move stops our clock at
-  once (a reject restarts it from its anchor); `GAME_END` freezes both. The
+  once (a reject, or a duplicate or gap `MOVE_ACCEPTED` that makes the pending
+  move moot, restarts it from its anchor); `GAME_END` freezes both. The
   anchor is the local monotonic time a frame ARRIVES, not `server_t`: the client
   sends no `PING`, so it has no offset to map `server_t`, and `MOVE_ACCEPTED`
   carries none. The display is therefore up to one network latency generous,

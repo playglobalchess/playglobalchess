@@ -20,7 +20,7 @@ function matched(seat: number): ServerMsg {
 
 /** A playing state as seat 0 (white), fresh from MATCHED. */
 function playingAsWhite(): GameState {
-  return reduce(initialState, { kind: "server", msg: matched(0) });
+  return reduce(initialState, { kind: "server", at: 0, msg: matched(0) });
 }
 
 function pieceAt(s: GameState, sq: string): string | null {
@@ -40,7 +40,7 @@ describe("game reducer", () => {
 
   it("optimistic localMove shows the move and records a revert point", () => {
     const s0 = playingAsWhite();
-    const s1 = reduce(s0, { kind: "localMove", uci: "e2e4" });
+    const s1 = reduce(s0, { kind: "localMove", at: 0, uci: "e2e4" });
     expect(pieceAt(s1, "e4")).toBe("P");
     expect(pieceAt(s1, "e2")).toBeNull();
     expect(s1.pendingMove?.uci).toBe("e2e4");
@@ -48,9 +48,9 @@ describe("game reducer", () => {
 
   it("MOVE_ACCEPTED confirming the pending move clears pending, keeps the board", () => {
     const s0 = playingAsWhite();
-    const s1 = reduce(s0, { kind: "localMove", uci: "e2e4" });
+    const s1 = reduce(s0, { kind: "localMove", at: 0, uci: "e2e4" });
     const s2 = reduce(s1, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } },
     });
     expect(s2.pendingMove).toBeNull();
@@ -63,9 +63,9 @@ describe("game reducer", () => {
 
   it("MOVE_REJECTED reverts the optimistic move and surfaces the reason", () => {
     const s0 = playingAsWhite();
-    const s1 = reduce(s0, { kind: "localMove", uci: "e2e4" });
+    const s1 = reduce(s0, { kind: "localMove", at: 0, uci: "e2e4" });
     const s2 = reduce(s1, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveRejected: { game_id: GID, ply_expected: 0, reason: 2 } }, // StalePly
     });
     // Reverted: e2 pawn back, e4 empty, no pending, reason surfaced.
@@ -78,10 +78,10 @@ describe("game reducer", () => {
   it("opponent MOVE_ACCEPTED (no pending) applies the move + the mover's clock", () => {
     // As white (seat 0): first our own move, then black replies.
     let s = playingAsWhite();
-    s = reduce(s, { kind: "localMove", uci: "e2e4" });
-    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
+    s = reduce(s, { kind: "localMove", at: 0, uci: "e2e4" });
+    s = reduce(s, { kind: "server", at: 0, msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
     // Black's reply e7e5 — we have NO pending, so the reducer applies the uci.
-    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 2, uci: "e7e5", clock_after_ms: 298000 } } });
+    s = reduce(s, { kind: "server", at: 0, msg: { MoveAccepted: { game_id: GID, ply: 2, uci: "e7e5", clock_after_ms: 298000 } } });
     expect(pieceAt(s, "e5")).toBe("p");
     expect(pieceAt(s, "e7")).toBeNull();
     expect(s.ply).toBe(2);
@@ -92,10 +92,10 @@ describe("game reducer", () => {
 
   it("STATE resync rebuilds from the FEN fold and drops pending", () => {
     let s = playingAsWhite();
-    s = reduce(s, { kind: "localMove", uci: "e2e4" }); // optimistic, pending
+    s = reduce(s, { kind: "localMove", at: 0, uci: "e2e4" }); // optimistic, pending
     const resyncFen = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2";
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { State: { game_id: GID, state: sb(resyncFen, 0, [280000, 275000]) } },
     });
     expect(s.pendingMove).toBeNull();
@@ -106,10 +106,10 @@ describe("game reducer", () => {
 
   it("DRAW_OFFERED records a pending offer; GAME_END ends the game", () => {
     let s = playingAsWhite();
-    s = reduce(s, { kind: "server", msg: { DrawOffered: { game_id: GID, by: 1 } } });
+    s = reduce(s, { kind: "server", at: 0, msg: { DrawOffered: { game_id: GID, by: 1 } } });
     expect(s.drawOffer).toEqual({ by: 1 });
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { GameEnd: { game_id: GID, result_vector: [2, 0], termination: Termination.Mate, rating_delta: [12, -12] } },
     });
     expect(s.phase).toBe("game_over");
@@ -120,13 +120,13 @@ describe("game reducer", () => {
 
   it("a second localMove while one is pending is ignored (no double-apply)", () => {
     const s0 = playingAsWhite();
-    const s1 = reduce(s0, { kind: "localMove", uci: "e2e4" });
-    const s2 = reduce(s1, { kind: "localMove", uci: "d2d4" });
+    const s1 = reduce(s0, { kind: "localMove", at: 0, uci: "e2e4" });
+    const s2 = reduce(s1, { kind: "localMove", at: 0, uci: "d2d4" });
     expect(s2).toBe(s1); // unchanged
   });
 
   it("localMove outside playing phase is ignored", () => {
-    const s = reduce(initialState, { kind: "localMove", uci: "e2e4" });
+    const s = reduce(initialState, { kind: "localMove", at: 0, uci: "e2e4" });
     expect(s).toBe(initialState);
   });
 
@@ -143,9 +143,9 @@ describe("game reducer", () => {
     // a DIFFERENT move d2d4 (a race / stale frame). The board must show ONLY d2d4
     // from the start position — never e2e4 AND d2d4 both.
     const s0 = playingAsWhite();
-    const s1 = reduce(s0, { kind: "localMove", uci: "e2e4" });
+    const s1 = reduce(s0, { kind: "localMove", at: 0, uci: "e2e4" });
     const s2 = reduce(s1, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "d2d4", clock_after_ms: 299000 } },
     });
     expect(pieceAt(s2, "d4")).toBe("P"); // the authoritative move applied
@@ -159,11 +159,11 @@ describe("game reducer", () => {
 
   it("a duplicate MOVE_ACCEPTED for the same ply is idempotent (no double-apply)", () => {
     let s = playingAsWhite();
-    s = reduce(s, { kind: "localMove", uci: "e2e4" });
-    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
+    s = reduce(s, { kind: "localMove", at: 0, uci: "e2e4" });
+    s = reduce(s, { kind: "server", at: 0, msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
     const afterFirst = s;
     // Replay the SAME accept (at-least-once delivery / reconnect replay).
-    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
+    s = reduce(s, { kind: "server", at: 0, msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } } });
     // Board + ply unchanged — the second frame did not re-apply e2e4.
     expect(s.position?.board).toEqual(afterFirst.position?.board);
     expect(s.ply).toBe(1);
@@ -173,7 +173,7 @@ describe("game reducer", () => {
   it("a MOVE_ACCEPTED that skips a ply flags needsResync and does not jump the board", () => {
     const s0 = playingAsWhite(); // ply 0
     const s1 = reduce(s0, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveAccepted: { game_id: GID, ply: 3, uci: "e2e4", clock_after_ms: 299000 } }, // gap: expected 1
     });
     expect(s1.needsResync).toBe(true);
@@ -183,9 +183,9 @@ describe("game reducer", () => {
 
   it("STATE clears needsResync (resync fulfilled)", () => {
     let s = playingAsWhite();
-    s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 3, uci: "e2e4", clock_after_ms: 1 } } });
+    s = reduce(s, { kind: "server", at: 0, msg: { MoveAccepted: { game_id: GID, ply: 3, uci: "e2e4", clock_after_ms: 1 } } });
     expect(s.needsResync).toBe(true);
-    s = reduce(s, { kind: "server", msg: { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } } });
+    s = reduce(s, { kind: "server", at: 0, msg: { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } } });
     expect(s.needsResync).toBe(false);
   });
 
@@ -195,10 +195,10 @@ describe("game reducer", () => {
     // move is pending; here we assert the turn guard directly by playing as
     // white when the position says black to move.
     const blackToMove = reduce(initialState, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1", 1, [300000, 300000]) } },
     });
-    const s = reduce(blackToMove, { kind: "localMove", uci: "e2e4" });
+    const s = reduce(blackToMove, { kind: "localMove", at: 0, uci: "e2e4" });
     expect(s).toBe(blackToMove); // ignored — not white's turn
   });
 
@@ -208,7 +208,7 @@ describe("game reducer", () => {
     // Reach a gap: at ply 0, a MOVE_ACCEPTED jumps to ply 5 → needsResync.
     let s = playingAsWhite();
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveAccepted: { game_id: GID, ply: 5, uci: "e2e4", clock_after_ms: 1 } },
     });
     expect(s.needsResync).toBe(true);
@@ -218,7 +218,7 @@ describe("game reducer", () => {
     // (= ply 4). Before the fix, ply stayed 0 and the next move sent ply 1.
     const resyncFen = "r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 4 3";
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { State: { game_id: GID, state: sb(resyncFen, 0, [1, 1]) } },
     });
     expect(s.needsResync).toBe(false);
@@ -234,7 +234,7 @@ describe("game reducer", () => {
     // A reject arriving with NO pending move (e.g. after a reconnect) must still
     // trigger a resync when it is StalePly.
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveRejected: { game_id: GID, ply_expected: 1, reason: Reason.StalePly } },
     });
     expect(s.needsResync).toBe(true);
@@ -243,9 +243,9 @@ describe("game reducer", () => {
 
   it("S2: a non-stale reject (Illegal) does NOT raise needsResync", () => {
     let s = playingAsWhite();
-    s = reduce(s, { kind: "localMove", uci: "e2e4" });
+    s = reduce(s, { kind: "localMove", at: 0, uci: "e2e4" });
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveRejected: { game_id: GID, ply_expected: 1, reason: Reason.Illegal } },
     });
     expect(s.needsResync).toBe(false); // illegal is not a desync
@@ -256,7 +256,7 @@ describe("game reducer", () => {
   it("S3: an Error (UNSUPPORTED_VERSION) is surfaced in state.error", () => {
     let s = playingAsWhite();
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { Error: { code: ErrorCode.UnsupportedVersion, msg: "bad major" } },
     });
     expect(s.error).toBe(ErrorCode.UnsupportedVersion);
@@ -265,12 +265,12 @@ describe("game reducer", () => {
   it("N2: GAME_END clears a stale needsResync / lastReject", () => {
     let s = playingAsWhite();
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveRejected: { game_id: GID, ply_expected: 1, reason: Reason.StalePly } },
     });
     expect(s.needsResync).toBe(true);
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: {
         GameEnd: {
           game_id: GID,
@@ -287,16 +287,16 @@ describe("game reducer", () => {
 
   it("F2: lastMove is set on accept and cleared by a STATE resync", () => {
     let s = playingAsWhite();
-    s = reduce(s, { kind: "localMove", uci: "e2e4" });
+    s = reduce(s, { kind: "localMove", at: 0, uci: "e2e4" });
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { MoveAccepted: { game_id: GID, ply: 1, uci: "e2e4", clock_after_ms: 299000 } },
     });
     expect(s.lastMove).toEqual({ uci: "e2e4", moverSeat: 0 });
     // A resync STATE is a fold — the "most recent move" is no longer meaningful
     // and must be cleared so the SR announcement does not re-read a stale move.
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: {
         State: {
           game_id: GID,
@@ -311,12 +311,12 @@ describe("game reducer", () => {
     // A FEN whose move counters disagree with the server ply (e.g. a custom
     // start position, or after a takeback): the body's ply is authoritative.
     let s = reduce(initialState, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1], { ply: 4, status: 2, last_move_uci: "g8f6", running_seat: 0 }) } },
     });
     expect(s.ply).toBe(4);
     s = reduce(s, {
-      kind: "server",
+      kind: "server", at: 0,
       msg: { State: { game_id: GID, state: sb(START_FEN, 0, [1, 1], { ply: 18, status: 2, last_move_uci: "e7e5", running_seat: 0 }) } },
     });
     expect(s.ply).toBe(18);
