@@ -105,8 +105,10 @@ WS). Teardown unbinds the seat; the game is untouched (it lives in the store).
 
 - `SEEK` is validated BEFORE enqueue (#93): `pool_id` must be in the pool
   catalogue (interim: `transport.DefaultPools`, until `GET /v1/pools`, X-13; see
-  GS5 §3.1), `time_control` must equal that pool's, and the control must resolve.
-  Otherwise `ERROR{PROTOCOL_VIOLATION}` and nothing is enqueued, so a client can
+  GS5 §3.1) and `time_control` must equal that pool's, else
+  `ERROR{PROTOCOL_VIOLATION}`. The pool's control must also resolve; a catalogue
+  entry that does not is a server misconfiguration, so it is `ERROR{INTERNAL}`
+  plus a log line. Every refusal is logged, and nothing is enqueued, so a client can
   never impose a clock on a waiting opponent, and a bad control can never create a
   durable game that fails to start. The resolver bounds every component (base
   ≤ 3 h, increment ≤ 3 min, daily ≤ 14 days, each checked before scaling to ms,
@@ -235,7 +237,8 @@ closed by) the §4A v1.1 amendment:
 | Persist fails (pipeline error) | NO ack; `ERROR{INTERNAL}` — the move did not happen (NFR-7). |
 | Disconnect mid-game | seat unbound, clock keeps running; reconnect → `STATE`; flag if the clock expires first. |
 | MATCHED seat never joins (ghost-claim) | join-timeout → abort the game (resolves the GS-5 residual). |
-| SEEK into an unknown pool, or with another pool's / an invalid time control | `ERROR{PROTOCOL_VIOLATION}`, no enqueue, no game (#93). |
+| SEEK into an unknown pool, or with another pool's time control | `ERROR{PROTOCOL_VIOLATION}`, logged, no enqueue, no game (#93). |
+| Catalogue pool whose time control does not resolve (misconfiguration) | `ERROR{INTERNAL}`, logged, no enqueue, no game (#93). |
 | Concurrent writes to one WS | serialized by the per-conn write pump. |
 | Reconnect to a different node | works — the Session folds from the durable stream (no node affinity). |
 | Oversized / malformed frame | the codec seam rejects it (typed error) → `ERROR{...}`, connection may be closed; never a panic (the seam's catch_unwind). |

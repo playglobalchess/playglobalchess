@@ -108,3 +108,23 @@ func TestSeekCannotImposeAClock(t *testing.T) {
 		t.Fatalf("game time control = %q, want the pool's blitz-5+3", got)
 	}
 }
+
+// A catalogue entry the resolver rejects is a server misconfiguration: the
+// client sent the pool's own control, so it gets INTERNAL (not
+// PROTOCOL_VIOLATION) and nothing is enqueued.
+func TestSeekIntoMisconfiguredPoolIsInternal(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	h.srv.pools = PoolCatalog{"broken": "custom-0+0"}
+	c := newFakeConn()
+	h.handle(context.Background(), c)
+	c.feedClient(t, codec.ClientMsg{Type: codec.CMAuthenticate, Authenticate: &codec.AuthenticatePayload{Token: "alice"}})
+	c.feedClient(t, codec.ClientMsg{Type: codec.CMSeek, Seek: &codec.SeekPayload{PoolID: "broken", TimeControl: "custom-0+0"}})
+	e := c.waitForServer(t, codec.SMError, 2*time.Second)
+	if e.Error.Code != codec.ECInternal {
+		t.Fatalf("error code = 0x%02x, want INTERNAL", e.Error.Code)
+	}
+	if n := h.pool.waitingCount(); n != 0 {
+		t.Fatalf("%d seekers enqueued, want 0", n)
+	}
+}
