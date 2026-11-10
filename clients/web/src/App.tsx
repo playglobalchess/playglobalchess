@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
 import { codecProtocolVersion } from "./codec/seam";
 import { useGame, canRequestTakeback } from "./game/useGame";
+import { canOfferDraw } from "./game/reducer";
 import { Board } from "./game/Board";
 import { Reason, ErrorCode, type ReasonCode } from "./codec/messages";
 import { DEV_POOL, DEV_TIME_CONTROL } from "./devConfig";
@@ -149,7 +150,7 @@ function GameView({ token }: { token: string }): React.JSX.Element {
               </button>
               <button
                 type="button"
-                disabled={state.myDrawOffered}
+                disabled={!canOfferDraw(state)}
                 onClick={() => commands.offerDraw()}
               >
                 {t("game.offerDraw")}
@@ -218,8 +219,12 @@ function buildAnnouncement(
   myTurn: boolean,
 ): string {
   if (state.phase === "game_over") return t("announce.game_over");
-  if (state.drawOffer != null) return t("announce.draw_offered");
-  if (state.incomingTakeback != null) return t("announce.takeback_requested");
+  // Both prompts can be pending at once (STATE carries both): announce both.
+  const prompts = [
+    state.drawOffer != null ? t("announce.draw_offered") : "",
+    state.incomingTakeback != null ? t("announce.takeback_requested") : "",
+  ].filter((p) => p !== "");
+  if (prompts.length > 0) return prompts.join(" ");
   if (state.lastMove != null) {
     const mine = state.lastMove.moverSeat === state.mySeat;
     const who = mine ? t("announce.you_moved") : t("announce.opponent_moved");

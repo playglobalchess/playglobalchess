@@ -592,6 +592,17 @@ situation). ADR-19 must say so.
 state of §6.4, and the clock anchor. The inline TS shape types and
 `codec/messages.ts` change with it.
 
+> **Amended at implementation (2026-11-10, owner-approved PR).** Two parts of the
+> paragraph above are deliberately NOT done by the web reducer:
+> - **`lastMove` is cleared on STATE, not set from `last_move_uci`.** In the web
+>   client `lastMove` only drives the screen-reader "X played Y" announcement, so
+>   setting it from a rewind STATE would announce the undone move as if it had
+>   just been played. `last_move_uci` stays in the body for clients that show a
+>   last-move highlight; a highlight can read it without touching the announcement.
+> - **The clock anchor (`running_seat`, `server_t`) is not stored yet.** The
+>   client does not tick clocks between server updates; that is #112, which
+>   stores and uses the anchor in one change rather than carrying unused state.
+
 **What it fixes.** A reconnecting or reloaded client learns its seat, side to
 move, ply, live-or-over, result, last move, pending prompts and a correct running
 clock from `STATE` alone (#101, #123). Not fixed here: the web client keeps its

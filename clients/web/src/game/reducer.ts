@@ -50,6 +50,9 @@ export interface GameState {
   drawOffer: DrawOffer | null;
   /** Our own draw offer is pending (GS-7 §6.4). */
   myDrawOffered: boolean;
+  /** Ply at which we last offered a draw (the server's 20-ply cooldown, §6.3),
+   * or null. Lets the UI disable "Offer draw" when the server would refuse. */
+  myLastDrawOfferPly: number | null;
   /** A pending takeback request FROM the opponent, awaiting our accept/decline. */
   incomingTakeback: { by: number; atPly: number } | null;
   /** Our own takeback request is pending. */
@@ -83,6 +86,7 @@ export const initialState: GameState = {
   pendingMove: null,
   drawOffer: null,
   myDrawOffered: false,
+  myLastDrawOfferPly: null,
   incomingTakeback: null,
   myTakebackSent: null,
   rated: null,
@@ -113,8 +117,10 @@ export function reduce(state: GameState, action: Action): GameState {
 
     case "localOfferDraw":
       // An offer while the opponent's is pending IS the accept (GAME_END follows).
-      if (state.phase !== "playing" || state.drawOffer != null) return state;
-      return { ...state, myDrawOffered: true };
+      // An accept of the opponent's offer, or an offer the server would refuse
+      // (canOfferDraw false), records nothing: no false "waiting" line.
+      if (state.drawOffer != null || !canOfferDraw(state)) return state;
+      return { ...state, myDrawOffered: true, myLastDrawOfferPly: state.ply };
     case "localDeclineDraw":
       return { ...state, drawOffer: null, myDrawOffered: false };
     case "localRequestTakeback":
@@ -288,6 +294,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         myDrawOffered: drawBy != null && drawBy === mySeat,
         incomingTakeback: tbBy != null && tbBy !== mySeat ? { by: tbBy, atPly: b.takeback_at_ply } : null,
         myTakebackSent: tbBy != null && tbBy === mySeat ? { atPly: b.takeback_at_ply } : null,
+        // A rewind drops cooldown entries above the new ply (§5.5).
+        myLastDrawOfferPly:
+          state.myLastDrawOfferPly != null && state.myLastDrawOfferPly > b.ply ? null : state.myLastDrawOfferPly,
         // A STATE with a LOWER ply than ours (after a takeback rewind) is valid:
         // the fold below replaces the board, ply and clocks wholesale.
         position: parseFen(s.state.fen),
@@ -357,4 +366,13 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       // Exhaustiveness: a new ServerMsg variant must be handled explicitly.
       return state;
   }
+}
+
+/** The server's §6.3 draw-offer gate as far as the client can see it: a live
+ * game at ply >= 2, no offer of ours pending, and none of ours in the last 20
+ * plies. (After a reload the last-offer ply is unknown; a refused offer is then
+ * answered by a STATE push, which keeps the UI honest.) */
+export function canOfferDraw(s: GameState): boolean {
+  if (s.phase !== "playing" || s.gameId == null || s.myDrawOffered || s.ply < 2) return false;
+  return s.myLastDrawOfferPly == null || s.myLastDrawOfferPly < s.ply - 20;
 }

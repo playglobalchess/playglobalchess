@@ -131,6 +131,14 @@ board + both clocks from `start_state`.
   client does not know the game is unrated (after a reload, since neither
   `MATCHED` nor `STATE` carries `rated`).
 - "Play" seeks `rated:false`, as §3.2 says (the client had sent `rated:true`).
+- "Offer draw" is enabled only when the server would accept a new offer (ply ≥ 2
+  and none of ours in the last 20 plies, GS-7 §6.3), so a click never shows a
+  "waiting" line the server then silently clears. The two decline buttons are
+  labelled "Decline draw" and "Decline takeback", and both prompts are announced
+  when both are pending.
+- On STATE the client clears the screen-reader `lastMove` instead of setting it
+  from `last_move_uci`, and does not yet store the clock anchor (see GS-7 §7.4
+  amendment; ticking clocks are #112).
 
 ### 3.4 Reconnection
 

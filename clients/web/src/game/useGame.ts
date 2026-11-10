@@ -28,7 +28,7 @@
 //     from the CURRENT reducer ply, read at call time, not from a stale closure.
 
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { reduce, initialState, type GameState } from "./reducer";
+import { reduce, initialState, canOfferDraw, type GameState } from "./reducer";
 import {
   GameSocket,
   type ConnStatus,
@@ -190,7 +190,10 @@ export function useGame(opts: UseGameOptions): UseGameResult {
 
   const offerDraw = useCallback(() => {
     const s = stateRef.current;
-    if (s.gameId == null || s.phase !== "playing" || s.myDrawOffered) return;
+    if (s.gameId == null || s.phase !== "playing") return;
+    // Accepting the opponent's offer is always allowed; a new offer only when
+    // the server would accept it (canOfferDraw).
+    if (s.drawOffer == null && !canOfferDraw(s)) return;
     dispatch({ kind: "localOfferDraw" });
     sockRef.current?.offerDraw(s.gameId);
   }, []);

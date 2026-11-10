@@ -237,6 +237,15 @@ describe("useGame", () => {
       | undefined;
     expect(acc?.TakebackAccept).toEqual({ game_id: "g1", at_ply: 2 });
 
+    // A second request from the opponent, which we decline this time.
+    act(() => h.fake().push({ TakebackOffered: { game_id: "g1", seat_idx: 1, at_ply: 2 } }));
+    act(() => h.get().commands.declineTakeback());
+    const dec = h.fake().sentMsgs().find((m) => "TakebackDecline" in m) as
+      | { TakebackDecline: { game_id: string; at_ply: number } }
+      | undefined;
+    expect(dec?.TakebackDecline).toEqual({ game_id: "g1", at_ply: 2 });
+    expect(h.get().state.incomingTakeback).toBeNull();
+
     act(() => h.fake().push({ DrawOffered: { game_id: "g1", by: 1 } }));
     act(() => h.get().commands.declineDraw());
     expect(countMsgs(h.fake(), "DeclineDraw")).toBe(1);

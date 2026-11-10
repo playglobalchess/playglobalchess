@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { reduce, initialState, type GameState } from "./reducer";
+import { reduce, initialState, canOfferDraw, type GameState } from "./reducer";
 import { canRequestTakeback } from "./useGame";
 import { NO_SEAT, Status, type ServerMsg } from "../codec/messages";
 import { sb } from "../test/stateBody";
@@ -127,13 +127,16 @@ describe("GS-7 reducer: STATE v1.3 drives everything (§7.4, #101)", () => {
     expect(s.result).toEqual({ termination: 3, resultVector: [2, 0] });
   });
 
-  it("a STATE with a lower ply after a rewind replaces ply, board and prompts", () => {
+  it("a STATE with a lower ply after a rewind replaces ply, board and prompts, and drops a pending move", () => {
+    // White at ply 2 requests a takeback, then makes an optimistic move that is
+    // still awaiting its ack when the rewind STATE (ply 1) arrives.
     let s = reduce(afterTwoPlies(0), { kind: "localRequestTakeback" });
-    s = reduce(accepted(s, 3, "g1f3"), { kind: "localMove", uci: "b1c3" }); // an optimistic move is pending... (not our turn: dropped)
-    const fen = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2";
-    s = server(s, { State: { game_id: GID, state: sb(fen, 0, [301000, 298000], { ply: 2, last_move_uci: "e7e5" }) } });
-    expect(s.ply).toBe(2);
-    expect(s.position?.turn).toBe("w");
+    s = reduce(s, { kind: "localMove", uci: "g1f3" });
+    expect(s.pendingMove?.uci).toBe("g1f3"); // really pending (white to move)
+    const fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
+    s = server(s, { State: { game_id: GID, state: sb(fen, 1, [301000, 300000], { ply: 1, last_move_uci: "e2e4" }) } });
+    expect(s.ply).toBe(1);
+    expect(s.position?.turn).toBe("b");
     expect(s.pendingMove).toBeNull();
     expect(s.myTakebackSent).toBeNull();
     expect(s.needsResync).toBe(false);
@@ -142,5 +145,28 @@ describe("GS-7 reducer: STATE v1.3 drives everything (§7.4, #101)", () => {
   it("rated survives MATCHED (the server does not send it back)", () => {
     expect(matched(0, false).rated).toBe(false);
     expect(matched(0, true).rated).toBe(true);
+  });
+});
+
+describe("GS-7 reducer: the draw-offer gate (§6.3)", () => {
+  it("an offer the server would refuse records nothing (no false waiting line)", () => {
+    // ply < 2
+    const early = accepted(matched(0), 1, "e2e4");
+    expect(canOfferDraw(early)).toBe(false);
+    expect(reduce(early, { kind: "localOfferDraw" }).myDrawOffered).toBe(false);
+    // within our own 20-ply cooldown: offer at ply 2, declined, try again at 22
+    let s = reduce(afterTwoPlies(0), { kind: "localOfferDraw" });
+    expect(s.myLastDrawOfferPly).toBe(2);
+    s = server(s, { DrawDeclined: { game_id: GID, seat_idx: 1 } });
+    expect(canOfferDraw({ ...s, ply: 22 })).toBe(false); // 2 >= 22 - 20
+    expect(canOfferDraw({ ...s, ply: 23 })).toBe(true); //  2 <  23 - 20
+    expect(reduce({ ...s, ply: 22 }, { kind: "localOfferDraw" }).myDrawOffered).toBe(false);
+  });
+
+  it("a rewind below our last offer reopens the gate", () => {
+    let s = reduce(afterTwoPlies(0), { kind: "localOfferDraw" });
+    s = server(s, { DrawDeclined: { game_id: GID, seat_idx: 1 } });
+    s = server(s, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000], { ply: 0 }) } });
+    expect(s.myLastDrawOfferPly).toBeNull();
   });
 });
