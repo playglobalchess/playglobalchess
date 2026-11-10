@@ -29,6 +29,7 @@ jobs:
     outputs:
       engine: ${{ steps.filter.outputs.engine }}
       protocol: ${{ steps.filter.outputs.protocol }}
+      rest: ${{ steps.filter.outputs.rest }}
       services: ${{ steps.filter.outputs.services }}
       web: ${{ steps.filter.outputs.web }}
       mobile: ${{ steps.filter.outputs.mobile }}
@@ -37,14 +38,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
+        # Each filter lists every path its job READS, not only the folder it owns
+        # (#86, #87). A job that reads a file its filter does not match is
+        # skipped on a change to that file, and its check is hollow.
+        #   services: links protocol/codec-cgo + engine/engine-cgo (Makefile
+        #             *_DIR), whose Cargo deps are protocol/codec + engine; the Go
+        #             codec tests read protocol/vectors/.
+        #   web:      depends on protocol/codec-wasm (package.json file:), which
+        #             depends on protocol/codec.
+        #   web-e2e:  builds both, so it runs on web, services or protocol (and,
+        #             through the services filter, engine).
+        #   rest:     the files platform/ci/check_rest_contract.py reads.
+        #   every filter includes ci.yml, so editing a job's steps runs that job.
+        # platform/ci/check_ci_filters.py DERIVES each job's inputs from those
+        # build files and fails the `platform` job if a filter misses one.
         with:
           filters: |
-            engine: ['engine/**']
-            protocol: ['protocol/**', 'platform/mobile/*[Cc]odec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**']
-            services: ['services/**']
-            web: ['clients/web/**']
-            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradlew', 'gradle/**']
-            platform: ['platform/**']
+            engine: ['engine/**', '.github/workflows/ci.yml']
+            protocol: ['protocol/**', 'platform/mobile/*[Cc]odec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**', '.github/workflows/ci.yml']
+            rest: ['protocol/rest/**', 'docs/specs/PE-platform-eng/API-CONTRACT.md', 'docs/specs/S2-realtime/PROTOCOL.md', 'platform/ci/check_rest_contract.py', '.github/workflows/ci.yml']
+            services: ['services/**', 'protocol/**', 'engine/**', '.github/workflows/ci.yml']
+            web: ['clients/web/**', 'protocol/**', '.github/workflows/ci.yml']
+            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradlew', 'gradle/**', '.github/workflows/ci.yml']
+            platform: ['platform/**', '.github/workflows/**']
 
   engine:
     needs: changes
@@ -200,6 +216,17 @@ jobs:
           # there — run with TMPDIR set to a project-local dir. CI (ubuntu) is
           # unaffected, so no override is needed here.
           ( cd protocol/codec-wasm && wasm-pack test --node )
+
+  # REST contract audit as its own job (#86). It reads two spec files under
+  # docs/, so as a step inside the Rust `protocol` job a docs-only contract
+  # change never ran it. Stdlib Python only, so it is cheap to run on exactly the
+  # files it reads (the `rest` filter), without starting the macOS parity job.
+  rest-contract:
+    needs: changes
+    if: ${{ needs.changes.outputs.rest == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -351,7 +378,8 @@ jobs:
     # The real-server e2e drives the web client against the actual Go
     # game-server, so it must run when EITHER the web client, the server, or the
     # shared codec changes — a server/codec change can break the live contract
-    # the e2e proves even with no web diff.
+    # the e2e proves even with no web diff. The services filter also covers
+    # engine/** (the server links engine-cgo), so an engine-only change runs it.
     if: ${{ needs.changes.outputs.web == 'true' || needs.changes.outputs.services == 'true' || needs.changes.outputs.protocol == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -415,3 +443,8 @@ jobs:
         run: python3 -c "import py_compile,glob,sys; [py_compile.compile(f,doraise=True) for f in glob.glob('platform/ci/*.py')]; print('platform/ci python compiles clean')"
       - name: Unit-test CI tooling
         run: python3 -m unittest discover -s platform/ci -p 'test_*.py' -v
+      - name: CI path-filter dependency audit (#86, #87)
+        # Fails if any gated job's filter misses a file the job reads, derived
+        # from the Makefiles, package.json, Cargo path deps, Go sources and
+        # check_rest_contract.py. Runs on every workflow change (platform filter).
+        run: python3 platform/ci/check_ci_filters.py
