@@ -122,6 +122,12 @@ unit-testable without Redis:
   reserves the pair; game creation commits it. Redis holds no game truth — a node
   loss drops only unmatched/claimed-but-uncommitted seekers (their claim TTL
   lapses and they re-seek).
+  **Claim invariant (#90):** the claim succeeds only if BOTH seekers are still
+  waiting (their seek hash exists AND they are still members of the pool) and
+  NEITHER is claimed, all checked inside the one Lua script. `Remove` deletes the
+  claim key together with the hash and the membership, so a claim-keys-only check
+  would let a node holding a stale pool read re-claim a just-matched seeker and
+  create a second game.
 - `Release(seek_id)` — undo a claim (claim held but creation failed): clear the
   `claimed` flag so the seeker is pairable again (bounded by the claim TTL anyway).
 - `Remove(seek_id)` — `ZREM` + `DEL` the hash; called in §3.4 step 5 AFTER the

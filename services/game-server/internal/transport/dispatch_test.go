@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ type fakeConn struct {
 	seen   int // how many out frames have been consumed by waitForServer
 	closed bool
 	addr   string
+	// stall makes Write block until its ctx expires, like a peer that has stopped
+	// reading (a backgrounded tab): the #91 slow-consumer case.
+	stall atomic.Bool
 }
 
 func newFakeConn() *fakeConn { return &fakeConn{in: make(chan []byte, 16)} }
@@ -40,7 +44,11 @@ func (f *fakeConn) Read(ctx context.Context) ([]byte, error) {
 	}
 }
 
-func (f *fakeConn) Write(_ context.Context, frame []byte) error {
+func (f *fakeConn) Write(ctx context.Context, frame []byte) error {
+	if f.stall.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cp := make([]byte, len(frame))

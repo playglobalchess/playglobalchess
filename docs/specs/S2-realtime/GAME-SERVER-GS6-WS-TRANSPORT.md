@@ -101,6 +101,22 @@ auth until X-3, Q-GS6c, behind an `Authenticator` interface like GS-5's
 per-connection write pump serializes outbound frames (no concurrent writes to one
 WS). Teardown unbinds the seat; the game is untouched (it lives in the store).
 
+**Write pump (#91).** `Handle` wraps every connection in a `pumpedConn`
+(`pump.go`), and the seat/user maps store that wrapper, so every outbound frame,
+from the connection's own handler, the other seat's fan-out, or the flag ticker,
+goes through it. `Write` only enqueues on a bounded queue (64 frames) and never
+blocks; one writer goroutine per connection drains it in order, each frame under
+a 5 s write deadline. A slow consumer is disconnected, not waited on: a full
+queue, or a write that fails or passes its deadline, closes the connection. The
+game keeps running under the clock and the player reconnects (STATE resyncs), so
+a peer that stops reading can never stall the opponent's handler or the flag
+ticker. Closing never blocks the caller: the connection is marked closed at
+once and the socket's closing handshake runs on its own goroutine. On `Handle`
+return the queue is flushed before the close, so a final frame such as the
+auth-failure `ERROR` still reaches the client; the frame in flight keeps its own
+deadline and the rest of the flush shares one, so a stalled peer's teardown
+takes at most two deadlines.
+
 ### 3.2 Dispatch & matchmaking
 
 - `SEEK` is validated BEFORE enqueue (#93): `pool_id` must be in the pool
@@ -240,6 +256,7 @@ closed by) the §4A v1.1 amendment:
 | SEEK into an unknown pool, or with another pool's time control | `ERROR{PROTOCOL_VIOLATION}`, logged, no enqueue, no game (#93). |
 | Catalogue pool whose time control does not resolve (misconfiguration) | `ERROR{INTERNAL}`, logged, no enqueue, no game (#93). |
 | Concurrent writes to one WS | serialized by the per-conn write pump. |
+| Peer stops reading (slow consumer) | its writes never block other handlers or the flag ticker: queue full (64) or one write past 5 s → that connection is closed; reconnect → `STATE` (#91). |
 | Reconnect to a different node | works — the Session folds from the durable stream (no node affinity). |
 | Oversized / malformed frame | the codec seam rejects it (typed error) → `ERROR{...}`, connection may be closed; never a panic (the seam's catch_unwind). |
 

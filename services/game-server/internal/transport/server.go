@@ -13,9 +13,10 @@ import (
 // Conn interface, so the library choice is isolated here and the whole dispatch
 // flow is tested without a socket (dispatch_test.go / flow_test.go / e2e_test.go).
 
-// wsConn adapts a coder/websocket to the Conn interface. Writes are serialized
-// by coder/websocket internally per message; we additionally never issue concurrent
-// Writes from the same goroutine. Binary frames only (the §4A wire is binary).
+// wsConn adapts a coder/websocket to the Conn interface. Binary frames only (the
+// §4A wire is binary). Handle wraps it in a pumpedConn (pump.go), so its Write is
+// only ever called by that connection's single writer goroutine, under a
+// deadline (#91).
 type wsConn struct {
 	ws   *websocket.Conn
 	addr string
@@ -36,8 +37,8 @@ func (c *wsConn) Read(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
-// Write sends one §4A frame as a binary message. coder/websocket serializes writes, so
-// this is safe for the concurrent caller (the MATCHED fan-out to the other seat).
+// Write sends one §4A frame as a binary message, honouring ctx (the pump's write
+// deadline): coder/websocket aborts a write whose ctx expires.
 func (c *wsConn) Write(ctx context.Context, frame []byte) error {
 	return c.ws.Write(ctx, websocket.MessageBinary, frame)
 }
