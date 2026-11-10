@@ -48,6 +48,11 @@ func TestSnapshotToStateBodyEncodes(t *testing.T) {
 			}
 		}
 	}
+	// No clock runs before the first move: the ply-0 anchor is session
+	// construction, not a real clock start.
+	if z := snapshotToStateBody(cases["live at ply 0"], 0); z.Status != codec.StatusLive || z.RunningSeat != codec.NoSeat {
+		t.Fatalf("ply-0 LIVE must report no running clock: %+v", z)
+	}
 	live := snapshotToStateBody(cases["live with draw offer"], 0)
 	if live.Status != codec.StatusLive || live.RunningSeat != 1 || live.PendingDrawBy != 0 || live.Clocks[1] != 0 {
 		t.Fatalf("live mapping wrong: %+v", live)

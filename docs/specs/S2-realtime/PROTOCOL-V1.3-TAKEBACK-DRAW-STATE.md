@@ -155,10 +155,11 @@ the new codes are in `PROTOCOL.md` §4A.2.
 ## 10. Acceptance criteria
 
 - [x] ADR-19 reviewed by S2, S4, PE, S6 and the architecture group; this document RATIFIED (2026-11-09).
-- [x] Codec, all bindings and the Go seams implement §2–§6; decode invariants enforced in the Rust codec on encode and decode, which every binding and the Go seams call.
-- [x] Golden corpus per §8; all consumers byte-identical; v1.2 vectors other than the three STATE-body vectors (`state`, `state_max_fen`, `matched`) unchanged.
-- [ ] Client rules (§7) covered by client contract tests (web now; iOS/Android in P2). With the GS-7 web reducer.
-- [ ] §2–§6 folded into `PROTOCOL.md` (wire 1.3) and docs-check green — done; §7 rows fold in with the GS-7 reducer.
+- [x] Codec, UniFFI, wasm, the Go seams and the web mirror implement §2–§6; the decode invariants are enforced in the Rust codec on encode and decode, which every binding and the Go seams call.
+- [x] Golden corpus per §8, reproduced byte-for-byte by Rust, Go and wasm; v1.2 vectors other than the three STATE-body vectors (`state`, `state_max_fen`, `matched`) unchanged.
+- [x] Swift and Kotlin host parity read the v1.3 STATE fields through the generated bindings and round-trip the frame. The Android instrumented and iOS XCTest suites carry the same check but only run on a device or Simulator (P2).
+- [x] §2–§6 folded into `PROTOCOL.md` (wire 1.3); docs-check green.
+- [ ] §7 rows (takeback, decline, duplicate MOVE, the two client rules) folded into `PROTOCOL.md` §5. Lands with the GS-7 reducer and web reducer, with client contract tests.
 
 ## 11. Open questions
 

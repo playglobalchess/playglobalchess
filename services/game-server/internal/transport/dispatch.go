@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
@@ -276,9 +277,11 @@ func (s *Server) unbindAll(st *connState, c Conn) {
 func (s *Server) send(ctx context.Context, c Conn, msg codec.ServerMsg) {
 	frame, err := codec.EncodeServer(msg)
 	if err != nil {
-		// Encoding our OWN message failed — a server bug (e.g. an out-of-domain
-		// discriminant). Do not loop; drop it. (The GS-6a encode guards make this
-		// unreachable for well-formed messages.)
+		// Encoding our OWN message failed — a server bug (an out-of-domain
+		// discriminant, or a STATE/MATCHED body that breaks a §4A.6 invariant).
+		// Do not loop; drop it, but LOG it: the client never gets this frame and
+		// would otherwise hang with nothing for on-call to find.
+		log.Printf("transport: dropped unencodable server message (type %d): %v", msg.Type, err)
 		return
 	}
 	_ = c.Write(ctx, frame)
@@ -301,9 +304,9 @@ func rejectMove(gameID string, plyExpected uint32, reason uint8) codec.ServerMsg
 // so STATE is built per recipient.
 //
 // Until the GS-7 reducer lands, the server has no takeback request state of
-// the v1.3 kind (takeback_by is always NoSeat) and no ClockStarted event: the
-// side to move's clock runs from the anchor whenever the game is LIVE. The
-// anchor is the last move (or session start); clocks are valid at it.
+// the v1.3 kind (takeback_by is always NoSeat) and no ClockStarted event: from
+// the first move on, the side to move's clock runs from the anchor (the last
+// move); at ply 0 no clock is reported running.
 func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 	clocks := make([]uint32, len(snap.RemainingMs))
 	for i, ms := range snap.RemainingMs {
@@ -340,7 +343,13 @@ func snapshotToStateBody(snap session.Snapshot, youSeat uint8) codec.StateBody {
 		body.PendingDrawBy = codec.NoSeat
 	case snap.Phase == game.PhaseLive:
 		body.Status = codec.StatusLive
-		body.RunningSeat = snap.Turn
+		// No clock runs before the first move: the anchor at ply 0 is session
+		// construction (or a rebuild), not a real clock start, so claiming a
+		// running clock would charge the first mover for that time. GS-7's
+		// ClockStarted event will define when the first clock starts.
+		if snap.Ply > 0 {
+			body.RunningSeat = snap.Turn
+		}
 	}
 	return body
 }
