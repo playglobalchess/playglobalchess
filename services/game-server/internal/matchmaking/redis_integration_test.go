@@ -3,6 +3,7 @@ package matchmaking
 import (
 	"context"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -195,8 +196,11 @@ func TestRedis_ReadPoolPrunesClaimedExpiredMember(t *testing.T) {
 func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	p := redisPool(t)
 	ctx := context.Background()
-	pool := "it-mutual-" + t.Name()
-	defer p.Remove(ctx, pool, "ma", "mb")
+	// Unique ids per run so -count=N runs cannot see each other's keys (#90/#76).
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pool := "it-mutual-" + t.Name() + "-" + run
+	ma, mb := "ma-"+run, "mb-"+run
+	defer p.Remove(ctx, pool, ma, mb)
 
 	store := game.NewMemStore()
 	m := New(p, store, SeedRatingSource{})
@@ -205,8 +209,8 @@ func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	var wg sync.WaitGroup
 	matches := make([]bool, 2)
 	seekers := []Seeker{
-		{SeekID: "ma", UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
-		{SeekID: "mb", UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: ma, UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: mb, UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
 	}
 	for i, s := range seekers {
 		wg.Add(1)
@@ -231,5 +235,86 @@ func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	}
 	if n := store.StreamCount(); n != 1 {
 		t.Fatalf("real-redis concurrent mutual seek created %d games, want 1", n)
+	}
+}
+
+// TestRedis_ClaimOfRemovedSeekerFails is the deterministic #90 interleaving:
+// B reads the pool and sees A waiting; meanwhile A is matched with C and the
+// match is finalized (Remove deletes A's hash, membership AND claim key); B then
+// claims A. B's claim must fail: A is no longer waiting. Before the fix it
+// succeeded (the script checked only the claim keys) and a second game was made.
+func TestRedis_ClaimOfRemovedSeekerFails(t *testing.T) {
+	p := redisPool(t)
+	ctx := context.Background()
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pool := "it-90-" + run
+	a, b, c := "a-"+run, "b-"+run, "c-"+run
+	defer p.Remove(ctx, pool, a, b, c)
+	for _, s := range []Seeker{
+		intgSeeker(a, "alice", pool, 1500, 0),
+		intgSeeker(c, "carol", pool, 1500, 0),
+		intgSeeker(b, "bob", pool, 1500, 0),
+	} {
+		if err := p.Enqueue(ctx, s); err != nil {
+			t.Fatalf("enqueue %s: %v", s.SeekID, err)
+		}
+	}
+	// B's stale snapshot: A is waiting and unclaimed.
+	snap, err := p.readPool(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawA := false
+	for _, s := range snap {
+		sawA = sawA || s.SeekID == a
+	}
+	if !sawA {
+		t.Fatalf("setup: B's read does not contain A: %+v", snap)
+	}
+	// A wins a claim with C, the game is created, and the match is finalized.
+	if ok, err := p.claim(ctx, pool, c, a); err != nil || !ok {
+		t.Fatalf("A/C claim: ok=%v err=%v", ok, err)
+	}
+	if err := p.Remove(ctx, pool, a, c); err != nil {
+		t.Fatal(err)
+	}
+	// B now claims A from its stale read: must fail.
+	ok, err := p.claim(ctx, pool, b, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("#90: B claimed A after A was matched and removed (a second game would be created)")
+	}
+	// And B itself is still claimable by a newcomer (its claim key was not left set).
+	d := "d-" + run
+	defer p.Remove(ctx, pool, d)
+	if err := p.Enqueue(ctx, intgSeeker(d, "dave", pool, 1500, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := p.claim(ctx, pool, d, b); err != nil || !ok {
+		t.Fatalf("B should still be claimable after the failed claim: ok=%v err=%v", ok, err)
+	}
+}
+
+// A seeker whose hash expired but whose pool member lingers (no lazy prune yet)
+// cannot be claimed either.
+func TestRedis_ClaimOfExpiredSeekerFails(t *testing.T) {
+	p := redisPool(t)
+	ctx := context.Background()
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pool := "it-90x-" + run
+	a, b := "a-"+run, "b-"+run
+	defer p.Remove(ctx, pool, a, b)
+	for _, s := range []Seeker{intgSeeker(a, "alice", pool, 1500, 0), intgSeeker(b, "bob", pool, 1500, 0)} {
+		if err := p.Enqueue(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.rdb.Del(ctx, seekKey(a)).Err(); err != nil { // the hash TTL lapsed
+		t.Fatal(err)
+	}
+	if ok, err := p.claim(ctx, pool, b, a); err != nil || ok {
+		t.Fatalf("claim of an expired seeker: ok=%v err=%v, want false", ok, err)
 	}
 }
