@@ -52,15 +52,17 @@ jobs:
         #
         # Every filter includes this workflow, so editing a job's steps runs it.
         # The REST contract audit and the filter audit run on every change.
+        # Every gate also ends with `|| github.event_name == 'schedule'`, so the
+        # nightly runs every job whatever the filter returns on a schedule event.
         with:
           predicate-quantifier: 'some-with-excludes'
           filters: |
-            engine: ['engine/**', '.github/workflows/ci.yml']
-            protocol: ['protocol/**', 'platform/mobile/*[Cc]odec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**', '.github/workflows/ci.yml']
+            engine: ['engine/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain', 'rust-toolchain.toml', '.cargo/**', '.github/workflows/ci.yml']
+            protocol: ['protocol/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain', 'rust-toolchain.toml', '.cargo/**', 'platform/mobile/*[Cc]odec*', 'clients/ios/CodecParityTests/**', 'clients/android/codec-parity/**', '.github/workflows/ci.yml']
             services: ['**', '!docs/**', '!*.md', '!clients/**', '!platform/mobile/**']
             web: ['**', '!docs/**', '!*.md', '!services/**', '!clients/ios/**', '!clients/android/**', '!platform/mobile/**']
             e2e: ['**', '!docs/**', '!*.md', '!clients/ios/**', '!clients/android/**', '!platform/mobile/**']
-            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradlew', 'gradle/**', '.github/workflows/ci.yml']
+            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradlew', 'gradlew.bat', 'gradle/**', '.github/workflows/ci.yml']
             platform: ['platform/**', '.github/workflows/**']
 
   # Path-filter policy audit (#86, #87). Runs on EVERY change: no `if:`, no
@@ -73,12 +75,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install pinned PyYAML (hash-verified)
+        run: python3 -m pip install --require-hashes -r platform/ci/requirements-ci.txt
       - name: CI path-filter policy (fail-safe filters, unconditional audits)
         run: python3 platform/ci/check_ci_filters.py
 
   engine:
     needs: changes
-    if: ${{ needs.changes.outputs.engine == 'true' }}
+    if: ${{ needs.changes.outputs.engine == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -153,7 +157,7 @@ jobs:
 
   protocol:
     needs: changes
-    if: ${{ needs.changes.outputs.protocol == 'true' }}
+    if: ${{ needs.changes.outputs.protocol == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -262,7 +266,7 @@ jobs:
   # need a booted device, which hosted runners do not provide cheaply.
   protocol-parity:
     needs: changes
-    if: ${{ needs.changes.outputs.protocol == 'true' || needs.changes.outputs.mobile == 'true' }}
+    if: ${{ needs.changes.outputs.protocol == 'true' || needs.changes.outputs.mobile == 'true' || github.event_name == 'schedule' }}
     runs-on: macos-latest
     # HARD GATE. The host-provable Swift-run + Kotlin-compile parity tier. Proven
     # green on hosted macOS runners (multiple runs on main + PRs, 2026-10-12), so
@@ -291,7 +295,7 @@ jobs:
 
   services:
     needs: changes
-    if: ${{ needs.changes.outputs.services == 'true' }}
+    if: ${{ needs.changes.outputs.services == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     # DynamoDB Local backs the GS-4 event-store integration test (Q-GS4D): the
     # store's conditional-put / TransactWriteItems semantics are proven against a
@@ -350,7 +354,7 @@ jobs:
 
   web:
     needs: changes
-    if: ${{ needs.changes.outputs.web == 'true' }}
+    if: ${{ needs.changes.outputs.web == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -391,7 +395,7 @@ jobs:
     # game-server, so a change to the web client, the server, the shared codec or
     # the engine can break the live contract it proves. Its own exclusion-style
     # filter (e2e) runs it on any change except docs and the mobile clients.
-    if: ${{ needs.changes.outputs.e2e == 'true' }}
+    if: ${{ needs.changes.outputs.e2e == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -423,7 +427,7 @@ jobs:
 
   mobile:
     needs: changes
-    if: ${{ needs.changes.outputs.mobile == 'true' }}
+    if: ${{ needs.changes.outputs.mobile == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -443,15 +447,16 @@ jobs:
 
   platform:
     needs: changes
-    if: ${{ needs.changes.outputs.platform == 'true' }}
+    if: ${{ needs.changes.outputs.platform == 'true' || github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install pinned CI tooling deps (PyYAML, hash-verified)
+        run: python3 -m pip install --require-hashes -r platform/ci/requirements-ci.txt
       - name: Lint CI tooling
         run: python3 -c "import py_compile,glob,sys; [py_compile.compile(f,doraise=True) for f in glob.glob('platform/ci/*.py')]; print('platform/ci python compiles clean')"
       - name: Unit-test CI tooling
         run: python3 -m unittest discover -s platform/ci -p 'test_*.py' -v
-
