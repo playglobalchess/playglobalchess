@@ -463,6 +463,9 @@ func mapSessionErr(gameID string, err error) codec.ServerMsg {
 		return errorMsg(codec.ECProtocolViolation, "no draw offer to accept")
 	case errors.Is(err, session.ErrGameNotLive):
 		return errorMsg(codec.ECProtocolViolation, "game is not live")
+	case errors.Is(err, session.ErrTakebackNotAllowed):
+		// GS-7 §5.2.1: rated game or seat count != 2.
+		return errorMsg(codec.ECProtocolViolation, "takeback is not allowed in this game")
 	case errors.Is(err, session.ErrUnsupportedSeatCount):
 		return errorMsg(codec.ECInternal, "unsupported game shape")
 	default:

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/session"
 )
 
 type captureConn struct{ writes int }
@@ -40,5 +41,14 @@ func TestSendLogsADroppedUnencodableMessage(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "dropped unencodable server message") {
 		t.Fatalf("the drop must be logged, log was %q", buf.String())
+	}
+}
+
+// TestTakebackNotAllowedIsProtocolViolation: a TAKEBACK in a rated (or
+// non-2-seat) game is a PROTOCOL_VIOLATION, not INTERNAL (GS-7 §5.2.1).
+func TestTakebackNotAllowedIsProtocolViolation(t *testing.T) {
+	got := mapSessionErr("g", session.ErrTakebackNotAllowed)
+	if got.Error == nil || got.Error.Code != codec.ECProtocolViolation {
+		t.Fatalf("mapSessionErr(ErrTakebackNotAllowed) = %+v, want PROTOCOL_VIOLATION", got.Error)
 	}
 }
