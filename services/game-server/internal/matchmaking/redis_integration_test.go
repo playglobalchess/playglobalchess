@@ -54,8 +54,12 @@ func TestRedis_EnqueueAndClaim(t *testing.T) {
 	if err := p.Enqueue(ctx, a); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	// A compatible new seeker claims alice.
+	// A compatible new seeker claims alice. Seek enqueues the claimer before
+	// TryClaim (the mutual-miss fix), and the claim requires both to be waiting.
 	b := intgSeeker("rb", "bob", pool, 1510, 0)
+	if err := p.Enqueue(ctx, b); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
 	partner, ok, err := p.TryClaim(ctx, b, DefaultWindow, time.Now())
 	if err != nil {
 		t.Fatalf("claim: %v", err)
@@ -78,33 +82,46 @@ func TestRedis_ConcurrentClaimExactlyOneWins(t *testing.T) {
 	n2 := intgSeeker("rn2", "n2", pool, 1500, 0)
 	defer p.Remove(ctx, pool, "rp", "rn1", "rn2")
 
-	if err := p.Enqueue(ctx, partner); err != nil {
-		t.Fatalf("enqueue partner: %v", err)
+	// Seek enqueues each claimer before TryClaim, so all three are waiting. The
+	// newcomers may also legitimately pair with each other; the guarantee is that
+	// no seeker ends up in two pairs and the partner is not lost.
+	for _, s := range []Seeker{partner, n1, n2} {
+		if err := p.Enqueue(ctx, s); err != nil {
+			t.Fatalf("enqueue %s: %v", s.SeekID, err)
+		}
 	}
 
 	var wg sync.WaitGroup
-	results := make([]bool, 2)
+	got := make([]string, 2) // the partner each newcomer claimed, "" if none
 	for i, n := range []Seeker{n1, n2} {
 		wg.Add(1)
 		go func(i int, s Seeker) {
 			defer wg.Done()
-			_, ok, err := p.TryClaim(ctx, s, DefaultWindow, time.Now())
+			won, ok, err := p.TryClaim(ctx, s, DefaultWindow, time.Now())
 			if err != nil {
 				t.Errorf("claim %s: %v", s.SeekID, err)
 			}
-			results[i] = ok
+			if ok {
+				got[i] = won.SeekID
+			}
 		}(i, n)
 	}
 	wg.Wait()
 
-	wins := 0
-	for _, r := range results {
-		if r {
-			wins++
+	seen := map[string]int{}
+	for i, g := range got {
+		if g != "" {
+			seen[g]++
+			seen[[]string{"rn1", "rn2"}[i]]++
 		}
 	}
-	if wins != 1 {
-		t.Fatalf("concurrent claim for one partner: %d winners, want exactly 1 (double-match or lost-match)", wins)
+	for id, n := range seen {
+		if n > 1 {
+			t.Fatalf("seeker %s is in %d pairs (double-match): claims %v", id, n, got)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatalf("no claim won with three compatible seekers waiting (lost match): %v", got)
 	}
 }
 
@@ -117,6 +134,7 @@ func TestRedis_ReleaseAndRemove(t *testing.T) {
 	defer p.Remove(ctx, pool, "rra", "rrb")
 	_ = p.Enqueue(ctx, a)
 	b := intgSeeker("rrb", "bob", pool, 1500, 0)
+	_ = p.Enqueue(ctx, b) // Seek enqueues the claimer first
 
 	// Claim, then Release → alice claimable again.
 	if _, ok, _ := p.TryClaim(ctx, b, DefaultWindow, time.Now()); !ok {
