@@ -29,6 +29,7 @@
 
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { reduce, initialState, canOfferDraw, type GameState } from "./reducer";
+import { monotonicNow } from "./monotonic";
 import {
   GameSocket,
   type ConnStatus,
@@ -102,7 +103,7 @@ export function useGame(opts: UseGameOptions): UseGameResult {
       // Only include `factory` when provided — exactOptionalPropertyTypes
       // forbids passing an explicit `undefined` to an optional field.
       ...(opts.factory != null ? { factory: opts.factory } : {}),
-      onServerMsg: (msg: ServerMsg) => dispatch({ kind: "server", msg }),
+      onServerMsg: (msg: ServerMsg) => dispatch({ kind: "server", msg, at: monotonicNow() }),
       onStatus: (s) => setStatus(s),
     });
     sockRef.current = sock;
@@ -179,7 +180,7 @@ export function useGame(opts: UseGameOptions): UseGameResult {
     // Optimistic local apply, then the send with ply+1 from the CURRENT reducer
     // ply (read at call time — move() runs in a click handler, after the mirror
     // effect has committed the latest state).
-    dispatch({ kind: "localMove", uci });
+    dispatch({ kind: "localMove", uci, at: monotonicNow() });
     sockRef.current?.move(s.gameId, s.ply + 1, uci);
   }, []);
 

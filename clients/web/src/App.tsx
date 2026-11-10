@@ -10,6 +10,7 @@ import { codecProtocolVersion } from "./codec/seam";
 import { useGame, canRequestTakeback } from "./game/useGame";
 import { canOfferDraw } from "./game/reducer";
 import { Board } from "./game/Board";
+import { ClockBar } from "./game/Clock";
 import { Reason, ErrorCode, type ReasonCode } from "./codec/messages";
 import { DEV_POOL, DEV_TIME_CONTROL } from "./devConfig";
 
@@ -131,7 +132,7 @@ function GameView({ token }: { token: string }): React.JSX.Element {
 
       {state.position != null ? (
         <>
-          <ClockBar clocks={state.clocks} mySeat={state.mySeat} />
+          <ClockBar clocks={state.clocks} clockRun={state.clockRun} mySeat={state.mySeat} />
           <p>{myTurn ? t("game.turn.yours") : t("game.turn.theirs")}</p>
           <Board
             position={state.position}
@@ -265,25 +266,6 @@ function useGatedAnnouncement(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
   return text;
-}
-
-function ClockBar({ clocks, mySeat }: { clocks: number[]; mySeat: number | null }): React.JSX.Element {
-  return (
-    <div aria-label={t("game.clock.aria")} style={{ display: "flex", gap: "1rem" }}>
-      {clocks.map((ms, seat) => (
-        <span key={seat} style={{ fontWeight: seat === mySeat ? 700 : 400 }}>
-          {formatClock(ms)}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function formatClock(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 function rejectText(reason: ReasonCode): string {

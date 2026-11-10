@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-11-10 (main at PR #163, plus the GS-7 web PR) |
+| Last updated | 2026-11-11 (main at PR #167, plus #168 ticking clocks) |
 | Phase | **P0 foundations, with a first playable game.** G-A (engine) GREEN. The three G-D contract specs are RATIFIED (SPEC-S2-PROTOCOL, SPEC-PE-API-CONTRACT, SPEC-S3-DATA-MODEL). The wire codec is at **v1.3** and runs in Rust, iOS/Android bindings, wasm, Go and the web TS mirror. The game server (X-2) and the first web client (F-01) are merged and play a full game end to end in CI (`web-e2e`). X-3 accounts is specced (RATIFIED) and scaffolded. |
-| Next step | **Game-server bugs #90, #91, #93** (Redis re-claim after Remove, WS writes with no deadline, SEEK trusting client pool and time control). Then X-3 accounts, starting with the handle spec (#134), which needs an owner decision. Also open from GS-7: #102 (the session is dropped at GAME_END, so a late resend or reload after the end gets no result), which #89 and #122 wait on. |
+| Next step | **X-3 accounts**, starting with the handle spec (#134), which needs an owner decision. Also open: #102 (the session is dropped at GAME_END, so a late resend or reload after the end gets no result), which #89 and #122 wait on; the transport follow-ups #88 and #92; low-time clock warnings (#142). |
 
 ## What is done
 
@@ -14,8 +14,8 @@
 |---|---|
 | Engine (S1, Rust) | GREEN (G-A). Perft corpus and bench run nightly. `Move::from_uci` non-ASCII panic is fixed. |
 | Wire codec (ADR-14) | **v1.3 merged** (#161): messages `0x0B-0x0D`, `0x88-0x8A`, events `0x0D-0x11`, `status` enum, the full STATE body with six decode invariants enforced on encode and decode. Golden vectors reproduced byte-for-byte by Rust, Go, wasm; Swift and Kotlin host parity read the v1.3 fields through the bindings. `PROTOCOL.md` carries wire 1.3; the takeback/decline/duplicate-MOVE **behaviour** rows are still in `PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md` §7 until GS-7 lands. |
-| Game server (X-2, Go) | Lifecycle, clock, engine seam, live session, resign/abort/draw, DynamoDB event store, Redis matchmaking and WS transport, plus **GS-7** (#163): one Evolve/Decide reducer, so a live game always equals a rebuild; takeback with consent and clock rewind; draw decline and a 20-ply cooldown; a durable first-clock start (`ClockStarted`); MOVE idempotency with recurring plies; STATE clocks charged to `server_t`. The invariant harness passes with nothing excused. |
-| Web client (S4, F-01) | First-playable client (#62, #66) plus the GS-7 web reducer: STATE alone resumes a game (seat, ply, status, result, prompts; #101), draw decline, and a takeback button in unrated games (request, opponent accept/decline), modelled on chess.com. A real-server e2e covers a takeback. Clocks do not tick between server updates yet (#112). |
+| Game server (X-2, Go) | Lifecycle, clock, engine seam, live session, resign/abort/draw, DynamoDB event store, Redis matchmaking and WS transport, plus **GS-7** (#163): one Evolve/Decide reducer, so a live game always equals a rebuild; takeback with consent and clock rewind; draw decline and a 20-ply cooldown; a durable first-clock start (`ClockStarted`); MOVE idempotency with recurring plies; STATE clocks charged to `server_t`. The invariant harness passes with nothing excused. Since then: the Redis claim requires both seekers to still be waiting, so a matched seeker cannot be re-claimed into a second game (#165, #90); every connection has a write pump (64-frame queue, 5 s write deadline, slow consumers are disconnected), so a peer that stops reading cannot stall the opponent or the flag ticker (#166, #91); the pool decides the clock, not the client (interim catalogue `transport.DefaultPools` until X-13, bounded resolver, refused SEEKs logged; #167, #93). |
+| Web client (S4, F-01) | First-playable client (#62, #66) plus the GS-7 web reducer: STATE alone resumes a game (seat, ply, status, result, prompts; #101), draw decline, and a takeback button in unrated games (request, opponent accept/decline), modelled on chess.com. A real-server e2e covers a takeback. **Clocks tick** (#168, #112): the side to move counts down from the last server value, your own move stops your clock at once, GAME_END freezes both, and the running clock is marked by ▶ and "running" text. Display only, anchored at frame arrival (the client sends no PING); it keeps ticking while disconnected because the server keeps charging. The dev pool is now `blitz-5+0`. |
 | Accounts (X-3) | Spec RATIFIED (#72, #73); contract and data-model amendments applied (#74); pure-Go skeleton scaffolded (#75). Handle syntax is undefined (#134), so handles are not final. Other `services/*` folders exist (rating, anti-cheat, puzzles, content); their state was not re-verified for this update. |
 | Mobile | Codec parity only (Swift and Kotlin host runs in CI; device runs are manual). No client app yet. The `mobile` CI job builds the Android parity Gradle modules and compiles no parity tests or bindings (#133). |
 
@@ -25,14 +25,15 @@
 - **Nightly runs every job** (each gate has a schedule bypass), plus the slow perft corpus and the perf bench.
 - `protocol-parity` (macOS, Swift run + Kotlin compile) is a **hard gate**.
 - **Known CI gaps (open issues):** `engine-cgo` has no gate (#114); toolchains, images and actions are not pinned (#115); nightly failures are silent (#116); branch protection is not enforced (#117); stub jobs pass by finding nothing (#146).
-- **Flaky:** `TestRedis_ConcurrentMutualPairCreatesOneGame` failed in a nightly (existing issue #76).
+- **Flaky:** `TestRedis_ConcurrentMutualPairCreatesOneGame` failed in the 2026-11-10 nightly with **2 matches**, the #90 race that #165 fixed. #76 reports the opposite signature (0 matches), so it stays open; a scheduled check closes it after the first green nightly following the fix, and it should be reopened if a 0-match failure returns.
 
-## Open work (71 open issues on 2026-11-10, after #163)
+## Open work (66 open issues on 2026-11-11, after #168)
 
 - **GS-7 cluster: closed** by #163 and the GS-7 web PR (#84, #85, #67, #94, #101, #107, #123, #157, #159). Still open from it: #89 and #122 (wait on #102), #124 (the clock-start rule itself).
-- **Game server, separate:** #90 (Redis re-claim after Remove), #91 (WS writes have no deadline), #93 (SEEK trusts client pool and time control).
+- **Game server:** #90, #91, #93 closed (#165-#167). Related and still open: #88 (a failed GAME_END broadcast latches the claim), #92 (no cross-goroutine frame ordering; GAME_END can overtake MOVE_ACCEPTED), #104 (no rate limit, connection cap, auth timeout or heartbeat). `rated` is still taken from the client until accounts (X-3).
 - **Protocol:** #131 (`MATCHED.opponent` carries the user id, not the handle), #150 (codec tests miss RESYNC/DRAW_OFFERED; `schema_ver` rule untested).
-- Counts by label: game-server 22, protocol 15, web 13, ci 7, specs 4, accounts 3, engine 5, mobile 1. 29 are `spec-first`.
+- **Web:** #112 closed (#168). Low-time warnings and clock announcements are #142; the WEB-F01 DoD checkbox is #136.
+- Counts by label: game-server 13, protocol 13, web 12, ci 7, engine 5, specs 4, accounts 3, mobile 1. 23 are `spec-first`.
 
 ## Accounts & infra (external, not in git)
 
@@ -58,4 +59,4 @@ ADR-1 Glicko-2 per pool · ADR-2 anti-cheat in-house · ADR-3 N-seat container �
 
 ## Working agreements worth remembering
 - Do not write `fixes #N` in a PR body for work the PR does not do. GitHub closes the issue on merge (this closed #84 early on #161 and was reopened).
-- Independent review is for load-bearing work (game rules, clocks, wire format). Triage its findings against the actual bug; file the rest as low-priority issues. Cap at one or two rounds.
+- Kiro decides per PR whether an independent review is needed, and states the call and the reason in the PR. Review (one round, context-free reviewer) when a bug would hurt players or data and tests cannot fully reproduce the failure: concurrency, trust boundaries, protocol and state-machine changes. Skip it for small, well-tested, cheap-to-fix changes. Fix real findings, push back with evidence on the rest, then stop. Skipping reviews to save cost only moves the review to the owner (the #165-#167 findings came from owner review).

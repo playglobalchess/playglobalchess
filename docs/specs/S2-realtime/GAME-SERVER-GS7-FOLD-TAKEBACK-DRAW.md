@@ -599,9 +599,11 @@ state of §6.4, and the clock anchor. The inline TS shape types and
 >   setting it from a rewind STATE would announce the undone move as if it had
 >   just been played. `last_move_uci` stays in the body for clients that show a
 >   last-move highlight; a highlight can read it without touching the announcement.
-> - **The clock anchor (`running_seat`, `server_t`) is not stored yet.** The
->   client does not tick clocks between server updates; that is #112, which
->   stores and uses the anchor in one change rather than carrying unused state.
+> - **The clock anchor is `running_seat` plus the local ARRIVAL time, not
+>   `server_t`** (#112, WEB-F01 §3.3). The web client sends no `PING`, so it has
+>   no offset to map `server_t`, and `MOVE_ACCEPTED` carries none; the display
+>   is at most one network latency generous and every server frame corrects it.
+>   A client that does ping may use `server_t` as specified above.
 
 **What it fixes.** A reconnecting or reloaded client learns its seat, side to
 move, ply, live-or-over, result, last move, pending prompts and a correct running
