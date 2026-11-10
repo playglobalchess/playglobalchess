@@ -46,6 +46,11 @@ func (p *MemoryPool) Enqueue(_ context.Context, s Seeker) error {
 func (p *MemoryPool) TryClaim(_ context.Context, newSeeker Seeker, _ Window, _ time.Time) (Seeker, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Like RedisPool (#90): the claimer must itself still be waiting and
+	// unclaimed, or a seeker withdrawn (or matched) since Enqueue would pair.
+	if _, waiting := p.waiting[newSeeker.SeekID]; !waiting || p.claimed[newSeeker.SeekID] {
+		return Seeker{}, false, nil
+	}
 	for id, s := range p.waiting {
 		if id == newSeeker.SeekID || p.claimed[id] {
 			continue

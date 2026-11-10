@@ -3,6 +3,7 @@ package matchmaking
 import (
 	"context"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -53,8 +54,12 @@ func TestRedis_EnqueueAndClaim(t *testing.T) {
 	if err := p.Enqueue(ctx, a); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	// A compatible new seeker claims alice.
+	// A compatible new seeker claims alice. Seek enqueues the claimer before
+	// TryClaim (the mutual-miss fix), and the claim requires both to be waiting.
 	b := intgSeeker("rb", "bob", pool, 1510, 0)
+	if err := p.Enqueue(ctx, b); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
 	partner, ok, err := p.TryClaim(ctx, b, DefaultWindow, time.Now())
 	if err != nil {
 		t.Fatalf("claim: %v", err)
@@ -64,10 +69,13 @@ func TestRedis_EnqueueAndClaim(t *testing.T) {
 	}
 }
 
-// THE concurrency guarantee: two seekers race to claim the SAME single waiting
-// partner; exactly one may win (no double-match). This is what the Lua
-// compare-and-set exists for.
-func TestRedis_ConcurrentClaimExactlyOneWins(t *testing.T) {
+// THE concurrency guarantee: two newcomers race while one partner waits. All
+// three are enqueued (Seek's contract), so the newcomers may also pair with each
+// other; what must hold is that no seeker is in two pairs (no double-match) and
+// that some pair forms (no lost match). It no longer asserts a single winner:
+// n1+n2 pairing while the partner keeps waiting is a correct outcome. This is
+// what the Lua compare-and-set exists for.
+func TestRedis_ConcurrentClaimNoDoubleMatch(t *testing.T) {
 	p := redisPool(t)
 	ctx := context.Background()
 	pool := "it-race-" + t.Name()
@@ -77,33 +85,46 @@ func TestRedis_ConcurrentClaimExactlyOneWins(t *testing.T) {
 	n2 := intgSeeker("rn2", "n2", pool, 1500, 0)
 	defer p.Remove(ctx, pool, "rp", "rn1", "rn2")
 
-	if err := p.Enqueue(ctx, partner); err != nil {
-		t.Fatalf("enqueue partner: %v", err)
+	// Seek enqueues each claimer before TryClaim, so all three are waiting. The
+	// newcomers may also legitimately pair with each other; the guarantee is that
+	// no seeker ends up in two pairs and the partner is not lost.
+	for _, s := range []Seeker{partner, n1, n2} {
+		if err := p.Enqueue(ctx, s); err != nil {
+			t.Fatalf("enqueue %s: %v", s.SeekID, err)
+		}
 	}
 
 	var wg sync.WaitGroup
-	results := make([]bool, 2)
+	got := make([]string, 2) // the partner each newcomer claimed, "" if none
 	for i, n := range []Seeker{n1, n2} {
 		wg.Add(1)
 		go func(i int, s Seeker) {
 			defer wg.Done()
-			_, ok, err := p.TryClaim(ctx, s, DefaultWindow, time.Now())
+			won, ok, err := p.TryClaim(ctx, s, DefaultWindow, time.Now())
 			if err != nil {
 				t.Errorf("claim %s: %v", s.SeekID, err)
 			}
-			results[i] = ok
+			if ok {
+				got[i] = won.SeekID
+			}
 		}(i, n)
 	}
 	wg.Wait()
 
-	wins := 0
-	for _, r := range results {
-		if r {
-			wins++
+	seen := map[string]int{}
+	for i, g := range got {
+		if g != "" {
+			seen[g]++
+			seen[[]string{"rn1", "rn2"}[i]]++
 		}
 	}
-	if wins != 1 {
-		t.Fatalf("concurrent claim for one partner: %d winners, want exactly 1 (double-match or lost-match)", wins)
+	for id, n := range seen {
+		if n > 1 {
+			t.Fatalf("seeker %s is in %d pairs (double-match): claims %v", id, n, got)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatalf("no claim won with three compatible seekers waiting (lost match): %v", got)
 	}
 }
 
@@ -116,6 +137,7 @@ func TestRedis_ReleaseAndRemove(t *testing.T) {
 	defer p.Remove(ctx, pool, "rra", "rrb")
 	_ = p.Enqueue(ctx, a)
 	b := intgSeeker("rrb", "bob", pool, 1500, 0)
+	_ = p.Enqueue(ctx, b) // Seek enqueues the claimer first
 
 	// Claim, then Release → alice claimable again.
 	if _, ok, _ := p.TryClaim(ctx, b, DefaultWindow, time.Now()); !ok {
@@ -195,8 +217,11 @@ func TestRedis_ReadPoolPrunesClaimedExpiredMember(t *testing.T) {
 func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	p := redisPool(t)
 	ctx := context.Background()
-	pool := "it-mutual-" + t.Name()
-	defer p.Remove(ctx, pool, "ma", "mb")
+	// Unique ids per run so -count=N runs cannot see each other's keys (#90/#76).
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pool := "it-mutual-" + t.Name() + "-" + run
+	ma, mb := "ma-"+run, "mb-"+run
+	defer p.Remove(ctx, pool, ma, mb)
 
 	store := game.NewMemStore()
 	m := New(p, store, SeedRatingSource{})
@@ -205,8 +230,8 @@ func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	var wg sync.WaitGroup
 	matches := make([]bool, 2)
 	seekers := []Seeker{
-		{SeekID: "ma", UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
-		{SeekID: "mb", UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: ma, UserID: "alice", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
+		{SeekID: mb, UserID: "bob", PoolID: pool, TimeControl: "blitz-5+3", Rated: true},
 	}
 	for i, s := range seekers {
 		wg.Add(1)
@@ -231,5 +256,86 @@ func TestRedis_ConcurrentMutualPairCreatesOneGame(t *testing.T) {
 	}
 	if n := store.StreamCount(); n != 1 {
 		t.Fatalf("real-redis concurrent mutual seek created %d games, want 1", n)
+	}
+}
+
+// TestRedis_ClaimOfRemovedSeekerFails is the deterministic #90 interleaving:
+// B reads the pool and sees A waiting; meanwhile A is matched with C and the
+// match is finalized (Remove deletes A's hash, membership AND claim key); B then
+// claims A. B's claim must fail: A is no longer waiting. Before the fix it
+// succeeded (the script checked only the claim keys) and a second game was made.
+func TestRedis_ClaimOfRemovedSeekerFails(t *testing.T) {
+	p := redisPool(t)
+	ctx := context.Background()
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pool := "it-90-" + run
+	a, b, c := "a-"+run, "b-"+run, "c-"+run
+	defer p.Remove(ctx, pool, a, b, c)
+	for _, s := range []Seeker{
+		intgSeeker(a, "alice", pool, 1500, 0),
+		intgSeeker(c, "carol", pool, 1500, 0),
+		intgSeeker(b, "bob", pool, 1500, 0),
+	} {
+		if err := p.Enqueue(ctx, s); err != nil {
+			t.Fatalf("enqueue %s: %v", s.SeekID, err)
+		}
+	}
+	// B's stale snapshot: A is waiting and unclaimed.
+	snap, err := p.readPool(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawA := false
+	for _, s := range snap {
+		sawA = sawA || s.SeekID == a
+	}
+	if !sawA {
+		t.Fatalf("setup: B's read does not contain A: %+v", snap)
+	}
+	// A wins a claim with C, the game is created, and the match is finalized.
+	if ok, err := p.claim(ctx, pool, c, a); err != nil || !ok {
+		t.Fatalf("A/C claim: ok=%v err=%v", ok, err)
+	}
+	if err := p.Remove(ctx, pool, a, c); err != nil {
+		t.Fatal(err)
+	}
+	// B now claims A from its stale read: must fail.
+	ok, err := p.claim(ctx, pool, b, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("#90: B claimed A after A was matched and removed (a second game would be created)")
+	}
+	// And B itself is still claimable by a newcomer (its claim key was not left set).
+	d := "d-" + run
+	defer p.Remove(ctx, pool, d)
+	if err := p.Enqueue(ctx, intgSeeker(d, "dave", pool, 1500, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := p.claim(ctx, pool, d, b); err != nil || !ok {
+		t.Fatalf("B should still be claimable after the failed claim: ok=%v err=%v", ok, err)
+	}
+}
+
+// A seeker whose hash expired but whose pool member lingers (no lazy prune yet)
+// cannot be claimed either.
+func TestRedis_ClaimOfExpiredSeekerFails(t *testing.T) {
+	p := redisPool(t)
+	ctx := context.Background()
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pool := "it-90x-" + run
+	a, b := "a-"+run, "b-"+run
+	defer p.Remove(ctx, pool, a, b)
+	for _, s := range []Seeker{intgSeeker(a, "alice", pool, 1500, 0), intgSeeker(b, "bob", pool, 1500, 0)} {
+		if err := p.Enqueue(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.rdb.Del(ctx, seekKey(a)).Err(); err != nil { // the hash TTL lapsed
+		t.Fatal(err)
+	}
+	if ok, err := p.claim(ctx, pool, b, a); err != nil || ok {
+		t.Fatalf("claim of an expired seeker: ok=%v err=%v, want false", ok, err)
 	}
 }

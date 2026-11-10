@@ -25,6 +25,8 @@ type SeekPool interface {
 	// removing either — it flips both to a claimed state so a concurrent node
 	// cannot claim the same partner. Returns the claimed partner and true, or
 	// false if no partner qualifies now (the new seeker remains enqueued).
+	// Precondition: newSeeker is already enqueued (Seek does this first); a claim
+	// succeeds only while BOTH seekers are still waiting (#90).
 	TryClaim(ctx context.Context, newSeeker Seeker, w Window, now time.Time) (Seeker, bool, error)
 	// Release undoes a claim (claim held but game creation failed) so both
 	// seekers become pairable again.

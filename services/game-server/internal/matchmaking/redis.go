@@ -127,17 +127,43 @@ func (p *RedisPool) readPool(ctx context.Context, poolID string) ([]Seeker, erro
 	return out, nil
 }
 
-// claimScript atomically marks BOTH seek_ids claimed iff NEITHER is currently
-// claimed. KEYS[1]=claim:a KEYS[2]=claim:b, ARGV[1]=ttlSeconds. Returns 1 on
-// success, 0 if either was already claimed (the caller retries).
+// claimScript atomically marks BOTH seek_ids claimed iff BOTH are still waiting
+// and NEITHER is claimed (#90, GS5 §3.3). "Still waiting" means the seek hash
+// exists AND the id is still a member of the pool: Remove deletes the claim key
+// together with the hash and the membership once a game is created, so checking
+// the claim keys alone let a node holding a stale pool read re-claim a seeker
+// who had just been matched, creating a second game for them.
+//
+// KEYS[1]=claim:a KEYS[2]=claim:b KEYS[3]=seek:a KEYS[4]=seek:b KEYS[5]=pool,
+// ARGV[1]=ttlSeconds ARGV[2]=a ARGV[3]=b. Returns 1 on success, 0 if either
+// seeker is claimed or no longer waiting (the caller re-reads and retries).
 var claimScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+if redis.call('EXISTS', KEYS[3]) == 0 or redis.call('EXISTS', KEYS[4]) == 0 then
+  return 0
+end
+if not redis.call('ZSCORE', KEYS[5], ARGV[2]) or not redis.call('ZSCORE', KEYS[5], ARGV[3]) then
   return 0
 end
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 redis.call('SET', KEYS[2], '1', 'EX', ARGV[1])
 return 1
 `)
+
+// claim runs claimScript for the pair a (the new seeker) and b (the chosen
+// partner) in poolID. Split out of TryClaim so a test can drive the read and the
+// claim separately (the #90 interleaving).
+func (p *RedisPool) claim(ctx context.Context, poolID, a, b string) (bool, error) {
+	ttl := strconv.Itoa(int(p.seekTTL.Seconds()))
+	res, err := claimScript.Run(ctx, p.rdb,
+		[]string{claimKey(a), claimKey(b), seekKey(a), seekKey(b), poolKey(poolID)}, ttl, a, b).Int()
+	if err != nil {
+		return false, fmt.Errorf("matchmaking: redis claim: %w", err)
+	}
+	return res == 1, nil
+}
 
 // TryClaim reads the pool, picks the pure-core winner, and atomically claims the
 // pair. If the atomic claim loses a race (either seeker got claimed between the
@@ -153,16 +179,15 @@ func (p *RedisPool) TryClaim(ctx context.Context, newSeeker Seeker, w Window, no
 		if !ok {
 			return Seeker{}, false, nil // no partner now
 		}
-		ttl := strconv.Itoa(int(p.seekTTL.Seconds()))
-		res, err := claimScript.Run(ctx, p.rdb,
-			[]string{claimKey(newSeeker.SeekID), claimKey(partner.SeekID)}, ttl).Int()
+		won, err := p.claim(ctx, newSeeker.PoolID, newSeeker.SeekID, partner.SeekID)
 		if err != nil {
-			return Seeker{}, false, fmt.Errorf("matchmaking: redis claim: %w", err)
+			return Seeker{}, false, err
 		}
-		if res == 1 {
+		if won {
 			return partner, true, nil // won the claim
 		}
-		// Lost the race — the chosen partner was claimed by another node; retry.
+		// Lost the race — the partner was claimed by another node, or already
+		// matched and removed (#90); retry against a fresh read.
 	}
 	// Contention did not resolve in the bound — treat as "no match now" so the
 	// seeker stays enqueued and retries on the next counter-seek, rather than
