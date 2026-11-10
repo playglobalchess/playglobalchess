@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { GameSocket, type SocketLike } from "./GameSocket";
 import { encodeServerFrame, decodeClientFrame } from "../codec/seam";
 import type { ClientMsg, ServerMsg } from "../codec/messages";
+import { sb } from "../test/stateBody";
 
 // A fake WebSocket that captures outgoing frames and lets the test feed incoming
 // ones. It uses the REAL codec seam, so this exercises the client's encode/decode
@@ -86,7 +87,7 @@ describe("GameSocket (fake socket, real codec)", () => {
     expect("Seek" in seek).toBe(true);
 
     // Server matches us as seat 0.
-    f.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "jane", start_state: { fen: START_FEN, turn: 0, clocks: [300000, 300000] } } });
+    f.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "jane", start_state: sb(START_FEN, 0, [300000, 300000]) } });
     expect(received.at(-1) && "Matched" in received.at(-1)!).toBe(true);
 
     // We move; the client sends MOVE with the ply we pass.
@@ -114,7 +115,7 @@ describe("GameSocket (fake socket, real codec)", () => {
     f.onmessage?.({ data: new Uint8Array([0xff]).buffer }); // garbage → decode throws → ignored
     expect(received.length).toBe(before);
     // The socket still works afterward.
-    f.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+    f.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1]) } });
     expect("Matched" in received.at(-1)!).toBe(true);
   });
 
@@ -157,7 +158,7 @@ describe("GameSocket (fake socket, real codec)", () => {
     sock.connect();
     fakes[0]!.open();
     sock.seek("p", "tc", false);
-    fakes[0]!.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+    fakes[0]!.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1]) } });
     fakes[0]!.onclose?.();
     return new Promise<void>((resolve) => {
       setTimeout(() => {
@@ -218,7 +219,7 @@ describe("GameSocket (fake socket, real codec)", () => {
         const sockets1 = fakes.length;
         // The OLD socket now emits a late frame AND a second close. Both must be
         // ignored — no dispatch, and crucially NO new reconnect socket.
-        first.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+        first.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1]) } });
         first.onclose?.();
         expect(received.length).toBe(beforeStale); // stale frame dropped
         setTimeout(() => {
@@ -269,7 +270,7 @@ describe("GameSocket (fake socket, real codec)", () => {
     const f1 = fakes[0]!;
     f1.open();
     sock.seek("blitz", "blitz-5+3", false);
-    f1.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: START_FEN, turn: 0, clocks: [1, 1] } } });
+    f1.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1]) } });
     // Socket drops; the UI issues a move while down. A game-mutating frame must
     // NOT be buffered — on reconnect the server auto-pushes STATE (restoring
     // ply), so a replayed stale MOVE at an old ply would wedge the player.

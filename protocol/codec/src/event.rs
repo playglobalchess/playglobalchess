@@ -75,6 +75,23 @@ pub enum GameEvent {
         pool_id: PoolId,
         per_seat: Vec<SeatRating>,
     },
+    // v1.3 (ADR-19) variants APPEND here: the GS-4a cgo seam encodes this enum
+    // by serde variant index. `TakebackReq`/`TakebackAccepted` stay decodable but
+    // a v1.3 server never writes them.
+    /// `0x0D` — `seat_idx`.
+    TakebackProposed { seat_idx: u8 },
+    /// `0x0E` — `seat_idx, to_ply, server_ts`.
+    TakebackRewound {
+        seat_idx: u8,
+        to_ply: u32,
+        server_ts: u64,
+    },
+    /// `0x0F` — `seat_idx`.
+    TakebackDeclined { seat_idx: u8 },
+    /// `0x10` — `seat_idx`.
+    DrawDeclined { seat_idx: u8 },
+    /// `0x11` — `server_ts`.
+    ClockStarted { server_ts: u64 },
 }
 
 impl GameEvent {
@@ -93,6 +110,11 @@ impl GameEvent {
             GameEvent::ClockFlagged { .. } => EventType::ClockFlagged,
             GameEvent::GameEnded { .. } => EventType::GameEnded,
             GameEvent::RatingApplied { .. } => EventType::RatingApplied,
+            GameEvent::TakebackProposed { .. } => EventType::TakebackProposed,
+            GameEvent::TakebackRewound { .. } => EventType::TakebackRewound,
+            GameEvent::TakebackDeclined { .. } => EventType::TakebackDeclined,
+            GameEvent::DrawDeclined { .. } => EventType::DrawDeclined,
+            GameEvent::ClockStarted { .. } => EventType::ClockStarted,
         }
     }
 }
@@ -179,4 +201,18 @@ pub(crate) struct GameEndedBody {
 pub(crate) struct RatingAppliedBody {
     pub pool_id: PoolId,
     pub per_seat: Vec<SeatRating>,
+}
+
+/// `TakebackRewound` body (§4A.8 v1.3): `seat_idx, to_ply, server_ts`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct TakebackRewoundBody {
+    pub seat_idx: u8,
+    pub to_ply: u32,
+    pub server_ts: u64,
+}
+
+/// `ClockStarted` body (§4A.8 v1.3): `server_ts`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ClockStartedBody {
+    pub server_ts: u64,
 }

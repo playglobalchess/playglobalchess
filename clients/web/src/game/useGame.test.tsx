@@ -19,11 +19,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("../codec/seam", () => {
   const enc = new TextEncoder();
   const dec = new TextDecoder();
+  // u64 fields (STATE.server_t, PONG) are bigint; JSON needs them tagged.
+  const toJson = (msg: unknown) =>
+    JSON.stringify(msg, (_k, v: unknown) => (typeof v === "bigint" ? { $big: v.toString() } : v));
+  const fromJson = (s: string): unknown =>
+    JSON.parse(s, (_k, v: unknown) =>
+      v != null && typeof v === "object" && "$big" in v ? BigInt((v as { $big: string }).$big) : v,
+    );
   return {
-    encode: (msg: unknown) => enc.encode(JSON.stringify(msg)),
-    decode: (bytes: Uint8Array) => JSON.parse(dec.decode(bytes)),
-    encodeServerFrame: (msg: unknown) => enc.encode(JSON.stringify(msg)),
-    decodeClientFrame: (bytes: Uint8Array) => JSON.parse(dec.decode(bytes)),
+    encode: (msg: unknown) => enc.encode(toJson(msg)),
+    decode: (bytes: Uint8Array) => fromJson(dec.decode(bytes)),
+    encodeServerFrame: (msg: unknown) => enc.encode(toJson(msg)),
+    decodeClientFrame: (bytes: Uint8Array) => fromJson(dec.decode(bytes)),
     codecProtocolVersion: () => 1,
   };
 });
@@ -33,10 +40,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { useGame, type UseGameResult } from "./useGame";
 import type { ClientMsg, ServerMsg } from "../codec/messages";
 import type { SocketLike } from "../net/GameSocket";
+import { sb } from "../test/stateBody";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const encodeFrame = (msg: unknown): Uint8Array => enc.encode(JSON.stringify(msg));
+const encodeFrame = (msg: unknown): Uint8Array =>
+  enc.encode(JSON.stringify(msg, (_k, v: unknown) => (typeof v === "bigint" ? { $big: v.toString() } : v)));
 const decodeClientFrame = (bytes: Uint8Array): ClientMsg =>
   JSON.parse(dec.decode(bytes)) as ClientMsg;
 
@@ -115,11 +124,7 @@ const matched: ServerMsg = {
     game_id: "g1",
     seat_idx: 0,
     opponent: "bob",
-    start_state: {
-      fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-      turn: 0,
-      clocks: [300000, 300000],
-    },
+    start_state: sb("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 0, [300000, 300000]),
   },
 };
 
@@ -173,11 +178,7 @@ describe("useGame", () => {
       h.fake().push({
         State: {
           game_id: "g1",
-          state: {
-            fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
-            turn: 1,
-            clocks: [299000, 300000],
-          },
+          state: sb("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1", 1, [299000, 300000]),
         },
       }),
     );

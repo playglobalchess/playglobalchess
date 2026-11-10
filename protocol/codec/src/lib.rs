@@ -64,6 +64,6 @@ pub use message::{client_code, server_code, ClientMsg, ServerMsg};
 pub use types::{is_known_color, is_known_result};
 pub use types::{
     AuthToken, Color, ErrorCode, EventType, GameId, PoolId, Reason, SeatColor, SeatRating,
-    SeatResult, StateBody, Termination, TimeControlId, UserId, ABORT_BY_SYSTEM, COLOR_BLACK,
-    COLOR_WHITE, RESULT_DRAW, RESULT_LOSS, RESULT_WIN,
+    SeatResult, StateBody, Status, Termination, TimeControlId, UserId, ABORT_BY_SYSTEM,
+    COLOR_BLACK, COLOR_WHITE, NO_SEAT, RESULT_DRAW, RESULT_LOSS, RESULT_WIN,
 };

@@ -55,6 +55,16 @@ pub enum ClientMsg {
     /// for a game it is seated in (on-demand resync; complements the auth-time
     /// server push).
     Resync { game_id: GameId },
+    // v1.3 (ADR-19) variants APPEND here: the GS-6a cgo seam encodes this enum
+    // by serde variant index, so existing variants must not move.
+    /// `0x0B` (v1.3) — `game_id:str36, at_ply:u32`. Accept a pending takeback.
+    TakebackAccept { game_id: GameId, at_ply: u32 },
+    /// `0x0C` (v1.3) — `game_id:str36, at_ply:u32`. Decline (responder) or
+    /// cancel (proposer) a pending takeback.
+    TakebackDecline { game_id: GameId, at_ply: u32 },
+    /// `0x0D` (v1.3) — `game_id:str36`. Decline (responder) or withdraw
+    /// (offerer) a pending draw offer.
+    DeclineDraw { game_id: GameId },
 }
 
 /// Server → client messages (§4A.2, codes `0x80–0xFF`).
@@ -106,6 +116,18 @@ pub enum ServerMsg {
     /// when a first (non-ending) draw OFFER is recorded, so a pending offer is a
     /// first-class notification rather than a UI inference.
     DrawOffered { game_id: GameId, by: u8 },
+    // v1.3 (ADR-19) server variants go BEFORE Error (spec §2; the Go seam
+    // mirrors this exact variant order).
+    /// `0x88` (v1.3) — `game_id:str36, seat_idx:u8, at_ply:u32`.
+    TakebackOffered {
+        game_id: GameId,
+        seat_idx: u8,
+        at_ply: u32,
+    },
+    /// `0x89` (v1.3) — `game_id:str36, seat_idx:u8`.
+    TakebackDeclined { game_id: GameId, seat_idx: u8 },
+    /// `0x8A` (v1.3) — `game_id:str36, seat_idx:u8`.
+    DrawDeclined { game_id: GameId, seat_idx: u8 },
     /// `0x8F` — `code:enum8, msg:str`.
     Error { code: ErrorCode, msg: String },
 }
@@ -125,6 +147,12 @@ pub mod client_code {
     pub const PING: u8 = 0x09;
     /// §4A v1.1 (ADR-17).
     pub const RESYNC: u8 = 0x0A;
+    /// §4A v1.3 (ADR-19).
+    pub const TAKEBACK_ACCEPT: u8 = 0x0B;
+    /// §4A v1.3.
+    pub const TAKEBACK_DECLINE: u8 = 0x0C;
+    /// §4A v1.3.
+    pub const DECLINE_DRAW: u8 = 0x0D;
 }
 
 /// Server → client frozen type codes (§4A.2).
@@ -137,6 +165,12 @@ pub mod server_code {
     pub const PONG: u8 = 0x86;
     /// §4A v1.1 (ADR-17).
     pub const DRAW_OFFERED: u8 = 0x87;
+    /// §4A v1.3 (ADR-19).
+    pub const TAKEBACK_OFFERED: u8 = 0x88;
+    /// §4A v1.3.
+    pub const TAKEBACK_DECLINED: u8 = 0x89;
+    /// §4A v1.3.
+    pub const DRAW_DECLINED: u8 = 0x8A;
     pub const ERROR: u8 = 0x8F;
 }
 
@@ -154,6 +188,9 @@ impl ClientMsg {
             ClientMsg::Rematch { .. } => client_code::REMATCH,
             ClientMsg::Ping { .. } => client_code::PING,
             ClientMsg::Resync { .. } => client_code::RESYNC,
+            ClientMsg::TakebackAccept { .. } => client_code::TAKEBACK_ACCEPT,
+            ClientMsg::TakebackDecline { .. } => client_code::TAKEBACK_DECLINE,
+            ClientMsg::DeclineDraw { .. } => client_code::DECLINE_DRAW,
         }
     }
 }
@@ -169,6 +206,9 @@ impl ServerMsg {
             ServerMsg::GameEnd { .. } => server_code::GAME_END,
             ServerMsg::Pong { .. } => server_code::PONG,
             ServerMsg::DrawOffered { .. } => server_code::DRAW_OFFERED,
+            ServerMsg::TakebackOffered { .. } => server_code::TAKEBACK_OFFERED,
+            ServerMsg::TakebackDeclined { .. } => server_code::TAKEBACK_DECLINED,
+            ServerMsg::DrawDeclined { .. } => server_code::DRAW_DECLINED,
             ServerMsg::Error { .. } => server_code::ERROR,
         }
     }
@@ -267,4 +307,26 @@ pub(crate) struct ErrorPayload {
 pub(crate) struct DrawOfferedPayload {
     pub game_id: GameId,
     pub by: u8,
+}
+
+/// `TAKEBACK_ACCEPT` / `TAKEBACK_DECLINE` payload (§4A v1.3): `game_id, at_ply`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GameAtPlyPayload {
+    pub game_id: GameId,
+    pub at_ply: u32,
+}
+
+/// `TAKEBACK_OFFERED` payload (§4A v1.3): `game_id, seat_idx, at_ply`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct TakebackOfferedPayload {
+    pub game_id: GameId,
+    pub seat_idx: u8,
+    pub at_ply: u32,
+}
+
+/// `TAKEBACK_DECLINED` / `DRAW_DECLINED` payload (§4A v1.3): `game_id, seat_idx`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GameSeatPayload {
+    pub game_id: GameId,
+    pub seat_idx: u8,
 }

@@ -30,15 +30,15 @@ use serde::Serialize;
 
 use crate::error::{CodecError, MAX_FRAME_BYTES};
 use crate::event::{
-    AbortedBody, EventEnvelope, GameCreatedBody, GameEndedBody, GameEvent, MovePlayedBody,
-    PlayerJoinedBody, RatingAppliedBody, SeatIdxBody,
+    AbortedBody, ClockStartedBody, EventEnvelope, GameCreatedBody, GameEndedBody, GameEvent,
+    MovePlayedBody, PlayerJoinedBody, RatingAppliedBody, SeatIdxBody, TakebackRewoundBody,
 };
 use crate::message::{
-    client_code, server_code, ClientMsg, DrawOfferedPayload, ErrorPayload, GameEndPayload,
-    MatchedPayload, MoveAcceptedPayload, MovePayload, MoveRejectedPayload, PongPayload,
-    SeekPayload, ServerMsg, StatePayload,
+    client_code, server_code, ClientMsg, DrawOfferedPayload, ErrorPayload, GameAtPlyPayload,
+    GameEndPayload, GameSeatPayload, MatchedPayload, MoveAcceptedPayload, MovePayload,
+    MoveRejectedPayload, PongPayload, SeekPayload, ServerMsg, StatePayload, TakebackOfferedPayload,
 };
-use crate::types::EventType;
+use crate::types::{EventType, StateBody, Status, Termination, NO_SEAT};
 
 /// Protocol major version for v1 frames (§4A.1).
 pub const VER_V1: u8 = 0x01;
@@ -80,6 +80,65 @@ fn check_result_vector(rv: &[u8]) -> Result<(), CodecError> {
         return Err(CodecError::MalformedPayload(format!(
             "result_vector entry 0x{bad:02x} is not a frozen result value (0=loss,1=draw,2=win)"
         )));
+    }
+    Ok(())
+}
+
+fn bad(msg: String) -> CodecError {
+    CodecError::MalformedPayload(msg)
+}
+
+/// The §4A.6 (v1.3) STATE-body decode invariants, plus the closed `status`,
+/// `termination` and result domains. Applied on encode AND decode of `STATE`
+/// and `MATCHED.start_state`, so the codec cannot emit a body it would refuse.
+pub(crate) fn check_state_body(s: &StateBody) -> Result<(), CodecError> {
+    if !s.status.is_known() {
+        return Err(bad(format!("unknown status 0x{:02x}", s.status.value())));
+    }
+    let ended = s.status == Status::ENDED;
+    let seats = s.clocks.len();
+    // 1. result_vector non-empty iff ENDED, and then one entry per seat.
+    if ended != !s.result_vector.is_empty() || (ended && s.result_vector.len() != seats) {
+        return Err(bad(
+            "STATE result_vector must be one entry per seat iff status is ENDED".into(),
+        ));
+    }
+    check_result_vector(&s.result_vector)?;
+    // 2. termination non-zero iff ENDED (and then a frozen §4A.5 code).
+    if ended != (s.termination != 0) || (ended && !Termination(s.termination).is_known()) {
+        return Err(bad(format!(
+            "STATE termination 0x{:02x} must be a §4A.5 code iff status is ENDED",
+            s.termination
+        )));
+    }
+    // 3. every seat field is a valid seat or NO_SEAT.
+    for (name, v) in [
+        ("you_seat", s.you_seat),
+        ("pending_draw_by", s.pending_draw_by),
+        ("takeback_by", s.takeback_by),
+        ("running_seat", s.running_seat),
+    ] {
+        if v != NO_SEAT && usize::from(v) >= seats {
+            return Err(bad(format!("STATE {name} {v} is not a seat or 0xFF")));
+        }
+    }
+    // 4. takeback_at_ply == 0 iff no takeback is pending.
+    if (s.takeback_at_ply == 0) != (s.takeback_by == NO_SEAT) {
+        return Err(bad(
+            "STATE takeback_at_ply must be 0 iff takeback_by is 0xFF".into(),
+        ));
+    }
+    // 5. last_move_uci <= 5 bytes, empty iff ply == 0.
+    if s.last_move_uci.len() > 5 || s.last_move_uci.is_empty() != (s.ply == 0) {
+        return Err(bad(
+            "STATE last_move_uci must be <= 5 bytes and empty iff ply is 0".into(),
+        ));
+    }
+    // 6. no clock runs once the game has ended.
+    if ended && s.running_seat != NO_SEAT {
+        return Err(bad(
+            "STATE running_seat must be 0xFF when status is ENDED".into()
+        ));
     }
     Ok(())
 }
@@ -145,8 +204,14 @@ pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, CodecError> {
         | ClientMsg::Abort { game_id }
         | ClientMsg::Takeback { game_id }
         | ClientMsg::Rematch { game_id }
-        | ClientMsg::Resync { game_id } => ser(game_id)?,
+        | ClientMsg::Resync { game_id }
+        | ClientMsg::DeclineDraw { game_id } => ser(game_id)?,
         ClientMsg::Ping { t } => ser(t)?,
+        ClientMsg::TakebackAccept { game_id, at_ply }
+        | ClientMsg::TakebackDecline { game_id, at_ply } => ser(&GameAtPlyPayload {
+            game_id: game_id.clone(),
+            at_ply: *at_ply,
+        })?,
     };
     frame(VER_V1, type_code, payload)
 }
@@ -201,6 +266,23 @@ pub fn decode_client(frame: &[u8]) -> Result<ClientMsg, CodecError> {
         client_code::RESYNC => Ok(ClientMsg::Resync {
             game_id: de_exact(payload)?,
         }),
+        client_code::TAKEBACK_ACCEPT => {
+            let p: GameAtPlyPayload = de_exact(payload)?;
+            Ok(ClientMsg::TakebackAccept {
+                game_id: p.game_id,
+                at_ply: p.at_ply,
+            })
+        }
+        client_code::TAKEBACK_DECLINE => {
+            let p: GameAtPlyPayload = de_exact(payload)?;
+            Ok(ClientMsg::TakebackDecline {
+                game_id: p.game_id,
+                at_ply: p.at_ply,
+            })
+        }
+        client_code::DECLINE_DRAW => Ok(ClientMsg::DeclineDraw {
+            game_id: de_exact(payload)?,
+        }),
         other => Err(CodecError::UnknownType(other)),
     }
 }
@@ -246,6 +328,8 @@ pub fn encode_server(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
                 code.value()
             )));
         }
+        ServerMsg::State { state, .. } => check_state_body(state)?,
+        ServerMsg::Matched { start_state, .. } => check_state_body(start_state)?,
         _ => {}
     }
     let type_code = msg.type_code();
@@ -304,6 +388,20 @@ pub fn encode_server(msg: &ServerMsg) -> Result<Vec<u8>, CodecError> {
             game_id: game_id.clone(),
             by: *by,
         })?,
+        ServerMsg::TakebackOffered {
+            game_id,
+            seat_idx,
+            at_ply,
+        } => ser(&TakebackOfferedPayload {
+            game_id: game_id.clone(),
+            seat_idx: *seat_idx,
+            at_ply: *at_ply,
+        })?,
+        ServerMsg::TakebackDeclined { game_id, seat_idx }
+        | ServerMsg::DrawDeclined { game_id, seat_idx } => ser(&GameSeatPayload {
+            game_id: game_id.clone(),
+            seat_idx: *seat_idx,
+        })?,
         ServerMsg::Error { code, msg } => ser(&ErrorPayload {
             code: *code,
             msg: msg.clone(),
@@ -324,6 +422,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, CodecError> {
     match type_code {
         server_code::MATCHED => {
             let p: MatchedPayload = de_exact(payload)?;
+            check_state_body(&p.start_state)?;
             Ok(ServerMsg::Matched {
                 game_id: p.game_id,
                 seat_idx: p.seat_idx,
@@ -356,6 +455,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, CodecError> {
         }
         server_code::STATE => {
             let p: StatePayload = de_exact(payload)?;
+            check_state_body(&p.state)?;
             Ok(ServerMsg::State {
                 game_id: p.game_id,
                 state: p.state,
@@ -389,6 +489,28 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, CodecError> {
             Ok(ServerMsg::DrawOffered {
                 game_id: p.game_id,
                 by: p.by,
+            })
+        }
+        server_code::TAKEBACK_OFFERED => {
+            let p: TakebackOfferedPayload = de_exact(payload)?;
+            Ok(ServerMsg::TakebackOffered {
+                game_id: p.game_id,
+                seat_idx: p.seat_idx,
+                at_ply: p.at_ply,
+            })
+        }
+        server_code::TAKEBACK_DECLINED => {
+            let p: GameSeatPayload = de_exact(payload)?;
+            Ok(ServerMsg::TakebackDeclined {
+                game_id: p.game_id,
+                seat_idx: p.seat_idx,
+            })
+        }
+        server_code::DRAW_DECLINED => {
+            let p: GameSeatPayload = de_exact(payload)?;
+            Ok(ServerMsg::DrawDeclined {
+                game_id: p.game_id,
+                seat_idx: p.seat_idx,
             })
         }
         server_code::ERROR => {
@@ -561,6 +683,23 @@ fn encode_event_body(ev: &GameEvent) -> Result<Vec<u8>, CodecError> {
             pool_id: pool_id.clone(),
             per_seat: per_seat.clone(),
         }),
+        GameEvent::TakebackProposed { seat_idx }
+        | GameEvent::TakebackDeclined { seat_idx }
+        | GameEvent::DrawDeclined { seat_idx } => ser(&SeatIdxBody {
+            seat_idx: *seat_idx,
+        }),
+        GameEvent::TakebackRewound {
+            seat_idx,
+            to_ply,
+            server_ts,
+        } => ser(&TakebackRewoundBody {
+            seat_idx: *seat_idx,
+            to_ply: *to_ply,
+            server_ts: *server_ts,
+        }),
+        GameEvent::ClockStarted { server_ts } => ser(&ClockStartedBody {
+            server_ts: *server_ts,
+        }),
     }
 }
 
@@ -679,6 +818,29 @@ fn decode_event_body(type_byte: u8, bytes: &[u8]) -> Result<GameEvent, CodecErro
         GameEvent::RatingApplied {
             pool_id: b.pool_id,
             per_seat: b.per_seat,
+        }
+    } else if type_byte == EventType::TakebackProposed.value() {
+        GameEvent::TakebackProposed {
+            seat_idx: de_exact::<SeatIdxBody>(bytes)?.seat_idx,
+        }
+    } else if type_byte == EventType::TakebackRewound.value() {
+        let b: TakebackRewoundBody = de_exact(bytes)?;
+        GameEvent::TakebackRewound {
+            seat_idx: b.seat_idx,
+            to_ply: b.to_ply,
+            server_ts: b.server_ts,
+        }
+    } else if type_byte == EventType::TakebackDeclined.value() {
+        GameEvent::TakebackDeclined {
+            seat_idx: de_exact::<SeatIdxBody>(bytes)?.seat_idx,
+        }
+    } else if type_byte == EventType::DrawDeclined.value() {
+        GameEvent::DrawDeclined {
+            seat_idx: de_exact::<SeatIdxBody>(bytes)?.seat_idx,
+        }
+    } else if type_byte == EventType::ClockStarted.value() {
+        GameEvent::ClockStarted {
+            server_ts: de_exact::<ClockStartedBody>(bytes)?.server_ts,
         }
     } else {
         // Unreachable in practice: decode_event rejects a non-frozen type byte

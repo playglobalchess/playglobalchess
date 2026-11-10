@@ -93,7 +93,7 @@ func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match
 		s.bindSeatForUser(cc, uid, match.GameID, seat)
 		s.send(ctx, cc, codec.ServerMsg{Type: codec.SMMatched, Matched: &codec.MatchedPayload{
 			GameID: match.GameID, SeatIdx: seat, Opponent: opponentUser(match, seat),
-			StartState: snapshotToStateBody(snap),
+			StartState: snapshotToStateBody(snap, seat),
 		}})
 	}
 	s.armJoinTimeout(match.GameID)
@@ -386,7 +386,8 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 // from the durable stream (same path as the auth-time server push); else
 // ERROR{UNKNOWN_GAME}. The complement to the Option-A auto-push.
 func (s *Server) handleResync(ctx context.Context, c Conn, gameID string) bool {
-	if _, seated := s.seatOf(c, gameID); !seated {
+	seat, seated := s.seatOf(c, gameID)
+	if !seated {
 		s.send(ctx, c, errorMsg(codec.ECUnknownGame, "not seated in this game"))
 		return true
 	}
@@ -401,20 +402,20 @@ func (s *Server) handleResync(ctx context.Context, c Conn, gameID string) bool {
 		return true
 	}
 	s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
-		GameID: gameID, State: snapshotToStateBody(snap),
+		GameID: gameID, State: snapshotToStateBody(snap, seat),
 	}})
 	return true
 }
 
 // broadcastState pushes a STATE frame to both seats' connections (used after a
-// takeback, which has no dedicated §4A frame).
+// takeback, which has no dedicated §4A frame). STATE is per recipient (v1.3
+// you_seat), so each seat gets its own body.
 func (s *Server) broadcastState(ctx context.Context, gameID string, snap session.Snapshot) {
-	msg := codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
-		GameID: gameID, State: snapshotToStateBody(snap),
-	}}
 	for seat := uint8(0); seat < 2; seat++ {
 		if cc, present := s.connFor(gameID, seat); present {
-			s.send(ctx, cc, msg)
+			s.send(ctx, cc, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
+				GameID: gameID, State: snapshotToStateBody(snap, seat),
+			}})
 		}
 	}
 }

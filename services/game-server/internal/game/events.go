@@ -31,6 +31,13 @@ const (
 	EvClockFlagged     EventType = 0x0A
 	EvGameEnded        EventType = 0x0B
 	EvRatingApplied    EventType = 0x0C
+	// v1.3 (ADR-19). The codec reads and writes these; the current fold still
+	// rejects them as unknown until the GS-7 reducer applies them.
+	EvTakebackProposed EventType = 0x0D
+	EvTakebackRewound  EventType = 0x0E
+	EvTakebackDeclined EventType = 0x0F
+	EvDrawDeclined     EventType = 0x10
+	EvClockStarted     EventType = 0x11
 )
 
 func (t EventType) String() string {
@@ -59,6 +66,16 @@ func (t EventType) String() string {
 		return "GameEnded"
 	case EvRatingApplied:
 		return "RatingApplied"
+	case EvTakebackProposed:
+		return "TakebackProposed"
+	case EvTakebackRewound:
+		return "TakebackRewound"
+	case EvTakebackDeclined:
+		return "TakebackDeclined"
+	case EvDrawDeclined:
+		return "DrawDeclined"
+	case EvClockStarted:
+		return "ClockStarted"
 	default:
 		return "Event(unknown)"
 	}
@@ -119,6 +136,22 @@ type Event struct {
 	Aborted       *Aborted
 	GameEnded     *GameEnded
 	RatingApplied *RatingApplied
+	// v1.3 (ADR-19).
+	TakebackRewound *TakebackRewound
+	ClockStarted    *ClockStarted
+}
+
+// TakebackRewound — §4A.8 v1.3 {seat_idx, to_ply, server_ts}: the accepted
+// takeback rewinds the game to to_ply.
+type TakebackRewound struct {
+	SeatIdx  uint8
+	ToPly    uint32
+	ServerTS uint64
+}
+
+// ClockStarted — §4A.8 v1.3 {server_ts}: the first clock started running.
+type ClockStarted struct {
+	ServerTS uint64
 }
 
 // GameCreated — §4A.8. start_fen/time_control carried as given; GS-1 does not
@@ -150,7 +183,8 @@ type MovePlayed struct {
 
 // SeatAction is the shared body for every event whose §4A.8 schema is exactly
 // {seat_idx:u8}: DrawOffered, DrawAccepted, Resigned, TakebackReq,
-// TakebackAccepted, ClockFlagged. The owning Event.Type disambiguates.
+// TakebackAccepted, ClockFlagged and (v1.3) TakebackProposed, TakebackDeclined,
+// DrawDeclined. The owning Event.Type disambiguates.
 type SeatAction struct {
 	SeatIdx uint8
 }

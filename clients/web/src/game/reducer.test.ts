@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { reduce, initialState, type GameState } from "./reducer";
 import { indexToSquare, squareToIndex } from "../board/position";
 import { Termination, Reason, ErrorCode, type ServerMsg } from "../codec/messages";
+import { sb } from "../test/stateBody";
 
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const GID = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
@@ -12,7 +13,7 @@ function matched(seat: number): ServerMsg {
       game_id: GID,
       seat_idx: seat,
       opponent: "grandmaster_jane",
-      start_state: { fen: START_FEN, turn: 0, clocks: [300000, 300000] },
+      start_state: sb(START_FEN, 0, [300000, 300000]),
     },
   };
 }
@@ -95,7 +96,7 @@ describe("game reducer", () => {
     const resyncFen = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2";
     s = reduce(s, {
       kind: "server",
-      msg: { State: { game_id: GID, state: { fen: resyncFen, turn: 0, clocks: [280000, 275000] } } },
+      msg: { State: { game_id: GID, state: sb(resyncFen, 0, [280000, 275000]) } },
     });
     expect(s.pendingMove).toBeNull();
     expect(pieceAt(s, "e4")).toBe("P");
@@ -184,7 +185,7 @@ describe("game reducer", () => {
     let s = playingAsWhite();
     s = reduce(s, { kind: "server", msg: { MoveAccepted: { game_id: GID, ply: 3, uci: "e2e4", clock_after_ms: 1 } } });
     expect(s.needsResync).toBe(true);
-    s = reduce(s, { kind: "server", msg: { State: { game_id: GID, state: { fen: START_FEN, turn: 0, clocks: [300000, 300000] } } } });
+    s = reduce(s, { kind: "server", msg: { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } } });
     expect(s.needsResync).toBe(false);
   });
 
@@ -195,7 +196,7 @@ describe("game reducer", () => {
     // white when the position says black to move.
     const blackToMove = reduce(initialState, {
       kind: "server",
-      msg: { Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1", turn: 1, clocks: [300000, 300000] } } },
+      msg: { Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1", 1, [300000, 300000]) } },
     });
     const s = reduce(blackToMove, { kind: "localMove", uci: "e2e4" });
     expect(s).toBe(blackToMove); // ignored — not white's turn
@@ -218,7 +219,7 @@ describe("game reducer", () => {
     const resyncFen = "r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 4 3";
     s = reduce(s, {
       kind: "server",
-      msg: { State: { game_id: GID, state: { fen: resyncFen, turn: 0, clocks: [1, 1] } } },
+      msg: { State: { game_id: GID, state: sb(resyncFen, 0, [1, 1]) } },
     });
     expect(s.needsResync).toBe(false);
     expect(s.ply).toBe(4); // RESTORED from the FEN (was the bug: stayed 0)
@@ -299,14 +300,25 @@ describe("game reducer", () => {
       msg: {
         State: {
           game_id: GID,
-          state: {
-            fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
-            turn: 1,
-            clocks: [299000, 300000],
-          },
+          state: sb("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1", 1, [299000, 300000]),
         },
       },
     });
     expect(s.lastMove).toBeNull();
+  });
+
+  it("takes ply from the v1.3 STATE and MATCHED bodies, not from the FEN", () => {
+    // A FEN whose move counters disagree with the server ply (e.g. a custom
+    // start position, or after a takeback): the body's ply is authoritative.
+    let s = reduce(initialState, {
+      kind: "server",
+      msg: { Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1], { ply: 4, status: 2, last_move_uci: "g8f6", running_seat: 0 }) } },
+    });
+    expect(s.ply).toBe(4);
+    s = reduce(s, {
+      kind: "server",
+      msg: { State: { game_id: GID, state: sb(START_FEN, 0, [1, 1], { ply: 18, status: 2, last_move_uci: "e7e5", running_seat: 0 }) } },
+    });
+    expect(s.ply).toBe(18);
   });
 });

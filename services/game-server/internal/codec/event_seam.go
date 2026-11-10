@@ -156,6 +156,12 @@ const (
 	vClockFlagged
 	vGameEnded
 	vRatingApplied
+	// v1.3 (ADR-19) — appended after RatingApplied, matching event.rs.
+	vTakebackProposed
+	vTakebackRewound
+	vTakebackDeclined
+	vDrawDeclined
+	vClockStarted
 )
 
 func (w *pcWriter) gameEvent(ev game.Event) error {
@@ -251,6 +257,28 @@ func (w *pcWriter) gameEvent(ev game.Event) error {
 			w.uvarint(uint64(s.RD))
 			w.f32(s.Vol)
 		}
+	case game.EvTakebackProposed:
+		return w.seatIdxBody(ev.SeatAction, vTakebackProposed, "TakebackProposed")
+	case game.EvTakebackDeclined:
+		return w.seatIdxBody(ev.SeatAction, vTakebackDeclined, "TakebackDeclined")
+	case game.EvDrawDeclined:
+		return w.seatIdxBody(ev.SeatAction, vDrawDeclined, "DrawDeclined")
+	case game.EvTakebackRewound:
+		b := ev.TakebackRewound
+		if b == nil {
+			return errNilBody("TakebackRewound")
+		}
+		w.uvarint(vTakebackRewound)
+		w.u8(b.SeatIdx)
+		w.uvarint(uint64(b.ToPly))
+		w.uvarint(b.ServerTS)
+	case game.EvClockStarted:
+		b := ev.ClockStarted
+		if b == nil {
+			return errNilBody("ClockStarted")
+		}
+		w.uvarint(vClockStarted)
+		w.uvarint(b.ServerTS)
 	default:
 		return fmt.Errorf("codec: unknown event type %d", ev.Type)
 	}
@@ -414,6 +442,34 @@ func (r *pcReader) gameEvent() (game.Event, error) {
 			per = append(per, game.SeatRating{SeatIdx: si, Before: before, After: after, RD: uint16(rd), Vol: vol})
 		}
 		return game.Event{Type: game.EvRatingApplied, RatingApplied: &game.RatingApplied{PoolID: poolID, PerSeat: per}}, nil
+	case vTakebackProposed:
+		return r.seatIdxEvent(game.EvTakebackProposed)
+	case vTakebackDeclined:
+		return r.seatIdxEvent(game.EvTakebackDeclined)
+	case vDrawDeclined:
+		return r.seatIdxEvent(game.EvDrawDeclined)
+	case vTakebackRewound:
+		si, err := r.u8()
+		if err != nil {
+			return game.Event{}, err
+		}
+		to, err := r.u32()
+		if err != nil {
+			return game.Event{}, err
+		}
+		ts, err := r.uvarint()
+		if err != nil {
+			return game.Event{}, err
+		}
+		return game.Event{Type: game.EvTakebackRewound, TakebackRewound: &game.TakebackRewound{
+			SeatIdx: si, ToPly: to, ServerTS: ts,
+		}}, nil
+	case vClockStarted:
+		ts, err := r.uvarint()
+		if err != nil {
+			return game.Event{}, err
+		}
+		return game.Event{Type: game.EvClockStarted, ClockStarted: &game.ClockStarted{ServerTS: ts}}, nil
 	default:
 		return game.Event{}, fmt.Errorf("codec: unknown event variant index %d", variant)
 	}

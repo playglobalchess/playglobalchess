@@ -154,24 +154,53 @@ func TestServerSeamFromSharedCorpus(t *testing.T) {
 	}
 
 	// Every §4A server code must be exercised by a fixture (coverage guard).
-	if len(corpusServerMsgs()) < 8 {
-		t.Fatalf("corpusServerMsgs covers %d messages, expected >=8 (one per S code incl v1.1)", len(corpusServerMsgs()))
+	// Every server vector in the shared corpus must have a Go fixture, so a new
+	// corpus message cannot go untested on the Go encode path.
+	if len(corpusServerMsgs()) != servers {
+		t.Fatalf("corpusServerMsgs covers %d messages, corpus has %d server vectors", len(corpusServerMsgs()), servers)
 	}
 }
 
 // corpusServerMsgs mirrors the server vectors in protocol/codec/tests/corpus/mod.rs
 // by NAME. These are the Go-side ServerMsg values the transport will build; the
 // test proves EncodeServer turns each into the exact frozen §4A frame.
+// baseState mirrors corpus/mod.rs base_state: a v1.3 STATE body with nothing
+// pending and no result — MATCHED at ply 0, otherwise LIVE with the side to
+// move's clock running.
+func baseState(fen string, turn uint8, clocks []uint32, ply uint32, last string) StateBody {
+	s := StateBody{
+		FEN: fen, Turn: turn, Clocks: clocks, YouSeat: 0, Ply: ply,
+		Status: StatusMatched, ResultVector: []uint8{}, LastMoveUCI: last,
+		PendingDrawBy: NoSeat, TakebackBy: NoSeat, RunningSeat: NoSeat,
+		ServerT: 1728000000500,
+	}
+	if ply > 0 {
+		s.Status = StatusLive
+		s.RunningSeat = turn
+	}
+	return s
+}
+
 func corpusServerMsgs() map[string]ServerMsg {
 	gid := "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+	e3 := "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+	pending := baseState(e3, 1, []uint32{250000, 260000}, 18, "g1f3")
+	pending.YouSeat, pending.PendingDrawBy, pending.TakebackBy, pending.TakebackAtPly = 1, 0, 1, 18
+	ended := baseState(e3, 1, []uint32{120000, 0}, 42, "d1h5")
+	ended.Status, ended.ResultVector, ended.Termination, ended.RunningSeat = StatusEnded, []uint8{2, 0}, 0x02, NoSeat
 	return map[string]ServerMsg{
 		"server/matched": {Type: SMMatched, Matched: &MatchedPayload{
 			GameID: gid, SeatIdx: 0, Opponent: "grandmaster_jane",
-			StartState: StateBody{
-				FEN:  "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-				Turn: 0, Clocks: []uint32{300000, 300000},
-			},
+			StartState: baseState("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+				0, []uint32{300000, 300000}, 0, ""),
 		}},
+		"server/state_pending": {Type: SMState, State: &StatePayload{GameID: gid, State: pending}},
+		"server/state_ended":   {Type: SMState, State: &StatePayload{GameID: gid, State: ended}},
+		"server/takeback_offered": {Type: SMTakebackOffered, TakebackOffered: &TakebackOfferedPayload{
+			GameID: gid, SeatIdx: 1, AtPly: 18,
+		}},
+		"server/takeback_declined": {Type: SMTakebackDeclined, SeatNotice: &SeatNoticePayload{GameID: gid, SeatIdx: 0}},
+		"server/draw_declined":     {Type: SMDrawDeclined, SeatNotice: &SeatNoticePayload{GameID: gid, SeatIdx: 1}},
 		"server/move_accepted": {Type: SMMoveAccepted, MoveAccepted: &MoveAcceptedPayload{
 			GameID: gid, Ply: 18, UCI: "e2e4", ClockAfterMs: 297500,
 		}},
@@ -180,17 +209,12 @@ func corpusServerMsgs() map[string]ServerMsg {
 		}},
 		"server/state_max_fen": {Type: SMState, State: &StatePayload{
 			GameID: gid,
-			State: StateBody{
-				FEN:  "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq e3 100 199",
-				Turn: 0, Clocks: []uint32{1000, 2000},
-			},
+			State: baseState("rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq e3 100 199",
+				0, []uint32{1000, 2000}, 397, "e7e8q"),
 		}},
 		"server/state": {Type: SMState, State: &StatePayload{
 			GameID: gid,
-			State: StateBody{
-				FEN:  "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-				Turn: 1, Clocks: []uint32{300000, 300000},
-			},
+			State:  baseState(e3, 1, []uint32{300000, 300000}, 1, "e2e4"),
 		}},
 		"server/game_end": {Type: SMGameEnd, GameEnd: &GameEndPayload{
 			GameID: gid, ResultVector: []uint8{2, 0}, // WIN, LOSS
@@ -251,9 +275,8 @@ func TestServerSeamHighU8RoundTrip(t *testing.T) {
 	msg := ServerMsg{Type: SMMatched, Matched: &MatchedPayload{
 		GameID: "f47ac10b-58cc-4372-a567-0e02b2c3d479", SeatIdx: 200,
 		Opponent: "x",
-		StartState: StateBody{
-			FEN: "startpos", Turn: 200, Clocks: []uint32{300000, 300000},
-		},
+		// turn has no closed domain; the seat fields must stay valid seats.
+		StartState: baseState("startpos", 200, []uint32{300000, 300000}, 0, ""),
 	}}
 	// Prove the u8 encoding positionally against the Rust oracle: the Go
 	// intermediate must byte-match pgc_encode_server's own input shape. The

@@ -9,7 +9,7 @@
 use pgc_protocol::{
     decode_client, decode_event, decode_server, encode_client, encode_event, encode_server,
     ClientMsg, ErrorCode, EventEnvelope, GameEvent, GameId, PoolId, Reason, SeatColor, SeatRating,
-    ServerMsg, StateBody, Termination, TimeControlId, UserId,
+    ServerMsg, StateBody, Status, Termination, TimeControlId, UserId, NO_SEAT,
 };
 use proptest::prelude::*;
 
@@ -66,13 +66,57 @@ fn arb_error_code() -> impl Strategy<Value = ErrorCode> {
     ]
 }
 
+/// A VALID v1.3 STATE body: the §4A.6 invariants hold by construction (seat
+/// fields are a seat or 0xFF, result/termination iff ENDED, takeback ply iff a
+/// takeback is pending, last move iff ply > 0, no running clock once ENDED).
 fn arb_state() -> impl Strategy<Value = StateBody> {
     (
         "[rnbqkpRNBQKP1-8/ w b KQkq-]{10,80}",
-        0u8..4,
         prop::collection::vec(any::<u32>(), 1..=4),
+        0u8..3,
+        0u32..500,
+        arb_uci(),
+        any::<[u8; 5]>(),
+        1u32..500,
+        any::<u64>(),
+        0u8..10,
     )
-        .prop_map(|(fen, turn, clocks)| StateBody { fen, turn, clocks })
+        .prop_map(
+            |(fen, clocks, st, ply, uci, picks, tb_ply, server_t, term)| {
+                let n = clocks.len() as u8;
+                // A seat in 0..n, or NO_SEAT when the pick lands on n.
+                let seat = |p: u8| {
+                    if p % (n + 1) == n {
+                        NO_SEAT
+                    } else {
+                        p % (n + 1)
+                    }
+                };
+                let status = [Status::MATCHED, Status::LIVE, Status::ENDED][st as usize];
+                let ended = status == Status::ENDED;
+                let takeback_by = seat(picks[2]);
+                StateBody {
+                    fen,
+                    turn: picks[0] % n,
+                    you_seat: seat(picks[1]),
+                    ply,
+                    status,
+                    result_vector: if ended {
+                        vec![pgc_protocol::RESULT_DRAW; n as usize]
+                    } else {
+                        vec![]
+                    },
+                    termination: if ended { term + 1 } else { 0 },
+                    last_move_uci: if ply == 0 { String::new() } else { uci },
+                    pending_draw_by: seat(picks[3]),
+                    takeback_by,
+                    takeback_at_ply: if takeback_by == NO_SEAT { 0 } else { tb_ply },
+                    running_seat: if ended { NO_SEAT } else { seat(picks[4]) },
+                    server_t,
+                    clocks,
+                }
+            },
+        )
 }
 
 fn arb_client_msg() -> impl Strategy<Value = ClientMsg> {
@@ -96,6 +140,15 @@ fn arb_client_msg() -> impl Strategy<Value = ClientMsg> {
         arb_game_id().prop_map(|g| ClientMsg::Takeback { game_id: g }),
         arb_game_id().prop_map(|g| ClientMsg::Rematch { game_id: g }),
         any::<u64>().prop_map(|t| ClientMsg::Ping { t }),
+        (arb_game_id(), any::<u32>()).prop_map(|(g, p)| ClientMsg::TakebackAccept {
+            game_id: g,
+            at_ply: p
+        }),
+        (arb_game_id(), any::<u32>()).prop_map(|(g, p)| ClientMsg::TakebackDecline {
+            game_id: g,
+            at_ply: p
+        }),
+        arb_game_id().prop_map(|g| ClientMsg::DeclineDraw { game_id: g }),
     ]
 }
 
@@ -142,6 +195,21 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
             }),
         (any::<u64>(), any::<u64>()).prop_map(|(t, s)| ServerMsg::Pong { t, server_t: s }),
         (arb_error_code(), "[ -~]{0,48}").prop_map(|(c, m)| ServerMsg::Error { code: c, msg: m }),
+        (arb_game_id(), any::<u8>(), any::<u32>()).prop_map(|(g, s, p)| {
+            ServerMsg::TakebackOffered {
+                game_id: g,
+                seat_idx: s,
+                at_ply: p,
+            }
+        }),
+        (arb_game_id(), any::<u8>()).prop_map(|(g, s)| ServerMsg::TakebackDeclined {
+            game_id: g,
+            seat_idx: s
+        }),
+        (arb_game_id(), any::<u8>()).prop_map(|(g, s)| ServerMsg::DrawDeclined {
+            game_id: g,
+            seat_idx: s
+        }),
     ]
 }
 
@@ -206,6 +274,17 @@ fn arb_event() -> impl Strategy<Value = GameEvent> {
         any::<u8>().prop_map(|b| GameEvent::Aborted { by: b }),
         any::<u8>().prop_map(|s| GameEvent::TakebackReq { seat_idx: s }),
         any::<u8>().prop_map(|s| GameEvent::TakebackAccepted { seat_idx: s }),
+        any::<u8>().prop_map(|s| GameEvent::TakebackProposed { seat_idx: s }),
+        (any::<u8>(), any::<u32>(), any::<u64>()).prop_map(|(s, p, ts)| {
+            GameEvent::TakebackRewound {
+                seat_idx: s,
+                to_ply: p,
+                server_ts: ts,
+            }
+        }),
+        any::<u8>().prop_map(|s| GameEvent::TakebackDeclined { seat_idx: s }),
+        any::<u8>().prop_map(|s| GameEvent::DrawDeclined { seat_idx: s }),
+        any::<u64>().prop_map(|ts| GameEvent::ClockStarted { server_ts: ts }),
         any::<u8>().prop_map(|s| GameEvent::ClockFlagged { seat_idx: s }),
         (prop::collection::vec(0u8..3, 1..=4), arb_termination()).prop_map(|(rv, t)| {
             GameEvent::GameEnded {

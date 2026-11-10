@@ -10,9 +10,10 @@
 // resync). The one exception is the OPTIMISTIC local move, which is immediately
 // REVERTED if the server rejects it (§3.3).
 
-import { type Position, parseFen, applyUci, plyFromFen } from "../board/position";
+import { type Position, parseFen, applyUci } from "../board/position";
 import {
   type ServerMsg,
+  type StateBody,
   type ReasonCode,
   type TerminationCode,
   type ErrorCodeValue,
@@ -131,7 +132,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
   const tag = serverTag(msg);
   switch (tag) {
     case "Matched": {
-      const m = (msg as { Matched: { game_id: string; seat_idx: number; opponent: string; start_state: { fen: string; turn: number; clocks: number[] } } }).Matched;
+      const m = (msg as { Matched: { game_id: string; seat_idx: number; opponent: string; start_state: StateBody } }).Matched;
       return {
         ...initialState,
         phase: "playing",
@@ -139,7 +140,8 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         mySeat: m.seat_idx,
         opponent: m.opponent,
         position: parseFen(m.start_state.fen),
-        ply: plyFromFen(m.start_state.fen),
+        // v1.3: the server's ply is in the body (no FEN inference).
+        ply: m.start_state.ply,
         clocks: m.start_state.clocks.slice(),
       };
     }
@@ -225,17 +227,16 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
     case "State": {
       // Authoritative resync: rebuild the board from the FEN fold. Drops any
       // optimistic/pending state — the server's STATE is the truth.
-      const s = (msg as { State: { game_id: string; state: { fen: string; turn: number; clocks: number[] } } }).State;
+      const s = (msg as { State: { game_id: string; state: StateBody } }).State;
       return {
         ...state,
         phase: state.phase === "game_over" ? "game_over" : "playing",
         gameId: s.game_id,
         position: parseFen(s.state.fen),
-        // CRITICAL: restore ply from the FEN. StateBody carries no ply, but ply
-        // is exactly what a gap desynchronized — if we leave it stale, the next
-        // MOVE sends ply_expected = stale+1 and the server rejects it StalePly
-        // forever (the resync would "succeed" visually yet wedge the player).
-        ply: plyFromFen(s.state.fen),
+        // CRITICAL: restore ply — it is exactly what a gap desynchronized. If it
+        // stayed stale, the next MOVE would send ply_expected = stale+1 and be
+        // rejected StalePly forever. v1.3 STATE carries the server ply directly.
+        ply: s.state.ply,
         clocks: s.state.clocks.slice(),
         pendingMove: null,
         needsResync: false,

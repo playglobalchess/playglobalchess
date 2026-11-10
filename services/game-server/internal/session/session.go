@@ -52,17 +52,23 @@ type Session struct {
 	closeOnce sync.Once
 
 	// --- owner-goroutine-only live projection ---
-	curFEN     string
-	priorKeys  []uint64 // folded Zobrist history (one key per MovePlayed, in order)
-	clocks     clock.Clock
-	phase      game.Phase
-	ply        uint32
-	turn       uint8
-	seatCount  int
-	rated      bool
-	ended      bool
-	terminal   game.Termination // the ending condition, set when ended=true
-	lastMoveAt time.Time
+	curFEN    string
+	priorKeys []uint64 // folded Zobrist history (one key per MovePlayed, in order)
+	clocks    clock.Clock
+	phase     game.Phase
+	ply       uint32
+	turn      uint8
+	seatCount int
+	rated     bool
+	ended     bool
+	terminal  game.Termination // the ending condition, set when ended=true
+	// resultVector is the GameEnded result, set with terminal by endGame (or at
+	// construction for an already-ended stream). Carried in STATE (v1.3).
+	resultVector []game.Result
+	// lastMoveUCI is the last LIVE move (empty at ply 0); after a takeback it is
+	// the last move of the retained prefix. Carried in STATE (v1.3).
+	lastMoveUCI string
+	lastMoveAt  time.Time
 	// drawOfferBy is the seat with a pending draw offer, or nil (GS-3b, §3.3). It
 	// is EPHEMERAL (owner-goroutine-only, like the other projection fields): it is
 	// cleared when EITHER seat moves (offerer withdraws / opponent declines) and
@@ -142,26 +148,28 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		lastMoveAt = time.UnixMilli(int64(ts))
 	}
 	s := &Session{
-		gameID:     cfg.GameID,
-		stream:     stream,
-		store:      cfg.Store,
-		oracle:     cfg.Oracle,
-		pipe:       &game.Pipeline{Oracle: cfg.Oracle, Store: cfg.Store, Opts: cfg.Opts},
-		opts:       cfg.Opts,
-		now:        now,
-		commands:   make(chan command),
-		quit:       make(chan struct{}),
-		curFEN:     st.CurFEN,
-		priorKeys:  st.PriorKeys,
-		clocks:     st.Clock,
-		phase:      st.Phase,
-		ply:        st.Ply,
-		turn:       st.TurnIdx,
-		seatCount:  len(st.Seats),
-		rated:      st.Rated,
-		ended:      st.Phase == game.PhaseEnded,
-		terminal:   st.Termination, // meaningful when already ended at construction
-		lastMoveAt: lastMoveAt,
+		gameID:       cfg.GameID,
+		stream:       stream,
+		store:        cfg.Store,
+		oracle:       cfg.Oracle,
+		pipe:         &game.Pipeline{Oracle: cfg.Oracle, Store: cfg.Store, Opts: cfg.Opts},
+		opts:         cfg.Opts,
+		now:          now,
+		commands:     make(chan command),
+		quit:         make(chan struct{}),
+		curFEN:       st.CurFEN,
+		priorKeys:    st.PriorKeys,
+		clocks:       st.Clock,
+		phase:        st.Phase,
+		ply:          st.Ply,
+		turn:         st.TurnIdx,
+		seatCount:    len(st.Seats),
+		rated:        st.Rated,
+		ended:        st.Phase == game.PhaseEnded,
+		terminal:     st.Termination, // meaningful when already ended at construction
+		resultVector: st.ResultVector,
+		lastMoveUCI:  st.LastMoveUCI,
+		lastMoveAt:   lastMoveAt,
 	}
 	s.abortBeforePly = cfg.AbortBeforePly
 	if s.abortBeforePly == 0 {

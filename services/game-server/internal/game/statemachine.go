@@ -70,6 +70,9 @@ type State struct {
 	CurFEN  string
 	TurnIdx uint8 // seat_idx to move (derived from Ply over the seat order)
 	Clock   clock.Clock
+	// LastMoveUCI is the UCI of the last folded MovePlayed (empty at ply 0). A
+	// takeback re-folds the retained prefix, so this is the last LIVE move.
+	LastMoveUCI string
 
 	// PriorKeys is the folded Zobrist-key history of the positions reached by
 	// the moves played so far (one key per MovePlayed, in order). Populated only
@@ -268,6 +271,7 @@ func applyMovePlayed(s State, ev Event) (State, error) {
 	cl := s.Clock.CloneWith(int(b.SeatIdx), int64(b.ClockAfterMs))
 	s.Clock = cl
 	s.Ply = b.Ply
+	s.LastMoveUCI = b.UCI
 	// CurFEN is engine-authoritative and is NOT derived here (the pure fold has
 	// no chess logic — NFR-5); FoldWithEngine projects it by replaying moves
 	// through the engine. The pure fold advances only ply/turn/clock.

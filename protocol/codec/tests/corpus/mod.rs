@@ -12,7 +12,7 @@
 
 use pgc_protocol::{
     ClientMsg, ErrorCode, EventEnvelope, GameEvent, GameId, PoolId, Reason, SeatColor, SeatRating,
-    ServerMsg, StateBody, Termination, TimeControlId,
+    ServerMsg, StateBody, Status, Termination, TimeControlId, NO_SEAT,
 };
 
 /// One encodable item in the corpus, tagged by its codec direction/kind.
@@ -46,12 +46,42 @@ pub const MAX_FEN: &str = "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b K
 
 /// Build the full ordered corpus. Order is stable so the JSON diff stays
 /// readable when a vector is added (new entries append).
+/// Fixed server epoch ms used by every STATE vector (deterministic bytes).
+pub const SERVER_T: u64 = 1_728_000_000_500;
+
+/// A v1.3 STATE body with nothing pending and no result: `MATCHED` at ply 0,
+/// otherwise `LIVE` with the side to move's clock running. Vectors override
+/// fields with struct-update syntax.
+pub fn base_state(fen: &str, turn: u8, clocks: Vec<u32>, ply: u32, last: &str) -> StateBody {
+    let live = ply > 0;
+    StateBody {
+        fen: fen.to_string(),
+        turn,
+        clocks,
+        you_seat: 0,
+        ply,
+        status: if live { Status::LIVE } else { Status::MATCHED },
+        result_vector: vec![],
+        termination: 0,
+        last_move_uci: last.to_string(),
+        pending_draw_by: NO_SEAT,
+        takeback_by: NO_SEAT,
+        takeback_at_ply: 0,
+        running_seat: if live { turn } else { NO_SEAT },
+        server_t: SERVER_T,
+    }
+}
+
 pub fn corpus() -> Vec<(&'static str, Item)> {
     let gid = || GameId::from(GAME_UUID);
-    let state = || StateBody {
-        fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1".to_string(),
-        turn: 1,
-        clocks: vec![300_000, 300_000],
+    let state = || {
+        base_state(
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+            1,
+            vec![300_000, 300_000],
+            1,
+            "e2e4",
+        )
     };
 
     vec![
@@ -125,11 +155,13 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
                 game_id: gid(),
                 seat_idx: 0,
                 opponent: "grandmaster_jane".to_string(),
-                start_state: StateBody {
-                    fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-                    turn: 0,
-                    clocks: vec![300_000, 300_000],
-                },
+                start_state: base_state(
+                    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                    0,
+                    vec![300_000, 300_000],
+                    0,
+                    "",
+                ),
             }),
         ),
         (
@@ -154,11 +186,7 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
             "server/state_max_fen",
             Item::Server(ServerMsg::State {
                 game_id: gid(),
-                state: StateBody {
-                    fen: MAX_FEN.to_string(),
-                    turn: 0,
-                    clocks: vec![1_000, 2_000],
-                },
+                state: base_state(MAX_FEN, 0, vec![1_000, 2_000], 397, "e7e8q"),
             }),
         ),
         (
@@ -199,6 +227,87 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
             Item::Server(ServerMsg::Error {
                 code: ErrorCode::RATE_LIMITED,
                 msg: "slow down".to_string(),
+            }),
+        ),
+        // --- v1.3 (ADR-19) ---
+        (
+            "client/takeback_accept",
+            Item::Client(ClientMsg::TakebackAccept {
+                game_id: gid(),
+                at_ply: 18,
+            }),
+        ),
+        (
+            "client/takeback_decline",
+            Item::Client(ClientMsg::TakebackDecline {
+                game_id: gid(),
+                at_ply: 18,
+            }),
+        ),
+        (
+            "client/decline_draw",
+            Item::Client(ClientMsg::DeclineDraw { game_id: gid() }),
+        ),
+        (
+            "server/takeback_offered",
+            Item::Server(ServerMsg::TakebackOffered {
+                game_id: gid(),
+                seat_idx: 1,
+                at_ply: 18,
+            }),
+        ),
+        (
+            "server/takeback_declined",
+            Item::Server(ServerMsg::TakebackDeclined {
+                game_id: gid(),
+                seat_idx: 0,
+            }),
+        ),
+        (
+            "server/draw_declined",
+            Item::Server(ServerMsg::DrawDeclined {
+                game_id: gid(),
+                seat_idx: 1,
+            }),
+        ),
+        (
+            // A LIVE STATE with both a pending draw offer and a takeback request.
+            "server/state_pending",
+            Item::Server(ServerMsg::State {
+                game_id: gid(),
+                state: StateBody {
+                    you_seat: 1,
+                    pending_draw_by: 0,
+                    takeback_by: 1,
+                    takeback_at_ply: 18,
+                    ..base_state(
+                        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+                        1,
+                        vec![250_000, 260_000],
+                        18,
+                        "g1f3",
+                    )
+                },
+            }),
+        ),
+        (
+            // An ENDED STATE: result per seat, termination, no clock running.
+            "server/state_ended",
+            Item::Server(ServerMsg::State {
+                game_id: gid(),
+                state: StateBody {
+                    status: Status::ENDED,
+                    result_vector: vec![pgc_protocol::RESULT_WIN, pgc_protocol::RESULT_LOSS],
+                    termination: Termination::RESIGN.value(),
+                    running_seat: NO_SEAT,
+                    ..base_state(
+                        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+                        1,
+                        vec![120_000, 0],
+                        42,
+                        "d1h5",
+                    )
+                },
             }),
         ),
         // --- events (every §4A.9 event type) ---
@@ -363,6 +472,41 @@ pub fn corpus() -> Vec<(&'static str, Item)> {
                             vol: 0.06,
                         },
                     ],
+                },
+            )),
+        ),
+        // --- v1.3 events (ADR-19) ---
+        (
+            "event/takeback_proposed",
+            Item::Event(ev(13, 0, GameEvent::TakebackProposed { seat_idx: 1 })),
+        ),
+        (
+            "event/takeback_rewound",
+            Item::Event(ev(
+                14,
+                0,
+                GameEvent::TakebackRewound {
+                    seat_idx: 0,
+                    to_ply: 16,
+                    server_ts: 1_728_000_100_000,
+                },
+            )),
+        ),
+        (
+            "event/takeback_declined",
+            Item::Event(ev(15, 0, GameEvent::TakebackDeclined { seat_idx: 0 })),
+        ),
+        (
+            "event/draw_declined",
+            Item::Event(ev(16, 0, GameEvent::DrawDeclined { seat_idx: 1 })),
+        ),
+        (
+            "event/clock_started",
+            Item::Event(ev(
+                17,
+                0,
+                GameEvent::ClockStarted {
+                    server_ts: 1_728_000_000_250,
                 },
             )),
         ),

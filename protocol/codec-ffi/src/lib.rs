@@ -204,12 +204,25 @@ impl ErrorCode {
 
 // --- value record mirrors ---------------------------------------------------
 
-/// `STATE` body / `MATCHED.start_state` (§4A.6): `fen, turn, clocks`.
+/// `STATE` body / `MATCHED.start_state` (§4A.6, v1.3). `status` (§4A.10) and
+/// `termination` (§4A.5, `0` unless ENDED) are raw bytes here; the core codec
+/// enforces their domains and the §4A.6 invariants on encode and decode.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct StateBody {
     pub fen: String,
     pub turn: u8,
     pub clocks: Vec<u32>,
+    pub you_seat: u8,
+    pub ply: u32,
+    pub status: u8,
+    pub result_vector: Vec<u8>,
+    pub termination: u8,
+    pub last_move_uci: String,
+    pub pending_draw_by: u8,
+    pub takeback_by: u8,
+    pub takeback_at_ply: u32,
+    pub running_seat: u8,
+    pub server_t: u64,
 }
 
 impl StateBody {
@@ -218,6 +231,17 @@ impl StateBody {
             fen: self.fen.clone(),
             turn: self.turn,
             clocks: self.clocks.clone(),
+            you_seat: self.you_seat,
+            ply: self.ply,
+            status: pgc_protocol::Status(self.status),
+            result_vector: self.result_vector.clone(),
+            termination: self.termination,
+            last_move_uci: self.last_move_uci.clone(),
+            pending_draw_by: self.pending_draw_by,
+            takeback_by: self.takeback_by,
+            takeback_at_ply: self.takeback_at_ply,
+            running_seat: self.running_seat,
+            server_t: self.server_t,
         }
     }
     fn from_core(s: &CoreState) -> Self {
@@ -225,6 +249,17 @@ impl StateBody {
             fen: s.fen.clone(),
             turn: s.turn,
             clocks: s.clocks.clone(),
+            you_seat: s.you_seat,
+            ply: s.ply,
+            status: s.status.value(),
+            result_vector: s.result_vector.clone(),
+            termination: s.termination,
+            last_move_uci: s.last_move_uci.clone(),
+            pending_draw_by: s.pending_draw_by,
+            takeback_by: s.takeback_by,
+            takeback_at_ply: s.takeback_at_ply,
+            running_seat: s.running_seat,
+            server_t: s.server_t,
         }
     }
 }
@@ -286,6 +321,20 @@ pub enum ClientMsg {
     Resync {
         game_id: String,
     },
+    /// §4A v1.3 (ADR-19).
+    TakebackAccept {
+        game_id: String,
+        at_ply: u32,
+    },
+    /// §4A v1.3.
+    TakebackDecline {
+        game_id: String,
+        at_ply: u32,
+    },
+    /// §4A v1.3.
+    DeclineDraw {
+        game_id: String,
+    },
 }
 
 /// Server → client messages (§4A.2).
@@ -326,6 +375,22 @@ pub enum ServerMsg {
     DrawOffered {
         game_id: String,
         by: u8,
+    },
+    /// §4A v1.3 (ADR-19).
+    TakebackOffered {
+        game_id: String,
+        seat_idx: u8,
+        at_ply: u32,
+    },
+    /// §4A v1.3.
+    TakebackDeclined {
+        game_id: String,
+        seat_idx: u8,
+    },
+    /// §4A v1.3.
+    DrawDeclined {
+        game_id: String,
+        seat_idx: u8,
     },
     Error {
         code: ErrorCode,
@@ -382,6 +447,28 @@ pub enum GameEvent {
     RatingApplied {
         pool_id: String,
         per_seat: Vec<SeatRating>,
+    },
+    /// §4A.9 v1.3 (ADR-19).
+    TakebackProposed {
+        seat_idx: u8,
+    },
+    /// §4A.9 v1.3.
+    TakebackRewound {
+        seat_idx: u8,
+        to_ply: u32,
+        server_ts: u64,
+    },
+    /// §4A.9 v1.3.
+    TakebackDeclined {
+        seat_idx: u8,
+    },
+    /// §4A.9 v1.3.
+    DrawDeclined {
+        seat_idx: u8,
+    },
+    /// §4A.9 v1.3.
+    ClockStarted {
+        server_ts: u64,
     },
 }
 
@@ -441,6 +528,17 @@ impl ClientMsg {
             ClientMsg::Resync { game_id } => CoreClient::Resync {
                 game_id: GameId::from(game_id.as_str()),
             },
+            ClientMsg::TakebackAccept { game_id, at_ply } => CoreClient::TakebackAccept {
+                game_id: GameId::from(game_id.as_str()),
+                at_ply: *at_ply,
+            },
+            ClientMsg::TakebackDecline { game_id, at_ply } => CoreClient::TakebackDecline {
+                game_id: GameId::from(game_id.as_str()),
+                at_ply: *at_ply,
+            },
+            ClientMsg::DeclineDraw { game_id } => CoreClient::DeclineDraw {
+                game_id: GameId::from(game_id.as_str()),
+            },
         }
     }
 
@@ -484,6 +582,17 @@ impl ClientMsg {
             },
             CoreClient::Ping { t } => ClientMsg::Ping { t: *t },
             CoreClient::Resync { game_id } => ClientMsg::Resync {
+                game_id: game_id.as_str().to_string(),
+            },
+            CoreClient::TakebackAccept { game_id, at_ply } => ClientMsg::TakebackAccept {
+                game_id: game_id.as_str().to_string(),
+                at_ply: *at_ply,
+            },
+            CoreClient::TakebackDecline { game_id, at_ply } => ClientMsg::TakebackDecline {
+                game_id: game_id.as_str().to_string(),
+                at_ply: *at_ply,
+            },
+            CoreClient::DeclineDraw { game_id } => ClientMsg::DeclineDraw {
                 game_id: game_id.as_str().to_string(),
             },
         }
@@ -552,6 +661,23 @@ impl ServerMsg {
                 game_id: pgc_protocol::GameId::from(game_id.as_str()),
                 by: *by,
             },
+            ServerMsg::TakebackOffered {
+                game_id,
+                seat_idx,
+                at_ply,
+            } => CoreServer::TakebackOffered {
+                game_id: GameId::from(game_id.as_str()),
+                seat_idx: *seat_idx,
+                at_ply: *at_ply,
+            },
+            ServerMsg::TakebackDeclined { game_id, seat_idx } => CoreServer::TakebackDeclined {
+                game_id: GameId::from(game_id.as_str()),
+                seat_idx: *seat_idx,
+            },
+            ServerMsg::DrawDeclined { game_id, seat_idx } => CoreServer::DrawDeclined {
+                game_id: GameId::from(game_id.as_str()),
+                seat_idx: *seat_idx,
+            },
         })
     }
 
@@ -614,6 +740,23 @@ impl ServerMsg {
             CoreServer::DrawOffered { game_id, by } => ServerMsg::DrawOffered {
                 game_id: game_id.as_str().to_string(),
                 by: *by,
+            },
+            CoreServer::TakebackOffered {
+                game_id,
+                seat_idx,
+                at_ply,
+            } => ServerMsg::TakebackOffered {
+                game_id: game_id.as_str().to_string(),
+                seat_idx: *seat_idx,
+                at_ply: *at_ply,
+            },
+            CoreServer::TakebackDeclined { game_id, seat_idx } => ServerMsg::TakebackDeclined {
+                game_id: game_id.as_str().to_string(),
+                seat_idx: *seat_idx,
+            },
+            CoreServer::DrawDeclined { game_id, seat_idx } => ServerMsg::DrawDeclined {
+                game_id: game_id.as_str().to_string(),
+                seat_idx: *seat_idx,
             },
         })
     }
@@ -700,6 +843,27 @@ impl GameEvent {
                     })
                     .collect(),
             },
+            GameEvent::TakebackProposed { seat_idx } => CoreEvent::TakebackProposed {
+                seat_idx: *seat_idx,
+            },
+            GameEvent::TakebackRewound {
+                seat_idx,
+                to_ply,
+                server_ts,
+            } => CoreEvent::TakebackRewound {
+                seat_idx: *seat_idx,
+                to_ply: *to_ply,
+                server_ts: *server_ts,
+            },
+            GameEvent::TakebackDeclined { seat_idx } => CoreEvent::TakebackDeclined {
+                seat_idx: *seat_idx,
+            },
+            GameEvent::DrawDeclined { seat_idx } => CoreEvent::DrawDeclined {
+                seat_idx: *seat_idx,
+            },
+            GameEvent::ClockStarted { server_ts } => CoreEvent::ClockStarted {
+                server_ts: *server_ts,
+            },
         })
     }
 
@@ -779,6 +943,27 @@ impl GameEvent {
                         vol: r.vol,
                     })
                     .collect(),
+            },
+            CoreEvent::TakebackProposed { seat_idx } => GameEvent::TakebackProposed {
+                seat_idx: *seat_idx,
+            },
+            CoreEvent::TakebackRewound {
+                seat_idx,
+                to_ply,
+                server_ts,
+            } => GameEvent::TakebackRewound {
+                seat_idx: *seat_idx,
+                to_ply: *to_ply,
+                server_ts: *server_ts,
+            },
+            CoreEvent::TakebackDeclined { seat_idx } => GameEvent::TakebackDeclined {
+                seat_idx: *seat_idx,
+            },
+            CoreEvent::DrawDeclined { seat_idx } => GameEvent::DrawDeclined {
+                seat_idx: *seat_idx,
+            },
+            CoreEvent::ClockStarted { server_ts } => GameEvent::ClockStarted {
+                server_ts: *server_ts,
             },
         })
     }

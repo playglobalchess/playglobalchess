@@ -7,6 +7,7 @@ import {
   codecProtocolVersion,
 } from "./seam";
 import { Termination, type ClientMsg, type ServerMsg } from "./messages";
+import { sb } from "../test/stateBody";
 
 // Step-2 proof: the typed TS layer round-trips through the REAL wasm seam (the
 // one shared §4A codec), covering every representation that could drift between
@@ -52,7 +53,7 @@ describe("typed codec seam", () => {
 
   it("round-trips every ServerMsg through the real codec", () => {
     const gid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
-    const state = { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", turn: 0, clocks: [300000, 300000] };
+    const state = sb("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 0, [300000, 300000]);
     const msgs: ServerMsg[] = [
       { Matched: { game_id: gid, seat_idx: 0, opponent: "grandmaster_jane", start_state: state } },
       { MoveAccepted: { game_id: gid, ply: 18, uci: "e2e4", clock_after_ms: 299100 } },
