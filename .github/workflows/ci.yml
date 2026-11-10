@@ -50,8 +50,8 @@ jobs:
         #             through the services filter, engine).
         #   rest:     the files platform/ci/check_rest_contract.py reads.
         #   every filter includes ci.yml, so editing a job's steps runs that job.
-        # platform/ci/check_ci_filters.py DERIVES each job's inputs from those
-        # build files and fails the `platform` job if a filter misses one.
+        # The ci-filter-audit job (unfiltered, below) DERIVES each gated job's
+        # inputs from its steps and build files and fails if a filter misses one.
         with:
           filters: |
             engine: ['engine/**', '.github/workflows/ci.yml']
@@ -59,8 +59,22 @@ jobs:
             rest: ['protocol/rest/**', 'docs/specs/PE-platform-eng/API-CONTRACT.md', 'docs/specs/S2-realtime/PROTOCOL.md', 'platform/ci/check_rest_contract.py', '.github/workflows/ci.yml']
             services: ['services/**', 'protocol/**', 'engine/**', '.github/workflows/ci.yml']
             web: ['clients/web/**', 'protocol/**', '.github/workflows/ci.yml']
-            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradlew', 'gradle/**', '.github/workflows/ci.yml']
+            mobile: ['clients/ios/**', 'clients/android/**', 'build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'gradlew', 'gradle/**', '.github/workflows/ci.yml']
             platform: ['platform/**', '.github/workflows/**']
+
+  # Path-filter audit (#86, #87). Deliberately has NO `if:` and no `needs:`: its
+  # inputs are Makefiles, Go sources, Cargo.toml files, package.json and this
+  # workflow, spread across the repo, so a filtered audit would itself be a
+  # hollow gate. The script also fails if this job ever gains an `if:`.
+  ci-filter-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Every gated job's filter covers what the job reads
+        run: python3 platform/ci/check_ci_filters.py
 
   engine:
     needs: changes
@@ -443,8 +457,4 @@ jobs:
         run: python3 -c "import py_compile,glob,sys; [py_compile.compile(f,doraise=True) for f in glob.glob('platform/ci/*.py')]; print('platform/ci python compiles clean')"
       - name: Unit-test CI tooling
         run: python3 -m unittest discover -s platform/ci -p 'test_*.py' -v
-      - name: CI path-filter dependency audit (#86, #87)
-        # Fails if any gated job's filter misses a file the job reads, derived
-        # from the Makefiles, package.json, Cargo path deps, Go sources and
-        # check_rest_contract.py. Runs on every workflow change (platform filter).
-        run: python3 platform/ci/check_ci_filters.py
+
