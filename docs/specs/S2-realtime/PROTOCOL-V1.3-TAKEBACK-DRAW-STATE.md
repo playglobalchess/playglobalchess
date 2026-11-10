@@ -22,7 +22,7 @@
 > **Implemented on the server; fully folded into `PROTOCOL.md`.** Approved
 > 2026-11-09. The codec, bindings, Go seams and web mirror implement §2–§6
 > (#161), and the GS-7 server reducer implements §7. `PROTOCOL.md` carries all of
-> it. Open: the web client's handling of the new messages (client contract tests).
+> it. The web client handles every v1.3 message (GS-7 web reducer). iOS and Android clients are P2.
 
 ## 1. Summary of changes
 
@@ -159,7 +159,7 @@ the new codes are in `PROTOCOL.md` §4A.2.
 - [x] Swift and Kotlin host parity read the v1.3 STATE fields through the generated bindings and round-trip the frame. The Android instrumented and iOS XCTest suites carry the same check but only run on a device or Simulator (P2).
 - [x] §2–§6 folded into `PROTOCOL.md` (wire 1.3); docs-check green.
 - [x] §7 rows (takeback, decline, duplicate MOVE, the two client rules) folded into `PROTOCOL.md` §5, with the GS-7 server reducer.
-- [ ] Web client handles the new messages, with client contract tests for the §7 client rules.
+- [x] Web client handles the new messages, with client contract tests for the §7 client rules (unknown and wrong-direction server frames dropped with the connection kept; no MOVE resend), and a real-server takeback e2e.
 
 ## 11. Open questions
 

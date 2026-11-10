@@ -50,6 +50,13 @@ export interface GameCommands {
   offerDraw: () => void;
   /** Accept a pending draw offer (sends OFFER_DRAW back — mutual agreement). */
   acceptDraw: () => void;
+  /** Decline the opponent's draw offer (§4A v1.3 DECLINE_DRAW). */
+  declineDraw: () => void;
+  /** Request a takeback (unrated only; the opponent must accept). */
+  requestTakeback: () => void;
+  /** Accept / decline the opponent's pending takeback request. */
+  acceptTakeback: () => void;
+  declineTakeback: () => void;
 }
 
 export interface UseGameResult {
@@ -149,7 +156,7 @@ export function useGame(opts: UseGameOptions): UseGameResult {
   // --- command surface the UI calls ----------------------------------------
   const seek = useCallback((poolId: string, timeControl: string, rated: boolean) => {
     sockRef.current?.seek(poolId, timeControl, rated);
-    dispatch({ kind: "seek" });
+    dispatch({ kind: "seek", rated });
   }, []);
 
   const move = useCallback((uci: string) => {
@@ -183,7 +190,38 @@ export function useGame(opts: UseGameOptions): UseGameResult {
 
   const offerDraw = useCallback(() => {
     const s = stateRef.current;
-    if (s.gameId != null) sockRef.current?.offerDraw(s.gameId);
+    if (s.gameId == null || s.phase !== "playing" || s.myDrawOffered) return;
+    dispatch({ kind: "localOfferDraw" });
+    sockRef.current?.offerDraw(s.gameId);
+  }, []);
+
+  const declineDraw = useCallback(() => {
+    const s = stateRef.current;
+    if (s.gameId == null || s.drawOffer == null) return;
+    dispatch({ kind: "localDeclineDraw" });
+    sockRef.current?.declineDraw(s.gameId);
+  }, []);
+
+  const requestTakeback = useCallback(() => {
+    const s = stateRef.current;
+    if (!canRequestTakeback(s)) return;
+    dispatch({ kind: "localRequestTakeback" });
+    sockRef.current?.requestTakeback(s.gameId as string);
+  }, []);
+
+  const acceptTakeback = useCallback(() => {
+    const s = stateRef.current;
+    if (s.gameId == null || s.incomingTakeback == null) return;
+    // The server answers with STATE to both seats (the rewound position).
+    sockRef.current?.acceptTakeback(s.gameId, s.incomingTakeback.atPly);
+  }, []);
+
+  const declineTakeback = useCallback(() => {
+    const s = stateRef.current;
+    if (s.gameId == null || s.incomingTakeback == null) return;
+    const at = s.incomingTakeback.atPly;
+    dispatch({ kind: "localDeclineTakeback" });
+    sockRef.current?.declineTakeback(s.gameId, at);
   }, []);
 
   const acceptDraw = useCallback(() => {
@@ -197,7 +235,7 @@ export function useGame(opts: UseGameOptions): UseGameResult {
   return {
     state,
     status,
-    commands: { seek, move, resign, offerDraw, acceptDraw },
+    commands: { seek, move, resign, offerDraw, acceptDraw, declineDraw, requestTakeback, acceptTakeback, declineTakeback },
   };
 }
 
@@ -207,4 +245,17 @@ export function useGame(opts: UseGameOptions): UseGameResult {
 function useStatus(): [ConnStatus, (s: ConnStatus) => void] {
   const [status, setStatus] = useState<ConnStatus>("connecting");
   return [status, setStatus];
+}
+
+/** A takeback can be requested in a live UNRATED game once both seats have
+ * moved (ply >= 2), with no request pending either way (GS-7 §5.2 step 1). */
+export function canRequestTakeback(s: GameState): boolean {
+  return (
+    s.phase === "playing" &&
+    s.gameId != null &&
+    s.rated === false &&
+    s.ply >= 2 &&
+    s.myTakebackSent == null &&
+    s.incomingTakeback == null
+  );
 }

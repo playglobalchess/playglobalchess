@@ -119,6 +119,21 @@ describe("GameSocket (fake socket, real codec)", () => {
     expect("Matched" in received.at(-1)!).toBe(true);
   });
 
+  it("drops a server frame with an UNKNOWN type code and keeps the connection (§7.6 client rule)", () => {
+    sock.connect();
+    const f = fakes[0]!;
+    f.open();
+    const before = received.length;
+    // ver 0x01, type 0x8B: a server type no v1.3 decoder knows (a future frame).
+    f.onmessage?.({ data: new Uint8Array([0x01, 0x8b, 0x00]).buffer });
+    // A wrong-direction frame (a CLIENT type at the client) is dropped the same way.
+    f.onmessage?.({ data: new Uint8Array([0x01, 0x03, 0x00]).buffer });
+    expect(received.length).toBe(before);
+    expect(f.closed).toBe(false);
+    f.feed({ Matched: { game_id: GID, seat_idx: 0, opponent: "x", start_state: sb(START_FEN, 0, [1, 1]) } });
+    expect("Matched" in received.at(-1)!).toBe(true);
+  });
+
   it("reconnects after an unexpected close and re-sends AUTHENTICATE + pending SEEK", () => {
     sock = new GameSocket({
       url: "ws://test",

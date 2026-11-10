@@ -214,4 +214,44 @@ describe("useGame", () => {
     root = null;
     expect(f.closed).toBe(true);
   });
+
+  it("GS-7: takeback and draw-decline commands send the v1.3 frames", () => {
+    const h = mountHook();
+    act(() => h.fake().open());
+    act(() => h.get().commands.seek("p", "blitz-5+3", false)); // unrated
+    act(() => h.fake().push(matched));
+    for (const [ply, uci] of [[1, "e2e4"], [2, "e7e5"]] as const) {
+      act(() => h.fake().push({ MoveAccepted: { game_id: "g1", ply, uci, clock_after_ms: 299000 } }));
+    }
+    act(() => h.get().commands.requestTakeback());
+    expect(countMsgs(h.fake(), "Takeback")).toBe(1);
+    expect(h.get().state.myTakebackSent).toEqual({ atPly: 2 });
+    act(() => h.get().commands.requestTakeback()); // already pending: no second frame
+    expect(countMsgs(h.fake(), "Takeback")).toBe(1);
+
+    act(() => h.fake().push({ TakebackDeclined: { game_id: "g1", seat_idx: 1 } }));
+    act(() => h.fake().push({ TakebackOffered: { game_id: "g1", seat_idx: 1, at_ply: 2 } }));
+    act(() => h.get().commands.acceptTakeback());
+    const acc = h.fake().sentMsgs().find((m) => "TakebackAccept" in m) as
+      | { TakebackAccept: { game_id: string; at_ply: number } }
+      | undefined;
+    expect(acc?.TakebackAccept).toEqual({ game_id: "g1", at_ply: 2 });
+
+    act(() => h.fake().push({ DrawOffered: { game_id: "g1", by: 1 } }));
+    act(() => h.get().commands.declineDraw());
+    expect(countMsgs(h.fake(), "DeclineDraw")).toBe(1);
+    expect(h.get().state.drawOffer).toBeNull();
+  });
+
+  it("GS-7: no takeback in a rated game", () => {
+    const h = mountHook();
+    act(() => h.fake().open());
+    act(() => h.get().commands.seek("p", "blitz-5+3", true));
+    act(() => h.fake().push(matched));
+    for (const [ply, uci] of [[1, "e2e4"], [2, "e7e5"]] as const) {
+      act(() => h.fake().push({ MoveAccepted: { game_id: "g1", ply, uci, clock_after_ms: 299000 } }));
+    }
+    act(() => h.get().commands.requestTakeback());
+    expect(countMsgs(h.fake(), "Takeback")).toBe(0);
+  });
 });

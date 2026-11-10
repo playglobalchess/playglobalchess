@@ -18,6 +18,8 @@ import {
   type TerminationCode,
   type ErrorCodeValue,
   Reason,
+  Status,
+  NO_SEAT,
   serverTag,
 } from "../codec/messages";
 
@@ -46,6 +48,15 @@ export interface GameState {
   pendingMove: { uci: string; prevPosition: Position; prevPly: number } | null;
   /** A pending draw offer FROM the opponent (DRAW_OFFERED), awaiting our accept/decline. */
   drawOffer: DrawOffer | null;
+  /** Our own draw offer is pending (GS-7 §6.4). */
+  myDrawOffered: boolean;
+  /** A pending takeback request FROM the opponent, awaiting our accept/decline. */
+  incomingTakeback: { by: number; atPly: number } | null;
+  /** Our own takeback request is pending. */
+  myTakebackSent: { atPly: number } | null;
+  /** Whether this game is rated, as we asked in our own SEEK; null when unknown
+   * (e.g. after a reload, where only STATE arrives). Takeback is unrated-only. */
+  rated: boolean | null;
   /** Set in game_over. */
   result: { termination: TerminationCode; resultVector: number[] } | null;
   /** Last MOVE_REJECTED reason, for the UI to surface; cleared on the next accepted move. */
@@ -71,6 +82,10 @@ export const initialState: GameState = {
   clocks: [],
   pendingMove: null,
   drawOffer: null,
+  myDrawOffered: false,
+  incomingTakeback: null,
+  myTakebackSent: null,
+  rated: null,
   result: null,
   lastReject: null,
   needsResync: false,
@@ -79,7 +94,14 @@ export const initialState: GameState = {
 };
 
 export type Action =
-  | { kind: "seek" } // user clicked Play
+  | { kind: "seek"; rated?: boolean } // user clicked Play
+  // Local echoes of our own prompt actions: the server tells only the OTHER seat,
+  // so the sender records its own pending/declined state here. A STATE push
+  // (the server's answer to an ignored action) overwrites them.
+  | { kind: "localOfferDraw" }
+  | { kind: "localDeclineDraw" }
+  | { kind: "localRequestTakeback" }
+  | { kind: "localDeclineTakeback" }
   | { kind: "localMove"; uci: string } // user made a board move (optimistic)
   | { kind: "server"; msg: ServerMsg }; // a decoded ServerMsg arrived
 
@@ -87,7 +109,19 @@ export type Action =
 export function reduce(state: GameState, action: Action): GameState {
   switch (action.kind) {
     case "seek":
-      return { ...initialState, phase: "seeking" };
+      return { ...initialState, phase: "seeking", rated: action.rated ?? null };
+
+    case "localOfferDraw":
+      // An offer while the opponent's is pending IS the accept (GAME_END follows).
+      if (state.phase !== "playing" || state.drawOffer != null) return state;
+      return { ...state, myDrawOffered: true };
+    case "localDeclineDraw":
+      return { ...state, drawOffer: null, myDrawOffered: false };
+    case "localRequestTakeback":
+      if (state.phase !== "playing" || state.incomingTakeback != null) return state;
+      return { ...state, myTakebackSent: { atPly: state.ply } };
+    case "localDeclineTakeback":
+      return { ...state, incomingTakeback: null };
 
     case "localMove": {
       // Optimistic: show the move now, remember how to revert. Only legal while
@@ -135,6 +169,7 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       const m = (msg as { Matched: { game_id: string; seat_idx: number; opponent: string; start_state: StateBody } }).Matched;
       return {
         ...initialState,
+        rated: state.rated, // from our own SEEK; MATCHED does not carry it
         phase: "playing",
         gameId: m.game_id,
         mySeat: m.seat_idx,
@@ -192,6 +227,10 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       if (moverSeat < clocks.length) {
         clocks[moverSeat] = a.clock_after_ms;
       }
+      // GS-7 §6.4: a NEW move by the opponent declines our pending prompts; a
+      // new move by us declines theirs. (A duplicate MOVE_ACCEPTED, a re-ack,
+      // returned above without clearing anything.)
+      const mine = moverSeat === state.mySeat;
       return {
         ...state,
         position,
@@ -200,6 +239,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         pendingMove: null,
         lastReject: null,
         lastMove: { uci: a.uci, moverSeat },
+        ...(mine
+          ? { drawOffer: null, incomingTakeback: null }
+          : { myDrawOffered: false, myTakebackSent: null }),
       };
     }
 
@@ -228,10 +270,26 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       // Authoritative resync: rebuild the board from the FEN fold. Drops any
       // optimistic/pending state — the server's STATE is the truth.
       const s = (msg as { State: { game_id: string; state: StateBody } }).State;
+      const b = s.state;
+      // v1.3: STATE alone is enough to resume (#101) — seat, ply, status,
+      // result and every pending prompt come from the body, not from memory.
+      const mySeat = b.you_seat === NO_SEAT ? null : b.you_seat;
+      const ended = b.status === Status.Ended;
+      const seatOrNull = (v: number) => (v === NO_SEAT ? null : v);
+      const drawBy = seatOrNull(b.pending_draw_by);
+      const tbBy = seatOrNull(b.takeback_by);
       return {
         ...state,
-        phase: state.phase === "game_over" ? "game_over" : "playing",
+        phase: ended ? "game_over" : "playing",
         gameId: s.game_id,
+        mySeat,
+        result: ended ? { termination: b.termination as TerminationCode, resultVector: b.result_vector.slice() } : null,
+        drawOffer: drawBy != null && drawBy !== mySeat ? { by: drawBy } : null,
+        myDrawOffered: drawBy != null && drawBy === mySeat,
+        incomingTakeback: tbBy != null && tbBy !== mySeat ? { by: tbBy, atPly: b.takeback_at_ply } : null,
+        myTakebackSent: tbBy != null && tbBy === mySeat ? { atPly: b.takeback_at_ply } : null,
+        // A STATE with a LOWER ply than ours (after a takeback rewind) is valid:
+        // the fold below replaces the board, ply and clocks wholesale.
         position: parseFen(s.state.fen),
         // CRITICAL: restore ply — it is exactly what a gap desynchronized. If it
         // stayed stale, the next MOVE would send ply_expected = stale+1 and be
@@ -253,6 +311,19 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
       return { ...state, drawOffer: { by: d.by } };
     }
 
+    case "DrawDeclined":
+      // The other seat declined our offer, or withdrew theirs (§6.3).
+      return { ...state, drawOffer: null, myDrawOffered: false };
+
+    case "TakebackOffered": {
+      const o = (msg as { TakebackOffered: { game_id: string; seat_idx: number; at_ply: number } }).TakebackOffered;
+      return { ...state, incomingTakeback: { by: o.seat_idx, atPly: o.at_ply } };
+    }
+
+    case "TakebackDeclined":
+      // The other seat declined our request, or cancelled theirs (§5.2).
+      return { ...state, incomingTakeback: null, myTakebackSent: null };
+
     case "GameEnd": {
       const g = (msg as { GameEnd: { game_id: string; result_vector: number[]; termination: TerminationCode; rating_delta: number[] } }).GameEnd;
       return {
@@ -260,6 +331,9 @@ function reduceServer(state: GameState, msg: ServerMsg): GameState {
         phase: "game_over",
         pendingMove: null,
         drawOffer: null,
+        myDrawOffered: false,
+        incomingTakeback: null,
+        myTakebackSent: null,
         needsResync: false,
         lastReject: null,
         result: { termination: g.termination, resultVector: g.result_vector.slice() },

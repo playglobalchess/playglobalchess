@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-11-10 (main at PR #161) |
+| Last updated | 2026-11-10 (main at PR #163, plus the GS-7 web PR) |
 | Phase | **P0 foundations, with a first playable game.** G-A (engine) GREEN. The three G-D contract specs are RATIFIED (SPEC-S2-PROTOCOL, SPEC-PE-API-CONTRACT, SPEC-S3-DATA-MODEL). The wire codec is at **v1.3** and runs in Rust, iOS/Android bindings, wasm, Go and the web TS mirror. The game server (X-2) and the first web client (F-01) are merged and play a full game end to end in CI (`web-e2e`). X-3 accounts is specced (RATIFIED) and scaffolded. |
-| Next step | **GS-7: the game-server decide/evolve reducer** (SPEC-S2-GAME-SERVER-GS7, RATIFIED; ADR-19 DECIDED). It makes the server do what the v1.3 wire already carries: takeback with consent, clock rewind, draw decline, `ClockStarted`, duplicate-MOVE with recurring plies. It fixes #84 and #85 and must pass the harness with `GS7_STRICT=1` (`internal/session/invariant_harness_test.go`). Then the web reducer for the new messages, then game-server bugs #90, #91, #93, then X-3 accounts (start with the handle spec, #134). |
+| Next step | **Game-server bugs #90, #91, #93** (Redis re-claim after Remove, WS writes with no deadline, SEEK trusting client pool and time control). Then X-3 accounts, starting with the handle spec (#134), which needs an owner decision. Also open from GS-7: #102 (the session is dropped at GAME_END, so a late resend or reload after the end gets no result), which #89 and #122 wait on. |
 
 ## What is done
 
@@ -14,8 +14,8 @@
 |---|---|
 | Engine (S1, Rust) | GREEN (G-A). Perft corpus and bench run nightly. `Move::from_uci` non-ASCII panic is fixed. |
 | Wire codec (ADR-14) | **v1.3 merged** (#161): messages `0x0B-0x0D`, `0x88-0x8A`, events `0x0D-0x11`, `status` enum, the full STATE body with six decode invariants enforced on encode and decode. Golden vectors reproduced byte-for-byte by Rust, Go, wasm; Swift and Kotlin host parity read the v1.3 fields through the bindings. `PROTOCOL.md` carries wire 1.3; the takeback/decline/duplicate-MOVE **behaviour** rows are still in `PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md` §7 until GS-7 lands. |
-| Game server (X-2, Go) | Lifecycle, clock, engine seam, live session, resign/abort/draw, DynamoDB event store, Redis matchmaking and WS transport are merged. STATE and MATCHED are built per recipient with the v1.3 body (no running clock reported at ply 0). A message the codec refuses is logged and dropped. **Not yet:** takeback with consent, `ClockStarted`, draw decline events. The fold still rejects the new event types. |
-| Web client (S4, F-01) | First-playable client merged (#62, #66): board, GameSocket, optimistic-with-revert moves, STATE/RESYNC reconnection, a11y, i18n. The reducer now takes `ply` from STATE. It ignores the three new server messages until the GS-7 web reducer. |
+| Game server (X-2, Go) | Lifecycle, clock, engine seam, live session, resign/abort/draw, DynamoDB event store, Redis matchmaking and WS transport, plus **GS-7** (#163): one Evolve/Decide reducer, so a live game always equals a rebuild; takeback with consent and clock rewind; draw decline and a 20-ply cooldown; a durable first-clock start (`ClockStarted`); MOVE idempotency with recurring plies; STATE clocks charged to `server_t`. The invariant harness passes with nothing excused. |
+| Web client (S4, F-01) | First-playable client (#62, #66) plus the GS-7 web reducer: STATE alone resumes a game (seat, ply, status, result, prompts; #101), draw decline, and a takeback button in unrated games (request, opponent accept/decline), modelled on chess.com. A real-server e2e covers a takeback. Clocks do not tick between server updates yet (#112). |
 | Accounts (X-3) | Spec RATIFIED (#72, #73); contract and data-model amendments applied (#74); pure-Go skeleton scaffolded (#75). Handle syntax is undefined (#134), so handles are not final. Other `services/*` folders exist (rating, anti-cheat, puzzles, content); their state was not re-verified for this update. |
 | Mobile | Codec parity only (Swift and Kotlin host runs in CI; device runs are manual). No client app yet. The `mobile` CI job builds the Android parity Gradle modules and compiles no parity tests or bindings (#133). |
 
@@ -27,9 +27,9 @@
 - **Known CI gaps (open issues):** `engine-cgo` has no gate (#114); toolchains, images and actions are not pinned (#115); nightly failures are silent (#116); branch protection is not enforced (#117); stub jobs pass by finding nothing (#146).
 - **Flaky:** `TestRedis_ConcurrentMutualPairCreatesOneGame` failed in a nightly (existing issue #76).
 
-## Open work (78 open issues on 2026-11-10)
+## Open work (71 open issues on 2026-11-10, after #163)
 
-- **Blockers (2) and the GS-7 cluster:** #84 (takeback re-ack and empty FEN), #85 (mutual draw writes an unfoldable stream), #101 (STATE could not resume a reload; wire done, server fill pending), #107 (takeback consent), #123 (stale clocks), #124 (clock-start rule), #157 (flagged clock after rebuild), #159 (draw offer lost on rebuild). All are covered by GS-7.
+- **GS-7 cluster: closed** by #163 and the GS-7 web PR (#84, #85, #67, #94, #101, #107, #123, #157, #159). Still open from it: #89 and #122 (wait on #102), #124 (the clock-start rule itself).
 - **Game server, separate:** #90 (Redis re-claim after Remove), #91 (WS writes have no deadline), #93 (SEEK trusts client pool and time control).
 - **Protocol:** #131 (`MATCHED.opponent` carries the user id, not the handle), #150 (codec tests miss RESYNC/DRAW_OFFERED; `schema_ver` rule untested).
 - Counts by label: game-server 22, protocol 15, web 13, ci 7, specs 4, accounts 3, engine 5, mobile 1. 29 are `spec-first`.

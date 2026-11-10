@@ -743,11 +743,11 @@ session is dropped). Not touched: #124.
       S4, PE, S6 and the architecture group (2026-11-09, owner attestation).
 - [x] Those documents merged to `main` before any implementation PR (#155, #156).
 - [x] Invariant harness merged and failing on `main` before the fix (#158).
-- [ ] Refactor merged; repro tests pass; `-race` clean. (Implementation PR: repro tests pass as regression tests, the harness passes with nothing excused, `-race` clean on every `internal/...` package.)
+- [x] Refactor merged; repro tests pass; `-race` clean (#163: the harness passes with nothing excused).
 - [x] All codec consumers (§7.5) pass parity, including the v1.3 `STATE`/`MATCHED` (#161).
-- [ ] #101 acceptance criteria met (§9 test 7). Server half done in the implementation PR (`TestReconnectDerivesEverythingFromState`); the web reducer half is the next PR.
-- [ ] GS-3b Q-EG2, Q-EG5, §3.3, §6 amended (done in the implementation PR); `PROJECT-STATUS.md` updated (#162, refreshed after merge).
-- [ ] Independent review of the FIX round before merge.
+- [x] #101 acceptance criteria met (§9 test 7): server in #163 (`TestReconnectDerivesEverythingFromState`), web reducer in the GS-7 web PR (a STATE with no prior MATCHED gives a playable game).
+- [x] GS-3b Q-EG2, Q-EG5, §3.3, §6 amended (#163); `PROJECT-STATUS.md` updated (GS-7 web PR).
+- [x] Independent review of the FIX round before merge (#163: APPROVE-WITH-CHANGES, addressed).
 
 ## 13. Review findings addressed (v0.1 → v0.2)
 
