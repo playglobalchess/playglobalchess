@@ -50,6 +50,10 @@ type Server struct {
 	// each broadcast GAME_END to the clients. Set once by claimGameEnd; cleared by
 	// dropGame.
 	endBroadcast map[string]bool
+	// Write pump bounds (#91): frames queued per connection, and one frame's
+	// write deadline. Past either, the connection is closed.
+	outboundQueue int
+	writeDeadline time.Duration
 }
 
 type gameSeAT struct {
@@ -60,15 +64,17 @@ type gameSeAT struct {
 // NewServer builds the transport server.
 func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *Server {
 	return &Server{
-		auth:         auth,
-		mm:           mm,
-		reg:          reg,
-		now:          time.Now,
-		conns:        make(map[gameSeAT]Conn),
-		userConns:    make(map[string]Conn),
-		userGames:    make(map[string]map[string]uint8),
-		joined:       make(map[string]chan struct{}),
-		endBroadcast: make(map[string]bool),
+		auth:          auth,
+		mm:            mm,
+		reg:           reg,
+		now:           time.Now,
+		conns:         make(map[gameSeAT]Conn),
+		userConns:     make(map[string]Conn),
+		userGames:     make(map[string]map[string]uint8),
+		joined:        make(map[string]chan struct{}),
+		endBroadcast:  make(map[string]bool),
+		outboundQueue: defaultOutboundQueue,
+		writeDeadline: defaultWriteDeadline,
 	}
 }
 
@@ -84,7 +90,13 @@ type connState struct {
 // routes each inbound frame until the connection closes or ctx is cancelled. On
 // return it unbinds the connection's seats (the games persist in the store).
 func (s *Server) Handle(ctx context.Context, c Conn) {
-	defer c.Close()
+	// Every write to this connection, from any goroutine, goes through its own
+	// bounded queue and single writer (#91): the seat map stores this wrapper, so
+	// fan-outs and the flag ticker can never block on a peer that stops reading.
+	// On return the queued frames are flushed, then the connection is closed.
+	pc := newPumpedConn(c, s.outboundQueue, s.writeDeadline)
+	c = pc
+	defer pc.CloseAfterFlush()
 	st := &connState{}
 	defer s.unbindAll(st, c)
 
