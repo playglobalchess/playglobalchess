@@ -38,7 +38,7 @@ vi.mock("../codec/seam", () => {
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { useGame, type UseGameResult } from "./useGame";
-import type { ClientMsg, ServerMsg } from "../codec/messages";
+import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
 import type { SocketLike } from "../net/GameSocket";
 import { sb } from "../test/stateBody";
 
@@ -192,6 +192,60 @@ describe("useGame", () => {
       }),
     );
     expect(countMsgs(h.fake(), "Resync")).toBe(2);
+  });
+
+  it("an INTERNAL error mid-game (move not confirmed) sends ONE RESYNC and never resends the MOVE", () => {
+    const h = mountHook();
+    act(() => h.fake().open());
+    act(() => h.fake().push(matched));
+    act(() => h.get().commands.move("e2e4"));
+    act(() => h.fake().push({ Error: { code: ErrorCode.Internal, msg: "move not confirmed" } }));
+    expect(h.get().state.error).toBeNull();
+    expect(h.get().state.needsResync).toBe(true);
+    expect(countMsgs(h.fake(), "Resync")).toBe(1);
+    expect(countMsgs(h.fake(), "Move")).toBe(1); // the original, not a resend
+  });
+
+  it("re-sends RESYNC with backoff while the RESYNC fails, and stops on STATE", () => {
+    vi.useFakeTimers();
+    try {
+      const h = mountHook();
+      act(() => h.fake().open());
+      act(() => h.fake().push(matched));
+      act(() => h.get().commands.move("e2e4"));
+      const internal: ServerMsg = { Error: { code: ErrorCode.Internal, msg: "move not confirmed" } };
+      act(() => h.fake().push(internal));
+      expect(countMsgs(h.fake(), "Resync")).toBe(1);
+      // The RESYNC fails too (same outage): no error banner, retried after 1 s, then 2 s.
+      act(() => h.fake().push(internal));
+      expect(h.get().state.error).toBeNull();
+      act(() => vi.advanceTimersByTime(999));
+      expect(countMsgs(h.fake(), "Resync")).toBe(1);
+      act(() => vi.advanceTimersByTime(1));
+      expect(countMsgs(h.fake(), "Resync")).toBe(2);
+      act(() => vi.advanceTimersByTime(2000));
+      expect(countMsgs(h.fake(), "Resync")).toBe(3);
+      expect(h.get().state.resyncAttempts).toBe(3); // the UI now suggests a refresh
+      // A reply that never comes is retried too; the gap is capped at 8 s.
+      act(() => vi.advanceTimersByTime(4000));
+      act(() => vi.advanceTimersByTime(8000));
+      expect(countMsgs(h.fake(), "Resync")).toBe(5);
+      act(() => vi.advanceTimersByTime(8000));
+      expect(countMsgs(h.fake(), "Resync")).toBe(6);
+      // STATE settles it: no more RESYNCs, and the move was never resent.
+      act(() =>
+        h.fake().push({
+          State: { game_id: "g1", state: sb("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1", 1, [299000, 300000]) },
+        }),
+      );
+      expect(h.get().state.needsResync).toBe(false);
+      expect(h.get().state.pendingMove).toBeNull();
+      act(() => vi.advanceTimersByTime(60000));
+      expect(countMsgs(h.fake(), "Resync")).toBe(6);
+      expect(countMsgs(h.fake(), "Move")).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("move() refuses to send a second MOVE while one is pending (S1 guard)", () => {

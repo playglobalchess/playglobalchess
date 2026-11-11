@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { reduce, initialState, canOfferDraw, type GameState } from "./reducer";
 import { canRequestTakeback } from "./useGame";
-import { NO_SEAT, Status, type ServerMsg } from "../codec/messages";
+import { ErrorCode, NO_SEAT, Status, type ServerMsg } from "../codec/messages";
 import { sb } from "../test/stateBody";
 
 // GS-7 client state rules (SPEC-S2-GAME-SERVER-GS7 §6.4, §7.4).
 
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const GID = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+const AFTER_E4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
 
 const server = (s: GameState, msg: ServerMsg): GameState => reduce(s, { kind: "server", at: 0, msg });
 
@@ -168,5 +169,62 @@ describe("GS-7 reducer: the draw-offer gate (§6.3)", () => {
     s = server(s, { DrawDeclined: { game_id: GID, seat_idx: 1 } });
     s = server(s, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000], { ply: 0 }) } });
     expect(s.myLastDrawOfferPly).toBeNull();
+  });
+});
+
+describe("INTERNAL during a game is recovered with a RESYNC (#89 follow-up)", () => {
+  const internal: ServerMsg = { Error: { code: ErrorCode.Internal, msg: "move not confirmed" } };
+
+  it("asks for STATE instead of showing an error, keeping the optimistic move until it arrives", () => {
+    let s = reduce(matched(0), { kind: "localMove", uci: "e2e4", at: 0 });
+    s = server(s, internal);
+    expect(s.error).toBeNull();
+    expect(s.needsResync).toBe(true);
+    expect(s.pendingMove?.uci).toBe("e2e4");
+  });
+
+  it("STATE settles it: the move is in the game, and nothing is left flagged", () => {
+    let s = server(reduce(matched(0), { kind: "localMove", uci: "e2e4", at: 0 }), internal);
+    s = server(s, { State: { game_id: GID, state: sb(AFTER_E4, 1, [299000, 300000]) } });
+    expect(s.needsResync).toBe(false);
+    expect(s.error).toBeNull();
+    expect(s.pendingMove).toBeNull();
+    expect(s.ply).toBe(1);
+  });
+
+  it("an INTERNAL answer to that RESYNC keeps it pending (retried with backoff), not an error", () => {
+    let s = server(matched(0), internal);
+    s = reduce(s, { kind: "resyncSent" });
+    s = server(s, internal);
+    expect(s.error).toBeNull();
+    expect(s.needsResync).toBe(true);
+    expect(s.resyncAttempts).toBe(1);
+  });
+
+  it("resyncSent counts sends only while a resync is needed; STATE resets the count", () => {
+    let s = reduce(matched(0), { kind: "resyncSent" });
+    expect(s.resyncAttempts).toBe(0);
+    s = server(s, internal);
+    s = reduce(reduce(s, { kind: "resyncSent" }), { kind: "resyncSent" });
+    expect(s.resyncAttempts).toBe(2);
+    s = server(s, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } });
+    expect(s.resyncAttempts).toBe(0);
+    expect(s.needsResync).toBe(false);
+  });
+
+  it("outside a game, INTERNAL is shown as before", () => {
+    const s = server(initialState, internal);
+    expect(s.error).toBe(ErrorCode.Internal);
+    expect(s.needsResync).toBe(false);
+  });
+
+  it("STATE clears a recoverable error, but not UNSUPPORTED_VERSION", () => {
+    let s = server(matched(0), { Error: { code: ErrorCode.ProtocolViolation, msg: "" } }); // shown mid-game
+    expect(s.error).toBe(ErrorCode.ProtocolViolation);
+    s = server(s, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } });
+    expect(s.error).toBeNull();
+    let v = server(matched(0), { Error: { code: ErrorCode.UnsupportedVersion, msg: "" } });
+    v = server(v, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } });
+    expect(v.error).toBe(ErrorCode.UnsupportedVersion);
   });
 });
