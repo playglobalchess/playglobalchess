@@ -29,6 +29,8 @@ type fakeDynamo struct {
 	// key "stream_id\x00seq" -> item
 	items   map[string]map[string]ddbtypes.AttributeValue
 	noTable bool // when true, DescribeTable fails (startup fail-fast test)
+	// inconsistentQueries counts Queries that did not ask for ConsistentRead.
+	inconsistentQueries int
 }
 
 func newFakeDynamo() *fakeDynamo {
@@ -104,6 +106,9 @@ func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.Transa
 func (f *fakeDynamo) Query(ctx context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if in.ConsistentRead == nil || !*in.ConsistentRead {
+		f.inconsistentQueries++
+	}
 	sid := in.ExpressionAttributeValues[":sid"].(*ddbtypes.AttributeValueMemberS).Value
 	// Collect all items for the partition, order by seq.
 	type kv struct {
@@ -380,5 +385,24 @@ func TestLoadPaginatesInOrder(t *testing.T) {
 		if got[i].Type != game.EvMovePlayed || got[i].MovePlayed.Ply != uint32(i) {
 			t.Fatalf("event %d out of order across pages: %+v", i, got[i])
 		}
+	}
+}
+
+// Load must read strongly consistently: the session decides game state from it,
+// including the re-read that confirms an ambiguous commit (#89). An eventually
+// consistent read can miss the write that just landed.
+func TestLoadIsStronglyConsistent(t *testing.T) {
+	s, f := newTestStore(t)
+	ctx := context.Background()
+	if err := s.Append(ctx, "game/cr", 0, gameCreated()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(ctx, "game/cr"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.inconsistentQueries != 0 {
+		t.Fatalf("%d Load queries without ConsistentRead", f.inconsistentQueries)
 	}
 }

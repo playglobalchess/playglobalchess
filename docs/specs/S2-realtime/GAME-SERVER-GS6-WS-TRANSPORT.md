@@ -194,7 +194,10 @@ stream without a live session (no wire change):
   it did not play, an unknown id) gets the same `ERROR{UNKNOWN_GAME, "no such
   game"}`, so RESYNC cannot tell other players' games apart. A store failure is
   `ERROR{INTERNAL}` and logged, never "no such game". After the push window,
-  RESYNC is the way back, on any node, for an ENDED game. A game still LIVE on
+  RESYNC is the way back, on any node, for an ENDED game. Lookups of games not
+  live on this node (RESYNC, or MOVE, of an ended game) read the stream, so each
+  connection may make 20 per minute; past that it gets `ERROR{RATE_LIMITED}`
+  without a store read (connection-wide limits are #104). A game still LIVE on
   another node answers `UNKNOWN_GAME` here: there is no node routing yet (G-E),
   so resuming it needs the reconnect to reach the node that holds it.
 
@@ -278,7 +281,8 @@ closed by) the §4A v1.1 amendment:
 |---|---|
 | First frame is not AUTHENTICATE | reject + close (no anonymous play). |
 | MOVE on a game this conn is not seated in | `MOVE_REJECTED{NOT_YOUR_SEAT}` (the session/pipeline already enforces; the transport routes by its seat map). |
-| Persist fails (pipeline error) | NO ack; `ERROR{INTERNAL}` — the move did not happen (NFR-7). |
+| Persist fails (pipeline error) | A store error does not prove the write failed (#89, #95): the session re-reads the stream (strongly consistent, up to 3 tries), and if its events are there the command happened and is acked normally (both seats, and `GAME_END` if it ended the game). Otherwise NO ack; `ERROR{INTERNAL}`, and the session adopts the store's state. If the re-read itself fails and a later resend of that move is re-acked while the game is still live, the opponent is sent the `MOVE_ACCEPTED` and `GAME_END` is broadcast to both seats once, then the game is dropped. (Clients must not resend `MOVE`, PROTOCOL §5; a client that gets `INTERNAL` should `RESYNC`.) |
+| `MOVE` on an ended game (session dropped) | for a player seated in it, the duplicate-MOVE rule against the game rebuilt from the stream: a resend of a committed ply is re-acked, plus `GAME_END` (sender only) if that move ended the game; a new ply is `GAME_OVER`. Others keep `NOT_YOUR_SEAT` (#122). |
 | Disconnect mid-game | seat unbound, clock keeps running; reconnect → `STATE`; flag if the clock expires first. |
 | Game ends while a seat is offline | that seat's next `AUTHENTICATE` (within 24 h, same node) pushes `STATE{status=ENDED, result}` once; `RESYNC` returns it at any time (§3.4, #102). |
 | MATCHED seat never joins (ghost-claim) | join-timeout → abort the game (resolves the GS-5 residual). |
