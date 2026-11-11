@@ -38,7 +38,7 @@ vi.mock("../codec/seam", () => {
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { useGame, type UseGameResult } from "./useGame";
-import type { ClientMsg, ServerMsg } from "../codec/messages";
+import { ErrorCode, type ClientMsg, type ServerMsg } from "../codec/messages";
 import type { SocketLike } from "../net/GameSocket";
 import { sb } from "../test/stateBody";
 
@@ -192,6 +192,18 @@ describe("useGame", () => {
       }),
     );
     expect(countMsgs(h.fake(), "Resync")).toBe(2);
+  });
+
+  it("an INTERNAL error mid-game (move not confirmed) sends ONE RESYNC and never resends the MOVE", () => {
+    const h = mountHook();
+    act(() => h.fake().open());
+    act(() => h.fake().push(matched));
+    act(() => h.get().commands.move("e2e4"));
+    act(() => h.fake().push({ Error: { code: ErrorCode.Internal, msg: "move not confirmed" } }));
+    expect(h.get().state.error).toBeNull();
+    expect(h.get().state.needsResync).toBe(true);
+    expect(countMsgs(h.fake(), "Resync")).toBe(1);
+    expect(countMsgs(h.fake(), "Move")).toBe(1); // the original, not a resend
   });
 
   it("move() refuses to send a second MOVE while one is pending (S1 guard)", () => {

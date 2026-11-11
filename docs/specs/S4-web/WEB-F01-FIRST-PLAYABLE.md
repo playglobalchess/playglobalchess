@@ -114,6 +114,13 @@ board + both clocks from `start_state`.
   REVERT the optimistic move and surface the reason. Legal-move highlighting uses
   the engine binding for UX only (NFR-5 — the server still validates).
 - Opponent `MOVE_ACCEPTED` (for the other seat) applies their move + clock.
+- **`ERROR{INTERNAL}` during a game is recovered, not shown.** It can mean the
+  server could not confirm whether our move was saved ("move not confirmed",
+  GAME-SERVER §3.6). The client must not resend the move (PROTOCOL §5); it sends
+  `RESYNC` once and shows "Reconnecting game state…". The optimistic move stays
+  on the board until the STATE says whether it is in the game. An `INTERNAL`
+  that arrives while that RESYNC is pending is shown as an error (no retry
+  loop), and a fresh STATE clears any error except `UNSUPPORTED_VERSION`.
 - **Clocks tick (#112).** The side to move's clock counts down locally from the
   last server value; the server stays authoritative and the client never flags.
   `MATCHED`/`STATE` start `running_seat`; `MOVE_ACCEPTED` sets the mover's

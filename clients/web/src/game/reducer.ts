@@ -20,6 +20,7 @@ import {
   Reason,
   Status,
   NO_SEAT,
+  ErrorCode,
   serverTag,
 } from "../codec/messages";
 
@@ -376,8 +377,10 @@ function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
         clockRun: ended ? null : runFromBody(b, at),
         pendingMove: null,
         needsResync: false,
-        // A fresh authoritative STATE means the connection is healthy again.
+        // A fresh authoritative STATE means the connection is healthy again, so
+        // a recoverable error is cleared too (an unsupported version is not).
         lastReject: null,
+        error: state.error === ErrorCode.UnsupportedVersion ? state.error : null,
         // A fold has no meaningful "most recent move" — clear it so the
         // screen-reader announcement does not re-read a stale pre-resync move.
         lastMove: null,
@@ -431,6 +434,14 @@ function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
       // here we record the code so GameView can render the right message rather
       // than only a generic "disconnected" status.
       const e = (msg as { Error: { code: ErrorCodeValue; msg: string } }).Error;
+      // INTERNAL during a game (e.g. "move not confirmed": the server could not
+      // tell whether our move was saved) is recoverable: ask for STATE, which
+      // says whether the move is in the game, instead of showing an error. The
+      // client must not resend the move (PROTOCOL §5). If an INTERNAL arrives
+      // while that RESYNC is already pending, show it: no retry loop.
+      if (e.code === ErrorCode.Internal && state.phase === "playing" && state.gameId != null && !state.needsResync) {
+        return { ...state, needsResync: true };
+      }
       return { ...state, error: e.code };
     }
 
