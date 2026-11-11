@@ -58,6 +58,7 @@ export const en = {
   "game.clock.running": "(running)",
   "game.opponent.label": "Opponent",
   "game.resync": "Reconnecting game state…",
+  "game.resync.slow": "If this lasts, refresh the page.",
   "game.reject.illegal": "Illegal move.",
   "game.reject.stale": "Move out of sync — try again.",
   "game.reject.gameover": "The game is over.",

@@ -89,6 +89,10 @@ export interface GameState {
   /** Set when the reducer detects a ply gap (a MOVE_ACCEPTED skipped ahead): the
    * GameSocket reads this and sends RESYNC to pull a fresh STATE. Cleared by STATE. */
   needsResync: boolean;
+  /** RESYNCs sent for the current needsResync (0 when none is needed). The hook
+   * re-sends with backoff until a STATE clears needsResync; the UI suggests a
+   * refresh once it climbs. Reset by STATE. */
+  resyncAttempts: number;
   /** A protocol/transport Error the UI must surface (e.g. UNSUPPORTED_VERSION →
    * "please refresh"). null when there is no active error. */
   error: ErrorCodeValue | null;
@@ -116,6 +120,7 @@ export const initialState: GameState = {
   result: null,
   lastReject: null,
   needsResync: false,
+  resyncAttempts: 0,
   error: null,
   lastMove: null,
 };
@@ -129,6 +134,7 @@ export type Action =
   | { kind: "localDeclineDraw" }
   | { kind: "localRequestTakeback" }
   | { kind: "localDeclineTakeback" }
+  | { kind: "resyncSent" } // the hook sent a RESYNC for needsResync
   // `at` is the local monotonic time (ms) the action happened: the clock anchor
   // (#112). REQUIRED, so a dispatch path that forgets it is a type error rather
   // than an anchor at 0 that silently shows the running clock as 0:00.
@@ -154,6 +160,9 @@ export function reduce(state: GameState, action: Action): GameState {
       return { ...state, myTakebackSent: { atPly: state.ply } };
     case "localDeclineTakeback":
       return { ...state, incomingTakeback: null };
+
+    case "resyncSent":
+      return state.needsResync ? { ...state, resyncAttempts: state.resyncAttempts + 1 } : state;
 
     case "localMove": {
       // Optimistic: show the move now, remember how to revert. Only legal while
@@ -377,6 +386,7 @@ function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
         clockRun: ended ? null : runFromBody(b, at),
         pendingMove: null,
         needsResync: false,
+        resyncAttempts: 0,
         // A fresh authoritative STATE means the connection is healthy again, so
         // a recoverable error is cleared too (an unsupported version is not).
         lastReject: null,
@@ -437,9 +447,10 @@ function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
       // INTERNAL during a game (e.g. "move not confirmed": the server could not
       // tell whether our move was saved) is recoverable: ask for STATE, which
       // says whether the move is in the game, instead of showing an error. The
-      // client must not resend the move (PROTOCOL §5). If an INTERNAL arrives
-      // while that RESYNC is already pending, show it: no retry loop.
-      if (e.code === ErrorCode.Internal && state.phase === "playing" && state.gameId != null && !state.needsResync) {
+      // client must not resend the move (PROTOCOL §5). An INTERNAL answer to
+      // that RESYNC (the same outage) keeps it pending: the hook retries with
+      // backoff, so there is no tight loop and no dead end.
+      if (e.code === ErrorCode.Internal && state.phase === "playing" && state.gameId != null) {
         return { ...state, needsResync: true };
       }
       return { ...state, error: e.code };

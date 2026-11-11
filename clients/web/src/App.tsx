@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
 import { codecProtocolVersion } from "./codec/seam";
-import { useGame, canRequestTakeback } from "./game/useGame";
+import { useGame, canRequestTakeback, RESYNC_SLOW_AFTER } from "./game/useGame";
 import { canOfferDraw } from "./game/reducer";
 import { Board } from "./game/Board";
 import { ClockBar } from "./game/Clock";
@@ -128,7 +128,12 @@ function GameView({ token }: { token: string }): React.JSX.Element {
         </button>
       ) : null}
 
-      {state.needsResync ? <p role="status">{t("game.resync")}</p> : null}
+      {state.needsResync ? (
+        <p role="status">
+          {t("game.resync")}
+          {state.resyncAttempts >= RESYNC_SLOW_AFTER ? ` ${t("game.resync.slow")}` : null}
+        </p>
+      ) : null}
 
       {state.position != null ? (
         <>

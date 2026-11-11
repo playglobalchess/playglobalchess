@@ -6,7 +6,7 @@
 //   • It constructs ONE GameSocket whose onServerMsg dispatches {kind:"server"}
 //     into the reducer — the socket feeds the reducer, never the other way.
 //   • It wires the step-4 DEFERRED seam: when the reducer sets needsResync
-//     (a ply gap it detected), this hook calls sock.resync(gameId). GameSocket
+//     (a ply gap, or INTERNAL during a game), this hook calls sock.resync(gameId). GameSocket
 //     never observes reducer output itself (§ its own doc); that observation
 //     lives here, because only this layer sees both the state and the socket.
 //   • It exposes a small command surface (connect/seek/move/resign/offerDraw/
@@ -19,10 +19,13 @@
 //     would reconnect-storm. React 19 StrictMode double-invokes effects in dev;
 //     the effect's cleanup close() + GameSocket.connect()'s own teardown make
 //     the double-mount safe.
-//   - needsResync is consumed exactly once per raised edge: after calling
-//     resync() we must not call it again until the reducer clears the flag
-//     (STATE clears it). We dispatch nothing to clear it from here — STATE does
-//     — so we guard on the flag transition with a ref, not on every render.
+//   - needsResync is answered by a RESYNC at once, then re-sent with backoff
+//     (1, 2, 4, 8 s, capped) until a STATE clears the flag. A RESYNC can fail
+//     (INTERNAL from the same outage) or go unanswered, so a single send could
+//     leave the board frozen on an unconfirmed move; the backoff keeps the
+//     retry rate low. STATE clears the flag; this hook never clears it, it
+//     only counts sends (resyncSent), and the effect keys on that count, not on
+//     every render.
 //   - move() applies the optimistic reducer dispatch BEFORE the socket send is
 //     irrelevant to ordering (both are local), but we send with ply+1 computed
 //     from the CURRENT reducer ply, read at call time, not from a stale closure.
@@ -30,6 +33,12 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { reduce, initialState, canOfferDraw, type GameState } from "./reducer";
 import { monotonicNow } from "./monotonic";
+
+/** RESYNC retry backoff while needsResync stays up: 1, 2, 4, 8 s, then every 8 s. */
+const RESYNC_BACKOFF_MS = 1000;
+const RESYNC_BACKOFF_CAP_MS = 8000;
+/** After this many RESYNCs without a STATE, the UI suggests refreshing. */
+export const RESYNC_SLOW_AFTER = 3;
 import {
   GameSocket,
   type ConnStatus,
@@ -90,10 +99,6 @@ export function useGame(opts: UseGameOptions): UseGameResult {
     stateRef.current = state;
   }, [state]);
 
-  // Guards the once-per-edge resync: true while we have already asked for a
-  // resync and are waiting for the clearing STATE. Prevents re-sending RESYNC
-  // on every render while needsResync is still set.
-  const resyncInFlight = useRef(false);
 
   // --- construct + connect the socket exactly once (mount) -----------------
   useEffect(() => {
@@ -138,21 +143,26 @@ export function useGame(opts: UseGameOptions): UseGameResult {
   }, [opts.url, opts.token, opts.factory, setStatus]);
 
   // --- wire the deferred needsResync → resync seam -------------------------
-  // When the reducer raises needsResync (a ply gap), ask the server for a fresh
-  // STATE exactly once. STATE clears needsResync, which drops resyncInFlight so
-  // a LATER gap can resync again.
+  // When the reducer raises needsResync (a ply gap, or an INTERNAL during a
+  // game), ask the server for a fresh STATE now, then again with backoff while
+  // the flag stays up: each send bumps resyncAttempts, which re-runs this
+  // effect to schedule the next. A STATE clears the flag (and the count), so the
+  // pending timer is cancelled and a LATER need starts again from an immediate send.
   useEffect(() => {
-    const sock = sockRef.current;
-    if (state.needsResync && state.gameId != null && sock != null) {
-      if (!resyncInFlight.current) {
-        resyncInFlight.current = true;
-        sock.resync(state.gameId);
-      }
-    } else if (!state.needsResync) {
-      // Flag cleared (by STATE) — re-arm for the next gap.
-      resyncInFlight.current = false;
+    if (!state.needsResync || state.gameId == null) return;
+    const gameId = state.gameId;
+    const send = () => {
+      sockRef.current?.resync(gameId);
+      dispatch({ kind: "resyncSent" });
+    };
+    if (state.resyncAttempts === 0) {
+      send();
+      return;
     }
-  }, [state.needsResync, state.gameId]);
+    const delay = Math.min(RESYNC_BACKOFF_MS * 2 ** (state.resyncAttempts - 1), RESYNC_BACKOFF_CAP_MS);
+    const timer = setTimeout(send, delay);
+    return () => clearTimeout(timer);
+  }, [state.needsResync, state.gameId, state.resyncAttempts]);
 
   // --- command surface the UI calls ----------------------------------------
   const seek = useCallback((poolId: string, timeControl: string, rated: boolean) => {

@@ -192,10 +192,24 @@ describe("INTERNAL during a game is recovered with a RESYNC (#89 follow-up)", ()
     expect(s.ply).toBe(1);
   });
 
-  it("an INTERNAL while that RESYNC is pending is shown (no retry loop)", () => {
+  it("an INTERNAL answer to that RESYNC keeps it pending (retried with backoff), not an error", () => {
     let s = server(matched(0), internal);
+    s = reduce(s, { kind: "resyncSent" });
     s = server(s, internal);
-    expect(s.error).toBe(ErrorCode.Internal);
+    expect(s.error).toBeNull();
+    expect(s.needsResync).toBe(true);
+    expect(s.resyncAttempts).toBe(1);
+  });
+
+  it("resyncSent counts sends only while a resync is needed; STATE resets the count", () => {
+    let s = reduce(matched(0), { kind: "resyncSent" });
+    expect(s.resyncAttempts).toBe(0);
+    s = server(s, internal);
+    s = reduce(reduce(s, { kind: "resyncSent" }), { kind: "resyncSent" });
+    expect(s.resyncAttempts).toBe(2);
+    s = server(s, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } });
+    expect(s.resyncAttempts).toBe(0);
+    expect(s.needsResync).toBe(false);
   });
 
   it("outside a game, INTERNAL is shown as before", () => {
@@ -205,7 +219,8 @@ describe("INTERNAL during a game is recovered with a RESYNC (#89 follow-up)", ()
   });
 
   it("STATE clears a recoverable error, but not UNSUPPORTED_VERSION", () => {
-    let s = server(server(matched(0), internal), internal);
+    let s = server(matched(0), { Error: { code: ErrorCode.ProtocolViolation, msg: "" } }); // shown mid-game
+    expect(s.error).toBe(ErrorCode.ProtocolViolation);
     s = server(s, { State: { game_id: GID, state: sb(START_FEN, 0, [300000, 300000]) } });
     expect(s.error).toBeNull();
     let v = server(matched(0), { Error: { code: ErrorCode.UnsupportedVersion, msg: "" } });
