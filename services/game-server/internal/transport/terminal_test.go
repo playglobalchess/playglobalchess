@@ -410,9 +410,10 @@ func TestFailedMoveNotCommittedLeavesGamePlayable(t *testing.T) {
 	moveAndAwaitBoth(t, black, white, gameID, 2, "e7e5")
 }
 
-// A terminal re-ack while the end claim is already held (by a broadcast that
-// failed after claiming, #88): the sender still gets GAME_END.
-func TestTerminalReackWithClaimHeldStillSendsGameEnd(t *testing.T) {
+// A terminal re-ack while another path holds the end claim (it is broadcasting):
+// the re-ack does not send its own GAME_END, so the sender gets exactly one,
+// from the holder.
+func TestTerminalReackWhileClaimHeldSendsOneGameEnd(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
 	amb := &ambiguousStore{EventStore: h.store, loadFails: 3}
@@ -424,12 +425,20 @@ func TestTerminalReackWithClaimHeldStillSendsGameEnd(t *testing.T) {
 	move(t, black, gameID, 4, "d8h4")
 	black.waitForServer(t, codec.SMError, 2*time.Second) // unconfirmed
 
-	h.srv.claimGameEnd(gameID) // another path took the claim and never sent
+	h.srv.claimGameEnd(gameID) // another path holds the claim, mid-broadcast
 	move(t, black, gameID, 4, "d8h4")
 	black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	black.noServerMsg(t, codec.SMGameEnd, 50*time.Millisecond) // the holder's job
+
+	// The holder finishes: it releases and the broadcast goes out once.
+	h.srv.releaseGameEnd(gameID)
+	if got := h.srv.broadcastGameEnd(gameID); got != endSent {
+		t.Fatalf("broadcast = %v, want endSent", got)
+	}
 	if ge := black.waitForServer(t, codec.SMGameEnd, 2*time.Second); game.Termination(ge.GameEnd.Termination) != game.TermMate {
 		t.Fatalf("termination = 0x%02x, want MATE", ge.GameEnd.Termination)
 	}
+	black.noServerMsg(t, codec.SMGameEnd, 50*time.Millisecond)
 }
 
 // Lookups of games not live here are budgeted per connection: past the budget

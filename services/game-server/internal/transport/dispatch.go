@@ -25,6 +25,11 @@ type Server struct {
 	// idle/disconnect forfeit path §3.4 — GS-3 delegates the ticker to the caller,
 	// "the session does not own a ticker"). 0 = default.
 	flagInterval time.Duration
+	// tickerExited, if set (tests only), is called when a game's flag ticker
+	// goroutine returns, so a leak test can see the ticker is gone (#88).
+	tickerExited func(gameID string)
+	// endReadTimeout overrides endBroadcastTimeout (tests only; 0 = default).
+	endReadTimeout time.Duration
 
 	mu    sync.Mutex
 	conns map[gameSeAT]Conn // (gameID, seatIdx) → the connection seated there
@@ -39,6 +44,10 @@ type Server struct {
 	// consults this to push STATE and rebind the seat — reconnection is
 	// server-initiated because §4A has no client resync frame (Option A).
 	userGames map[string]map[string]uint8 // userID → (gameID → seat)
+	// gameUsers is the reverse index: gameID → (seat → userID). Same lifetime as
+	// userGames (set at bind, cleared by dropGame), so a game end finds its two
+	// users without scanning every user under the lock.
+	gameUsers map[string]map[uint8]string
 	// joined is closed the FIRST time any seat binds a connection for a game, so
 	// the join-timeout can distinguish "a seat actually joined" (even if it later
 	// disconnects) from "nobody ever joined" (the true GS-5 ghost-claim case).
@@ -77,6 +86,7 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 		conns:         make(map[gameSeAT]Conn),
 		userConns:     make(map[string]Conn),
 		userGames:     make(map[string]map[string]uint8),
+		gameUsers:     make(map[string]map[uint8]string),
 		joined:        make(map[string]chan struct{}),
 		endBroadcast:  make(map[string]bool),
 		outboundQueue: defaultOutboundQueue,
@@ -271,6 +281,7 @@ func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
 		s.userGames[st.userID] = make(map[string]uint8)
 	}
 	s.userGames[st.userID][gameID] = seat
+	s.indexGameUserLocked(gameID, seat, st.userID)
 	s.mu.Unlock()
 	// Record on the conn-state only once (a reconnect re-binds the same seat).
 	for _, existing := range st.seats {
