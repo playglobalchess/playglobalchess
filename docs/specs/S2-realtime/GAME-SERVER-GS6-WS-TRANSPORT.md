@@ -222,16 +222,17 @@ triggering connection's, so a mover who disconnects right after the ending
 cannot cancel the opponent's `GAME_END`. The frame's result comes from the
 session snapshot, and the seat users from the in-memory user index, so no store
 read can blank or degrade it. A call that does not broadcast releases the
-claim, and a caller that finds the claim held sends nothing itself (the holder
-is broadcasting to every bound seat), so no client gets two `GAME_END`s. The
-ticker also asks whether the game is OVER, not only whether this tick ended it.
-So an ended game whose broadcast did not go out is broadcast by the next tick,
-and then dropped. If that keeps failing, the ticker drops the ended game after
-10 failed ticks, and never sooner than two broadcast read bounds' worth of
-ticks, so it cannot cut a live broadcast short at any tick interval. The result
-stays in the stream, where RESYNC serves it (§3.4). In every case the session,
-the seat and user indices, the claim, the join signal and the ticker goroutine
-are reclaimed.
+claim. A caller that finds the claim held, or the game already dropped, sends
+nothing itself: the holder is broadcasting to every bound seat, or already has.
+So no client gets two `GAME_END`s. The ticker also asks whether the game is
+OVER, not only whether this tick ended it. So an ended game whose broadcast did
+not go out is broadcast by the next tick, and then dropped. If that keeps
+failing, the ticker drops the ended game after 10 failed ticks, and never
+sooner than two broadcast read bounds' worth of ticks, so it cannot cut a live
+broadcast short at any tick interval. It first records both seats as having
+missed the ending, so each one's next `AUTHENTICATE` pushes the ended `STATE`
+(§3.4). In every case the session, the seat and user indices, the claim, the
+join signal and the ticker goroutine are reclaimed.
 
 `PING{t}` → `PONG{t, server_t}` (liveness + RTT). On close, the connection's
 seat is unbound (via `unbindAll`, which only drops bindings still pointing at

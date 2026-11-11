@@ -59,7 +59,8 @@ func wantReclaimed(t *testing.T, h *harness, w *tickerWatch, gameID string) {
 		}
 		_, claimed := s.endBroadcast[gameID]
 		_, joined := s.joined[gameID]
-		return !claimed && !joined
+		_, indexed := s.gameUsers[gameID]
+		return !claimed && !joined && !indexed
 	})
 	waitUntil(t, 2*time.Second, "the flag ticker to exit", func() bool { return w.gone(gameID) })
 }
@@ -161,13 +162,18 @@ func TestBroadcastThatDoesNotGoOutReleasesTheClaim(t *testing.T) {
 		_, ok := h.srv.endBroadcast[id]
 		return ok
 	}
-	// A live game (not ended), and a game this node does not have.
-	for _, id := range []string{gameID, "f47ac10b-58cc-4372-a567-0e02b2c3d479"} {
-		if got := h.srv.broadcastGameEnd(id); got != endNotSent {
-			t.Fatalf("broadcast %s = %v, want endNotSent", id, got)
+	// A live game (not ended), and a game this node does not have (or has
+	// already broadcast and dropped): "not sent" and "gone" are distinct, so a
+	// late caller after a completed broadcast never sends a second GAME_END.
+	for _, c := range []struct {
+		id   string
+		want endOutcome
+	}{{gameID, endNotSent}, {"f47ac10b-58cc-4372-a567-0e02b2c3d479", endGone}} {
+		if got := h.srv.broadcastGameEnd(c.id); got != c.want {
+			t.Fatalf("broadcast %s = %v, want %v", c.id, got, c.want)
 		}
-		if claimed(id) {
-			t.Fatalf("the claim on %s stayed latched after a broadcast that did not go out", id)
+		if claimed(c.id) {
+			t.Fatalf("the claim on %s stayed latched after a broadcast that did not go out", c.id)
 		}
 	}
 	// While another path holds it, a caller is told so and changes nothing.
@@ -210,11 +216,21 @@ func TestTickerDropsAnEndedGameItCannotBroadcast(t *testing.T) {
 	h.srv.endReadTimeout = 20 * time.Millisecond // keeps the drop bound at 10 ticks
 	w := watchTickers(h)
 	ctx := context.Background()
-	_, _, gameID, seatA, _ := pair(t, h, ctx, "alice", "bob")
+	_, _, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 	h.srv.claimGameEnd(gameID) // held by a holder that never finishes
 	sess, _ := h.srv.reg.Get(gameID)
 	if err := sess.Resign(ctx, seatA); err != nil {
 		t.Fatalf("resign: %v", err)
 	}
 	wantReclaimed(t, h, w, gameID)
+	// Nobody got GAME_END, so both are recorded as having missed it: each one's
+	// next AUTHENTICATE pushes the ended STATE (review finding).
+	for _, c := range []struct {
+		uid  string
+		seat uint8
+	}{{"alice", seatA}, {"bob", seatB}} {
+		if got := h.srv.takeMissedEnds(c.uid); got[gameID] != c.seat || len(got) != 1 {
+			t.Fatalf("%s's missed endings = %v, want %s at seat %d", c.uid, got, gameID, c.seat)
+		}
+	}
 }

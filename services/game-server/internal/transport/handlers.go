@@ -185,8 +185,8 @@ func (s *Server) armFlagTicker(gameID string) {
 				// drop the game anyway after the error bound: its result stays in
 				// the stream (RESYNC serves it, #102), and the session and this
 				// goroutine are reclaimed rather than leaked.
-				if s.broadcastGameEnd(gameID) == endSent {
-					return
+				if r := s.broadcastGameEnd(gameID); r == endSent || r == endGone {
+					return // broadcast, here or by another path that also dropped it
 				}
 				// endHeld counts too: a holder finishes within one read timeout
 				// (then the game is gone, or the claim is released), and the bound
@@ -195,6 +195,12 @@ func (s *Server) armFlagTicker(gameID string) {
 				consecutiveErrs++
 				if consecutiveErrs >= dropBound {
 					log.Printf("transport: GAME_END for %s never broadcast; dropping the ended game", gameID)
+					// No seat got GAME_END: record both as missed, so each one's
+					// next AUTHENTICATE pushes the ended STATE (#102), before the
+					// drop clears the index that names them.
+					for seat, uid := range s.seatUsers(gameID) {
+						s.recordMissedEnd(uid, gameID, seat)
+					}
 					s.dropGame(gameID)
 					return
 				}
@@ -235,6 +241,7 @@ func (s *Server) bindSeatForUser(c Conn, uid, gameID string, seat uint8) {
 		s.userGames[uid] = make(map[string]uint8)
 	}
 	s.userGames[uid][gameID] = seat
+	s.indexGameUserLocked(gameID, seat, uid)
 	s.markJoinedLocked(gameID)
 }
 
@@ -370,10 +377,11 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 				s.send(ctx, cc, acc)
 			}
 			if s.broadcastGameEnd(p.GameID) == endNotSent {
-				// Nothing went out and the claim was released (a read failed, #88).
-				// The sender must still learn the result. Not on endHeld: the path
-				// holding the claim is broadcasting to every bound seat, this
-				// sender included, so sending here too would be a second GAME_END.
+				// A read failed: nothing went out and the claim was released (#88).
+				// The sender must still learn the result. Not on endHeld (the
+				// holder is broadcasting to every bound seat, this sender
+				// included) and not on endGone (another path already broadcast
+				// and dropped the game): either would be a second GAME_END.
 				if sp, err := sess.StateSnapshot(ctx); err == nil && sp.Ended {
 					s.send(ctx, c, gameEndMsg(p.GameID, sp.ResultVector, sp.Terminal))
 				}
@@ -582,8 +590,9 @@ func (s *Server) broadcastGameEnd(gameID string) endOutcome {
 	defer cancel()
 	snap, ok := s.reg.Get(gameID)
 	if !ok {
+		// Gone: usually another path already broadcast and dropped it.
 		s.releaseGameEnd(gameID)
-		return endNotSent
+		return endGone
 	}
 	sp, err := snap.StateSnapshot(ctx)
 	if err != nil || !sp.Ended {
@@ -619,7 +628,8 @@ type endOutcome int
 const (
 	endSent    endOutcome = iota // this call broadcast GAME_END and dropped the game
 	endHeld                      // another path holds the claim and is broadcasting
-	endNotSent                   // nothing was sent and the claim was released
+	endNotSent                   // a read failed: nothing sent, claim released
+	endGone                      // the game is not live here (already dropped)
 )
 
 // endTimeout bounds the reads behind one GAME_END broadcast and one flag tick.
@@ -630,18 +640,24 @@ func (s *Server) endTimeout() time.Duration {
 	return endBroadcastTimeout
 }
 
-// seatUsers maps each seat of gameID to its user, from the user→game index
-// bound at MATCHED (it stays until dropGame).
+// seatUsers maps each seat of gameID to its user (a copy of gameUsers, bound
+// at MATCHED, kept until dropGame). O(seats), not O(connected users).
 func (s *Server) seatUsers(gameID string) map[uint8]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[uint8]string, 2)
-	for uid, games := range s.userGames {
-		if seat, ok := games[gameID]; ok {
-			out[seat] = uid
-		}
+	for seat, uid := range s.gameUsers[gameID] {
+		out[seat] = uid
 	}
 	return out
+}
+
+// indexGameUserLocked records uid at seat in the per-game index. s.mu held.
+func (s *Server) indexGameUserLocked(gameID string, seat uint8, uid string) {
+	if s.gameUsers[gameID] == nil {
+		s.gameUsers[gameID] = make(map[uint8]string, 2)
+	}
+	s.gameUsers[gameID][seat] = uid
 }
 
 // releaseGameEnd gives back a claim whose holder did not broadcast (#88).
@@ -687,6 +703,7 @@ func (s *Server) dropGame(gameID string) {
 			}
 		}
 	}
+	delete(s.gameUsers, gameID)
 	delete(s.joined, gameID)
 	delete(s.endBroadcast, gameID)
 	s.mu.Unlock()
