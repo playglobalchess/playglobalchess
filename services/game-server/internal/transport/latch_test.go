@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 )
 
 // #88: a GAME_END broadcast that does not go out must not latch the claim and
@@ -154,14 +155,48 @@ func TestBroadcastThatDoesNotGoOutReleasesTheClaim(t *testing.T) {
 	defer h.cancel()
 	ctx := context.Background()
 	_, _, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
-	if h.srv.broadcastGameEnd(gameID) { // the game is live, not ended
-		t.Fatal("broadcast a live game's end")
+	claimed := func(id string) bool {
+		h.srv.mu.Lock()
+		defer h.srv.mu.Unlock()
+		_, ok := h.srv.endBroadcast[id]
+		return ok
 	}
-	h.srv.mu.Lock()
-	_, claimed := h.srv.endBroadcast[gameID]
-	h.srv.mu.Unlock()
-	if claimed {
-		t.Fatal("the claim stayed latched after a broadcast that did not go out")
+	// A live game (not ended), and a game this node does not have.
+	for _, id := range []string{gameID, "f47ac10b-58cc-4372-a567-0e02b2c3d479"} {
+		if got := h.srv.broadcastGameEnd(id); got != endNotSent {
+			t.Fatalf("broadcast %s = %v, want endNotSent", id, got)
+		}
+		if claimed(id) {
+			t.Fatalf("the claim on %s stayed latched after a broadcast that did not go out", id)
+		}
+	}
+	// While another path holds it, a caller is told so and changes nothing.
+	h.srv.claimGameEnd(gameID)
+	if got := h.srv.broadcastGameEnd(gameID); got != endHeld {
+		t.Fatalf("broadcast with the claim held = %v, want endHeld", got)
+	}
+	if !claimed(gameID) {
+		t.Fatal("a caller that found the claim held released it")
+	}
+}
+
+// The GAME_END result comes from the session, not a store read: with every
+// store read failing, both seats still get the full result, and a seat that is
+// offline is still recorded as having missed it (review finding).
+func TestGameEndCarriesTheResultWhenStoreReadsFail(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	disconnect(cb)
+	h.srv.reg.store = failingLoadStore{h.store}
+	ca.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
+	ge := ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	if len(ge.GameEnd.ResultVector) != 2 || ge.GameEnd.ResultVector[seatA] != uint8(game.ResultLoss) || ge.GameEnd.ResultVector[seatB] != uint8(game.ResultWin) {
+		t.Fatalf("result = %v, want the resigner losing", ge.GameEnd.ResultVector)
+	}
+	if got := h.srv.takeMissedEnds("bob"); got[gameID] != seatB {
+		t.Fatalf("bob's missed endings = %v, want %s at seat %d", got, gameID, seatB)
 	}
 }
 
@@ -172,6 +207,7 @@ func TestTickerDropsAnEndedGameItCannotBroadcast(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
 	h.srv.flagInterval = 5 * time.Millisecond
+	h.srv.endReadTimeout = 20 * time.Millisecond // keeps the drop bound at 10 ticks
 	w := watchTickers(h)
 	ctx := context.Background()
 	_, _, gameID, seatA, _ := pair(t, h, ctx, "alice", "bob")

@@ -28,6 +28,8 @@ type Server struct {
 	// tickerExited, if set (tests only), is called when a game's flag ticker
 	// goroutine returns, so a leak test can see the ticker is gone (#88).
 	tickerExited func(gameID string)
+	// endReadTimeout overrides endBroadcastTimeout (tests only; 0 = default).
+	endReadTimeout time.Duration
 
 	mu    sync.Mutex
 	conns map[gameSeAT]Conn // (gameID, seatIdx) → the connection seated there
