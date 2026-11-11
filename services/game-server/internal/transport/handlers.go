@@ -281,13 +281,20 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 		return true
 	}
 	seat, seated := s.seatOf(c, p.GameID)
-	if !seated {
-		s.send(ctx, c, rejectMove(p.GameID, p.PlyExpected, codec.ReasonNotYourSeat))
-		return true
-	}
-	sess, ok := s.reg.Get(p.GameID)
-	if !ok {
-		s.send(ctx, c, rejectMove(p.GameID, p.PlyExpected, codec.ReasonUnknownGame))
+	sess, live := s.reg.Get(p.GameID)
+	if !seated || !live {
+		// Not a live game this connection is seated in. If it is an ENDED game
+		// the user played, its session was dropped at GAME_END: apply the
+		// duplicate-MOVE rule to the folded stream, so a resend of the move that
+		// ended the game is re-acked with the result (#122).
+		if s.moveOnEndedGame(ctx, c, st.userID, p) {
+			return true
+		}
+		reason := uint8(codec.ReasonUnknownGame)
+		if !seated {
+			reason = codec.ReasonNotYourSeat
+		}
+		s.send(ctx, c, rejectMove(p.GameID, p.PlyExpected, reason))
 		return true
 	}
 	// The session does the durable append BEFORE returning (persist-before-ack,
@@ -307,16 +314,26 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 		s.broadcastGameEnd(ctx, p.GameID)
 	case out.Accepted && out.Reacked:
 		// GS-7 §4: a re-ack is not news to the opponent, so MOVE_ACCEPTED goes
-		// to the SENDER only. (A resend after the game ended cannot reach here
-		// today: the session is dropped at GAME_END, #102.)
-		s.send(ctx, c, codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
+		// to the SENDER only.
+		acc := codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
 			GameID: p.GameID, Ply: out.Ply, UCI: out.UCI, ClockAfterMs: out.ClockAfterMs,
-		}})
-		// If the re-acked move ended the game, the sender also gets GAME_END
-		// again (#89, #122): its first one may be what got lost.
+		}}
+		s.send(ctx, c, acc)
 		if out.EndedGame {
-			if sp, err := sess.StateSnapshot(ctx); err == nil && sp.Ended {
-				s.send(ctx, c, gameEndMsg(p.GameID, sp.ResultVector, sp.Terminal))
+			// The re-acked move ended the game, and the game is still live here,
+			// so its first ack failed: the batch committed but the store
+			// reported an error ("move not persisted"), and the opponent never
+			// heard of this move or the end (#89). Tell the opponent the move,
+			// then broadcast GAME_END and drop the game, exactly once.
+			if cc, present := s.connFor(p.GameID, 1-seat); present {
+				s.send(ctx, cc, acc)
+			}
+			if !s.broadcastGameEnd(ctx, p.GameID) {
+				// Another path is already broadcasting this end; make sure the
+				// sender gets it (its first one may be what got lost).
+				if sp, err := sess.StateSnapshot(ctx); err == nil && sp.Ended {
+					s.send(ctx, c, gameEndMsg(p.GameID, sp.ResultVector, sp.Terminal))
+				}
 			}
 		}
 	case out.Accepted:
@@ -503,17 +520,19 @@ func mapSessionErr(gameID string, err error) codec.ServerMsg {
 // (claimGameEnd) so that when a terminal move and the flag tick (or two ending
 // paths) resolve near-simultaneously, exactly ONE goroutine broadcasts + drops —
 // a client never receives two GAME_END frames for one game (reviewer finding).
-func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
+// It reports whether THIS call broadcast the end (false: another path claimed
+// it, or the game is gone or not ended).
+func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) bool {
 	if !s.claimGameEnd(gameID) {
-		return // another goroutine already broadcast this game's end.
+		return false // another goroutine already broadcast this game's end.
 	}
 	snap, ok := s.reg.Get(gameID)
 	if !ok {
-		return
+		return false
 	}
 	sp, err := snap.StateSnapshot(ctx)
 	if err != nil || !sp.Ended {
-		return
+		return false
 	}
 	rv, term, users := s.endingResult(ctx, gameID, sp)
 	msg := gameEndMsg(gameID, rv, term)
@@ -532,6 +551,7 @@ func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
 	// persists in the store, and endedState rebuilds a read-only ended view from
 	// it for a late reconnect (missed ending) or a RESYNC (#102).
 	s.dropGame(gameID)
+	return true
 }
 
 // claimGameEnd returns true to exactly ONE caller per game — the one that should

@@ -170,3 +170,34 @@ func (s *Server) resyncEnded(ctx context.Context, c Conn, uid, gameID string) {
 // errNoSuchGame is the one UNKNOWN_GAME message for every RESYNC the caller may
 // not see (not seated, not ended here, or no such game).
 const errNoSuchGame = "no such game"
+
+// moveOnEndedGame answers a MOVE for a game that is not live on this node, when
+// the stream says it ENDED and uid was seated in it (#122): the duplicate-MOVE
+// rule against the folded end state. A resend of the move that ended the game
+// gets MOVE_ACCEPTED and GAME_END again, to the sender only (it is not news to
+// the opponent; the sender's first copies may be what got lost). Any other ply
+// gets its MOVE_REJECTED (GAME_OVER for a new move). It reports false, sending
+// nothing, when the caller did not play an ended game with this id, so
+// handleMove keeps its NOT_YOUR_SEAT / UNKNOWN_GAME answer.
+func (s *Server) moveOnEndedGame(ctx context.Context, c Conn, uid string, p *codec.MovePayload) bool {
+	out, st, seated, err := s.reg.EndedMove(ctx, p.GameID, uid, p.PlyExpected, p.UCI)
+	switch {
+	case err != nil && !errors.Is(err, errNotEnded):
+		// Retryable, and not "this game does not exist" (see resyncEnded).
+		log.Printf("transport: MOVE on ended game %s: %v", p.GameID, err)
+		s.send(ctx, c, errorMsg(codec.ECInternal, "could not read game state"))
+		return true
+	case !seated || err != nil:
+		return false
+	case out.Rejected:
+		s.send(ctx, c, rejectMove(p.GameID, out.PlyExpected, uint8(out.Reason)))
+	case out.Accepted:
+		s.send(ctx, c, codec.ServerMsg{Type: codec.SMMoveAccepted, MoveAccepted: &codec.MoveAcceptedPayload{
+			GameID: p.GameID, Ply: out.Ply, UCI: out.UCI, ClockAfterMs: out.ClockAfterMs,
+		}})
+		if out.EndedGame {
+			s.send(ctx, c, gameEndMsg(p.GameID, st.ResultVector, st.Termination))
+		}
+	}
+	return true
+}

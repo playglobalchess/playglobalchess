@@ -279,16 +279,15 @@ func (r *Registry) loadStream(ctx context.Context, gameID string) ([]game.Event,
 // errNotEnded is EndedView's answer for a game that exists but has not ended.
 var errNotEnded = errors.New("transport: game has not ended")
 
-// EndedView rebuilds an ENDED game's projection, as seen by user uid, from the
-// durable stream (#102), without standing up a live session (no actor, no
-// ticker, nothing to drop). seated is false, with NO engine replay, if the game
-// does not exist or uid was not seated in it (PlayerJoined), so a RESYNC for
-// someone else's game id costs one stream read, not a fold. errNotEnded if the
-// game is still running.
-func (r *Registry) EndedView(ctx context.Context, gameID, uid string) (snap session.Snapshot, seat uint8, seated bool, err error) {
+// loadEnded folds an ENDED game from the durable stream for user uid (#102),
+// without standing up a live session. seated is false, with NO engine replay,
+// if the game does not exist or uid was not seated in it (PlayerJoined), so a
+// request for someone else's game id costs one stream read, not a fold.
+// errNotEnded if the game is still running.
+func (r *Registry) loadEnded(ctx context.Context, gameID, uid string) (st game.State, opts game.FoldOptions, seat uint8, seated bool, err error) {
 	events, err := r.loadStream(ctx, gameID)
 	if err != nil {
-		return session.Snapshot{}, 0, false, err
+		return game.State{}, opts, 0, false, err
 	}
 	tcID := ""
 	for _, ev := range events {
@@ -300,22 +299,57 @@ func (r *Registry) EndedView(ctx context.Context, gameID, uid string) (snap sess
 		}
 	}
 	if !seated {
-		return session.Snapshot{}, 0, false, nil
+		return game.State{}, opts, 0, false, nil
 	}
 	tc, err := r.resolver.Resolve(tcID)
 	if err != nil {
-		return session.Snapshot{}, seat, true, err
+		return game.State{}, opts, seat, true, err
 	}
-	st, err := game.FoldWithEngine(ctx, events, game.FoldOptions{TimeControl: tc}, r.oracle)
+	opts = game.FoldOptions{TimeControl: tc}
+	st, err = game.FoldWithEngine(ctx, events, opts, r.oracle)
 	if err != nil {
-		return session.Snapshot{}, seat, true, err
+		return game.State{}, opts, seat, true, err
 	}
 	if st.Phase != game.PhaseEnded {
-		return session.Snapshot{}, seat, true, errNotEnded
+		return game.State{}, opts, seat, true, errNotEnded
 	}
-	now := time.Now()
+	return st, opts, seat, true, nil
+}
+
+func (r *Registry) clockNow() time.Time {
 	if r.now != nil {
-		now = r.now()
+		return r.now()
 	}
-	return session.SnapshotOf(st, now, tc), seat, true, nil
+	return time.Now()
+}
+
+// EndedView is the ended game's projection as seen by uid (see loadEnded).
+func (r *Registry) EndedView(ctx context.Context, gameID, uid string) (snap session.Snapshot, seat uint8, seated bool, err error) {
+	st, opts, seat, seated, err := r.loadEnded(ctx, gameID, uid)
+	if err != nil || !seated {
+		return session.Snapshot{}, seat, seated, err
+	}
+	return session.SnapshotOf(st, r.clockNow(), opts.TimeControl), seat, true, nil
+}
+
+// EndedMove applies the duplicate-MOVE rule (PROTOCOL §5, GAME-SERVER §3.6) to
+// a MOVE that uid sent for an ENDED game after its live session was dropped
+// (#122): the same decideMove the live session runs, against the folded end
+// state, so a resend of a committed ply is re-acked (EndedGame set when that
+// move ended the game) and anything else is rejected (GAME_OVER, STALE_PLY,
+// NOT_YOUR_SEAT). Read-only: an ended game decides no events.
+func (r *Registry) EndedMove(ctx context.Context, gameID, uid string, plyExpected uint32, uci string) (out game.MoveOutcome, st game.State, seated bool, err error) {
+	st, opts, seat, seated, err := r.loadEnded(ctx, gameID, uid)
+	if err != nil || !seated {
+		return game.MoveOutcome{}, st, seated, err
+	}
+	d, err := game.Decide(ctx, st, game.CmdMove{Seat: seat, PlyExpected: plyExpected, UCI: uci},
+		uint64(r.clockNow().UnixMilli()), opts, r.oracle)
+	if err != nil {
+		return game.MoveOutcome{}, st, true, err
+	}
+	if len(d.Events) != 0 {
+		return game.MoveOutcome{}, st, true, fmt.Errorf("transport: an ended game decided %d events", len(d.Events))
+	}
+	return d.Move, st, true, nil
 }

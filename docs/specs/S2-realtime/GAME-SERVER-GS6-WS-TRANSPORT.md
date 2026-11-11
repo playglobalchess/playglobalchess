@@ -278,7 +278,8 @@ closed by) the §4A v1.1 amendment:
 |---|---|
 | First frame is not AUTHENTICATE | reject + close (no anonymous play). |
 | MOVE on a game this conn is not seated in | `MOVE_REJECTED{NOT_YOUR_SEAT}` (the session/pipeline already enforces; the transport routes by its seat map). |
-| Persist fails (pipeline error) | NO ack; `ERROR{INTERNAL}` — the move did not happen (NFR-7). |
+| Persist fails (pipeline error) | NO ack; `ERROR{INTERNAL}`. The move may still have committed (an ambiguous store error, #95); the client resends it, which the duplicate rule re-acks. If that move ended the game and the game is still live here, its first ack never went out, so the opponent is sent the `MOVE_ACCEPTED` too and `GAME_END` is broadcast to both seats once, then the game is dropped (#89). |
+| `MOVE` on an ended game (session dropped) | for a player seated in it, the duplicate-MOVE rule against the game rebuilt from the stream: a resend of a committed ply is re-acked, plus `GAME_END` (sender only) if that move ended the game; a new ply is `GAME_OVER`. Others keep `NOT_YOUR_SEAT` (#122). |
 | Disconnect mid-game | seat unbound, clock keeps running; reconnect → `STATE`; flag if the clock expires first. |
 | Game ends while a seat is offline | that seat's next `AUTHENTICATE` (within 24 h, same node) pushes `STATE{status=ENDED, result}` once; `RESYNC` returns it at any time (§3.4, #102). |
 | MATCHED seat never joins (ghost-claim) | join-timeout → abort the game (resolves the GS-5 residual). |

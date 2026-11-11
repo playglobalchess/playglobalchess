@@ -127,7 +127,7 @@ void    pgc_free(uint8_t* ptr, size_t len);   // Rust frees what Rust allocated
 | Stale/racing move | `MOVE_REJECTED{STALE_PLY, ply_expected=server's current}` (SPEC-S2-PROTOCOL §5). |
 | Illegal move | engine rejects → `MOVE_REJECTED{ILLEGAL}`; no event. |
 | Move after game end | `MOVE_REJECTED{GAME_OVER}`. |
-| Duplicate MOVE (retry) | idempotent on `(game_id, ply_expected)`; re-ack, no second event. |
+| Duplicate MOVE (retry) | idempotent on `(game_id, ply_expected)`; re-ack, no second event. **The re-ack rule wins over the phase:** a resend of a committed ply is re-acked even after the game ended, and a resend of the move that ENDED the game also gets `GAME_END`. Only a new (uncommitted) ply on an ended game gets `GAME_OVER` (#122). |
 | Disconnect mid-game | clock keeps running; reconnect → `STATE` resync; flag if clock expires first. |
 | Node failure mid-game | another node resumes from the event store (fold); no game loss (NFR-2). |
 | Persist fails after validation | do NOT ack; surface `ERROR{INTERNAL}`; the move did not happen (no ack-before-persist). |
