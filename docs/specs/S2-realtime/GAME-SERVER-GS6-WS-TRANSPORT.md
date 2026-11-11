@@ -215,6 +215,19 @@ players both disconnect (the session + goroutines + indices are freed, not
 leaked). Without this driver a disconnected or stalled player's clock would run
 forever and the game would hang; it is NOT a deferred limitation.
 
+**The end broadcast cannot latch (#88).** One end path claims the right to
+broadcast `GAME_END` and drop the game, so a client never gets two. That
+broadcast reads on a server-owned context with a 5 s bound, never on the
+triggering connection's, so a mover who disconnects right after the ending
+cannot cancel the opponent's `GAME_END`. A call that does not broadcast
+releases the claim. The ticker also asks whether the game is OVER, not only
+whether this tick ended it. So an ended game whose broadcast did not go out is
+broadcast by the next tick, and then dropped. If that keeps failing, the ticker
+drops the ended game after its 10-failure bound. The result stays in the
+stream, where RESYNC serves it (§3.4). In every case the session, the seat and
+user indices, the claim, the join signal and the ticker goroutine are
+reclaimed.
+
 `PING{t}` → `PONG{t, server_t}` (liveness + RTT). On close, the connection's
 seat is unbound (via `unbindAll`, which only drops bindings still pointing at
 that connection, so a reconnect's rebind survives) but the game persists and its

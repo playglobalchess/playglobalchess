@@ -22,6 +22,10 @@ const defaultJoinTTL = 30 * time.Second
 // resolution for forfeit purposes while being cheap (one actor command/game/sec).
 const defaultFlagInterval = 1 * time.Second
 
+// endBroadcastTimeout bounds the reads behind one GAME_END broadcast (and one
+// flag tick). They run on the server's context, not a connection's (#88).
+const endBroadcastTimeout = 5 * time.Second
+
 // --- SEEK -> matchmaking -> MATCHED ----------------------------------------
 
 func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec.SeekPayload) bool {
@@ -140,6 +144,9 @@ func (s *Server) armFlagTicker(gameID string) {
 	go func() {
 		t := time.NewTicker(iv)
 		defer t.Stop()
+		if s.tickerExited != nil {
+			defer s.tickerExited(gameID)
+		}
 		consecutiveErrs := 0
 		const maxConsecutiveErrs = 10
 		for range t.C {
@@ -147,7 +154,9 @@ func (s *Server) armFlagTicker(gameID string) {
 			if !ok {
 				return // game ended/dropped by some path — stop the ticker.
 			}
-			ended, err := sess.TickFlagCheck(context.Background())
+			ctx, cancel := context.WithTimeout(s.reg.rootCtx, endBroadcastTimeout)
+			over, err := sess.TickGameOver(ctx)
+			cancel()
 			if err != nil {
 				// A persistent store/engine outage makes this recur every tick.
 				// Count consecutive failures and give up after a bound rather than
@@ -162,11 +171,25 @@ func (s *Server) armFlagTicker(gameID string) {
 				}
 				continue
 			}
-			consecutiveErrs = 0
-			if ended {
-				s.broadcastGameEnd(context.Background(), gameID)
-				return
+			if over {
+				// Ended by this tick, or by another path whose GAME_END broadcast
+				// did not go out (#88): (re)try it. The ticker stops once the game
+				// is dropped (the next tick sees it gone). If it keeps failing,
+				// drop the game anyway after the error bound: its result stays in
+				// the stream (RESYNC serves it, #102), and the session and this
+				// goroutine are reclaimed rather than leaked.
+				if s.broadcastGameEnd(gameID) {
+					return
+				}
+				consecutiveErrs++
+				if consecutiveErrs >= maxConsecutiveErrs {
+					log.Printf("transport: GAME_END for %s never broadcast; dropping the ended game", gameID)
+					s.dropGame(gameID)
+					return
+				}
+				continue
 			}
+			consecutiveErrs = 0
 		}
 	}()
 }
@@ -315,7 +338,7 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 	case out.Flagged:
 		// The move arrived after the clock expired: the session appended the
 		// ClockFlagged+GameEnded ending. Broadcast GAME_END to both seats.
-		s.broadcastGameEnd(ctx, p.GameID)
+		s.broadcastGameEnd(p.GameID)
 	case out.Accepted && out.Reacked:
 		// GS-7 §4: a re-ack is not news to the opponent, so MOVE_ACCEPTED goes
 		// to the SENDER only.
@@ -335,7 +358,7 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 			if cc, present := s.connFor(p.GameID, 1-seat); present {
 				s.send(ctx, cc, acc)
 			}
-			if !s.broadcastGameEnd(ctx, p.GameID) {
+			if !s.broadcastGameEnd(p.GameID) {
 				// Not broadcast by this call: another path holds the claim (and
 				// may have failed after taking it, #88). The sender must still
 				// learn the result; a second GAME_END is harmless, none is not.
@@ -357,7 +380,7 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 		}
 		// The move and its GameEnded were one batch; announce the end.
 		if out.EndedGame {
-			s.broadcastGameEnd(ctx, p.GameID)
+			s.broadcastGameEnd(p.GameID)
 		}
 	}
 	return true
@@ -434,7 +457,7 @@ func (s *Server) handleEnding(ctx context.Context, c Conn, gameID string, kind e
 		}
 	}
 	if snap.Ended {
-		s.broadcastGameEnd(ctx, gameID)
+		s.broadcastGameEnd(gameID)
 		return true
 	}
 	other := uint8(1) - seat
@@ -530,16 +553,29 @@ func mapSessionErr(gameID string, err error) codec.ServerMsg {
 // a client never receives two GAME_END frames for one game (reviewer finding).
 // It reports whether THIS call broadcast the end (false: another path holds
 // the claim, or the game is gone or not ended).
-func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) bool {
+//
+// #88: the reads run on a server-owned context bounded by endBroadcastTimeout,
+// never on the triggering connection's (a mover who disconnects right after
+// the ending must not cancel the opponent's GAME_END), and a call that does not
+// broadcast RELEASES the claim, so the ending can be retried (the flag ticker
+// does, see armFlagTicker) instead of being latched and leaked for good.
+func (s *Server) broadcastGameEnd(gameID string) bool {
 	if !s.claimGameEnd(gameID) {
-		return false // another goroutine already broadcast this game's end.
+		return false // another goroutine holds the claim (broadcasting now).
 	}
+	ctx, cancel := context.WithTimeout(s.reg.rootCtx, endBroadcastTimeout)
+	defer cancel()
 	snap, ok := s.reg.Get(gameID)
 	if !ok {
+		s.releaseGameEnd(gameID)
 		return false
 	}
 	sp, err := snap.StateSnapshot(ctx)
 	if err != nil || !sp.Ended {
+		if err != nil {
+			log.Printf("transport: GAME_END for %s not broadcast (will retry): %v", gameID, err)
+		}
+		s.releaseGameEnd(gameID)
 		return false
 	}
 	rv, term, users := s.endingResult(ctx, gameID, sp)
@@ -560,6 +596,13 @@ func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) bool {
 	// it for a late reconnect (missed ending) or a RESYNC (#102).
 	s.dropGame(gameID)
 	return true
+}
+
+// releaseGameEnd gives back a claim whose holder did not broadcast (#88).
+func (s *Server) releaseGameEnd(gameID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.endBroadcast, gameID)
 }
 
 // claimGameEnd returns true to exactly ONE caller per game — the one that should

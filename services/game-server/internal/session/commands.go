@@ -101,3 +101,12 @@ func (s *Session) TickFlagCheck(ctx context.Context) (bool, error) {
 	d, _, err := s.run(ctx, game.CmdTickFlag{})
 	return err == nil && d.Effect == game.EffectEnded, err
 }
+
+// TickGameOver runs the same flag check and reports whether the game is OVER,
+// whether this tick ended it or some other path already had (#88): the ticker
+// uses it to repair an ending whose GAME_END broadcast did not go out, instead
+// of ticking an ended session forever.
+func (s *Session) TickGameOver(ctx context.Context) (bool, error) {
+	d, snap, err := s.run(ctx, game.CmdTickFlag{})
+	return err == nil && (d.Effect == game.EffectEnded || snap.Ended), err
+}
