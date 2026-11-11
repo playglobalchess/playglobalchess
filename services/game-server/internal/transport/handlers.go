@@ -622,6 +622,11 @@ func (s *Server) claimGameEnd(gameID string) bool {
 // the seat→conn bindings and the userID→game reconnection index (so a later
 // AUTHENTICATE does not try to resync an ended game). Idempotent.
 func (s *Server) dropGame(gameID string) {
+	// Unregister the session FIRST, then clear the indices and the end claim. In
+	// the other order, a late end path (the ticker's retry, #88) could re-claim
+	// the cleared claim while the ended session is still registered, find no seat
+	// bindings, and record both players as having missed an ending they saw.
+	s.reg.Drop(gameID)
 	s.mu.Lock()
 	for gs := range s.conns {
 		if gs.gameID == gameID {
@@ -639,7 +644,6 @@ func (s *Server) dropGame(gameID string) {
 	delete(s.joined, gameID)
 	delete(s.endBroadcast, gameID)
 	s.mu.Unlock()
-	s.reg.Drop(gameID)
 }
 
 // endingResult reads the authoritative result vector + termination from the
