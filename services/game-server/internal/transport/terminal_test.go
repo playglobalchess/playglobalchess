@@ -40,11 +40,16 @@ func playAllButLast(t *testing.T, white, black *fakeConn, gameID string, line []
 }
 
 // ambiguousStore commits the first batch that ends the game but reports an
-// error, like a store write that timed out after it succeeded (#89, #95).
+// error, like a store write that timed out after it succeeded (#89, #95). With
+// failReread, the session's re-read right after that error fails once too, so
+// the session cannot confirm the commit at the time.
 type ambiguousStore struct {
 	game.EventStore
-	mu    sync.Mutex
-	fired bool
+	failReread bool
+
+	mu        sync.Mutex
+	fired     bool
+	loadFails int
 }
 
 func (a *ambiguousStore) AppendBatch(ctx context.Context, stream string, seq uint32, evs []game.Event) error {
@@ -56,10 +61,26 @@ func (a *ambiguousStore) AppendBatch(ctx context.Context, stream string, seq uin
 	for _, ev := range evs {
 		if ev.Type == game.EvGameEnded && !a.fired {
 			a.fired = true
+			if a.failReread {
+				a.loadFails = 1
+			}
 			return errors.New("store: timeout (the write did commit)")
 		}
 	}
 	return nil
+}
+
+func (a *ambiguousStore) Load(ctx context.Context, stream string) ([]game.Event, error) {
+	a.mu.Lock()
+	fail := a.loadFails > 0
+	if fail {
+		a.loadFails--
+	}
+	a.mu.Unlock()
+	if fail {
+		return nil, errors.New("store: unavailable")
+	}
+	return a.EventStore.Load(ctx, stream)
 }
 
 func countEvents(t *testing.T, h *harness, gameID string, typ game.EventType) int {
@@ -77,78 +98,114 @@ func countEvents(t *testing.T, h *harness, gameID string, typ game.EventType) in
 	return n
 }
 
-// #89: the batch with the ending commits but the store reports an error, so
-// the mover is told "move not persisted" and resends. The resend must announce
-// the move and the end to BOTH seats once, with the engine's termination, and
-// drop the game; nothing may flag it later.
-func TestTerminalMoveAmbiguousCommitThenResend(t *testing.T) {
+// wantOneEnd checks both seats got exactly one GAME_END with term and rv (for
+// white, black), and that the game was dropped with one GameEnded and no flag.
+func wantOneEnd(t *testing.T, h *harness, gameID string, white, black *fakeConn, term game.Termination, rv []uint8) {
+	t.Helper()
+	for _, c := range []*fakeConn{white, black} {
+		ge := c.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+		if game.Termination(ge.GameEnd.Termination) != term {
+			t.Fatalf("termination = 0x%02x, want 0x%02x", ge.GameEnd.Termination, uint8(term))
+		}
+		if len(ge.GameEnd.ResultVector) != 2 || ge.GameEnd.ResultVector[0] != rv[0] || ge.GameEnd.ResultVector[1] != rv[1] {
+			t.Fatalf("result = %v, want %v", ge.GameEnd.ResultVector, rv)
+		}
+	}
+	waitUntil(t, time.Second, "the game to be dropped", func() bool {
+		_, live := h.srv.reg.Get(gameID)
+		return !live
+	})
+	h.clk.add(time.Hour) // time passes: nothing flags the ended game
+	time.Sleep(50 * time.Millisecond)
+	if n := countEvents(t, h, gameID, game.EvGameEnded); n != 1 {
+		t.Fatalf("%d GameEnded events, want 1", n)
+	}
+	if n := countEvents(t, h, gameID, game.EvClockFlagged); n != 0 {
+		t.Fatalf("%d ClockFlagged events after the end, want 0", n)
+	}
+	white.noServerMsg(t, codec.SMGameEnd, 50*time.Millisecond)
+	black.noServerMsg(t, codec.SMGameEnd, 0)
+}
+
+var (
+	blackWins = []uint8{uint8(game.ResultLoss), uint8(game.ResultWin)}
+	drawn     = []uint8{uint8(game.ResultDraw), uint8(game.ResultDraw)}
+)
+
+// #89: the ending batch commits but the store reports an error. The session
+// re-reads the stream, sees its events, and the ending is announced at once,
+// with no client resend (PROTOCOL forbids one): MOVE_ACCEPTED and one GAME_END
+// to both seats with the engine's termination, then the game is dropped.
+func TestAmbiguousEndingCommitIsConfirmed(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		line []string
+		line []string // nil: White resigns at the start
 		term game.Termination
-		// result for (white, black)
-		rv []uint8
+		rv   []uint8
 	}{
-		{"mate", foolsMate, game.TermMate, []uint8{uint8(game.ResultLoss), uint8(game.ResultWin)}},
-		{"stalemate", loydStalemate, game.TermStalemate, []uint8{uint8(game.ResultDraw), uint8(game.ResultDraw)}},
+		{"mate", foolsMate, game.TermMate, blackWins},
+		{"stalemate", loydStalemate, game.TermStalemate, drawn},
+		{"resign", nil, game.TermResign, blackWins},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			defer h.cancel()
-			h.srv.flagInterval = 10 * time.Millisecond
 			amb := &ambiguousStore{EventStore: h.store}
 			h.srv.reg.store = amb
 			ctx := context.Background()
 			ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
 			white, black := whiteBlack(ca, cb, seatA, seatB)
-			mover, other := playAllButLast(t, white, black, gameID, tc.line)
-			last := tc.line[len(tc.line)-1]
-			ply := uint32(len(tc.line))
-
-			move(t, mover, gameID, ply, last)
-			if e := mover.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECInternal {
-				t.Fatalf("first attempt: error 0x%02x, want INTERNAL", e.Error.Code)
+			if tc.line == nil {
+				white.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
+			} else {
+				mover, other := playAllButLast(t, white, black, gameID, tc.line)
+				ply, last := uint32(len(tc.line)), tc.line[len(tc.line)-1]
+				move(t, mover, gameID, ply, last)
+				for _, c := range []*fakeConn{mover, other} {
+					if acc := c.waitForServer(t, codec.SMMoveAccepted, 2*time.Second); acc.MoveAccepted.Ply != ply {
+						t.Fatalf("MOVE_ACCEPTED ply = %d, want %d", acc.MoveAccepted.Ply, ply)
+					}
+				}
 			}
+			wantOneEnd(t, h, gameID, white, black, tc.term, tc.rv)
 			if !amb.fired {
 				t.Fatal("the store wrapper never saw the ending batch")
 			}
-
-			move(t, mover, gameID, ply, last) // the client's resend
-			acc := mover.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-			if acc.MoveAccepted.Ply != ply || acc.MoveAccepted.UCI != last {
-				t.Fatalf("re-ack = %+v, want ply %d %s", acc.MoveAccepted, ply, last)
-			}
-			// The opponent learns the move itself first, then the end.
-			oacc := other.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
-			if oacc.MoveAccepted.Ply != ply || oacc.MoveAccepted.UCI != last {
-				t.Fatalf("opponent MOVE_ACCEPTED = %+v, want ply %d %s", oacc.MoveAccepted, ply, last)
-			}
-			for _, c := range []*fakeConn{mover, other} {
-				ge := c.waitForServer(t, codec.SMGameEnd, 2*time.Second)
-				if game.Termination(ge.GameEnd.Termination) != tc.term {
-					t.Fatalf("termination = 0x%02x, want 0x%02x", ge.GameEnd.Termination, uint8(tc.term))
-				}
-				if len(ge.GameEnd.ResultVector) != 2 || ge.GameEnd.ResultVector[0] != tc.rv[0] || ge.GameEnd.ResultVector[1] != tc.rv[1] {
-					t.Fatalf("result = %v, want %v", ge.GameEnd.ResultVector, tc.rv)
-				}
-			}
-			waitUntil(t, time.Second, "the game to be dropped", func() bool {
-				_, live := h.srv.reg.Get(gameID)
-				return !live
-			})
-			// Time passes: nothing flags the ended game.
-			h.clk.add(time.Hour)
-			time.Sleep(50 * time.Millisecond)
-			if n := countEvents(t, h, gameID, game.EvGameEnded); n != 1 {
-				t.Fatalf("%d GameEnded events, want 1", n)
-			}
-			if n := countEvents(t, h, gameID, game.EvClockFlagged); n != 0 {
-				t.Fatalf("%d ClockFlagged events after the terminal move, want 0", n)
-			}
-			mover.noServerMsg(t, codec.SMGameEnd, 50*time.Millisecond) // exactly once
-			other.noServerMsg(t, codec.SMGameEnd, 0)
+			white.noServerMsg(t, codec.SMError, 0)
+			black.noServerMsg(t, codec.SMError, 0)
 		})
 	}
+}
+
+// #89, when the session cannot confirm the commit at the time (the re-read
+// fails too): the mover gets INTERNAL and the opponent hears nothing. A later
+// resend of that move (from a client that does resend) is re-acked, and then
+// the opponent gets the move and both get one GAME_END.
+func TestAmbiguousEndingUnconfirmedThenResend(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	amb := &ambiguousStore{EventStore: h.store, failReread: true}
+	h.srv.reg.store = amb
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	_, _ = playAllButLast(t, white, black, gameID, foolsMate)
+
+	move(t, black, gameID, 4, "d8h4")
+	if e := black.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECInternal {
+		t.Fatalf("first attempt: error 0x%02x, want INTERNAL", e.Error.Code)
+	}
+	white.noServerMsg(t, codec.SMMoveAccepted, 50*time.Millisecond) // the bug: White never hears
+	white.noServerMsg(t, codec.SMGameEnd, 0)
+
+	move(t, black, gameID, 4, "d8h4")
+	if acc := black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second); acc.MoveAccepted.UCI != "d8h4" {
+		t.Fatalf("re-ack = %+v", acc.MoveAccepted)
+	}
+	if acc := white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second); acc.MoveAccepted.Ply != 4 {
+		t.Fatalf("opponent MOVE_ACCEPTED ply = %d, want 4", acc.MoveAccepted.Ply)
+	}
+	wantOneEnd(t, h, gameID, white, black, game.TermMate, blackWins)
 }
 
 // #122: after the game ended and its session was dropped, a resend of the
@@ -204,6 +261,12 @@ func TestMoveAfterEnd_DuplicateRule(t *testing.T) {
 		}
 	}
 
+	// The other seat resending the mating ply: NOT_YOUR_SEAT (it is Black's move).
+	move(t, white, gameID, 4, "d8h4")
+	if r := white.waitForServer(t, codec.SMMoveRejected, 2*time.Second); r.MoveRejected.Reason != codec.ReasonNotYourSeat {
+		t.Fatalf("other seat: reason 0x%02x, want NOT_YOUR_SEAT", r.MoveRejected.Reason)
+	}
+
 	// A reconnected sender (no seat binding) is served the same way.
 	disconnect(black)
 	blackUser := "bob"
@@ -220,5 +283,26 @@ func TestMoveAfterEnd_DuplicateRule(t *testing.T) {
 	move(t, eve, gameID, 4, "d8h4")
 	if r := eve.waitForServer(t, codec.SMMoveRejected, 2*time.Second); r.MoveRejected.Reason != codec.ReasonNotYourSeat {
 		t.Fatalf("stranger: reason 0x%02x, want NOT_YOUR_SEAT", r.MoveRejected.Reason)
+	}
+}
+
+// A store failure while answering a MOVE on an ended game is a retryable
+// INTERNAL, not "not your seat".
+func TestMoveAfterEnd_StoreFailureIsInternal(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
+	ca.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
+	ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	cb.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	waitUntil(t, time.Second, "the game to be dropped", func() bool {
+		_, live := h.srv.reg.Get(gameID)
+		return !live
+	})
+	h.srv.reg.store = failingLoadStore{h.store}
+	move(t, cb, gameID, 1, "e2e4")
+	if e := cb.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECInternal {
+		t.Fatalf("error code = 0x%02x, want INTERNAL", e.Error.Code)
 	}
 }
