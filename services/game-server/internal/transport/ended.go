@@ -150,7 +150,11 @@ func (s *Server) pushMissedEnds(ctx context.Context, c Conn, uid string) {
 // ERROR{UNKNOWN_GAME} with the same message handleResync uses for a live game
 // the caller is not seated in, so a RESYNC cannot tell other players' games
 // (live, ended or unknown) apart.
-func (s *Server) resyncEnded(ctx context.Context, c Conn, uid, gameID string) {
+func (s *Server) resyncEnded(ctx context.Context, c Conn, st *connState, gameID string) {
+	if !s.allowLookup(ctx, c, st) {
+		return
+	}
+	uid := st.userID
 	snap, seat, seated, err := s.reg.EndedView(ctx, gameID, uid)
 	switch {
 	case err != nil && !errors.Is(err, errNotEnded):
@@ -179,8 +183,11 @@ const errNoSuchGame = "no such game"
 // gets its MOVE_REJECTED (GAME_OVER for a new move). It reports false, sending
 // nothing, when the caller did not play an ended game with this id, so
 // handleMove keeps its NOT_YOUR_SEAT / UNKNOWN_GAME answer.
-func (s *Server) moveOnEndedGame(ctx context.Context, c Conn, uid string, p *codec.MovePayload) bool {
-	out, st, seated, err := s.reg.EndedMove(ctx, p.GameID, uid, p.PlyExpected, p.UCI)
+func (s *Server) moveOnEndedGame(ctx context.Context, c Conn, cs *connState, p *codec.MovePayload) bool {
+	if !s.allowLookup(ctx, c, cs) {
+		return true
+	}
+	out, st, seated, err := s.reg.EndedMove(ctx, p.GameID, cs.userID, p.PlyExpected, p.UCI)
 	switch {
 	case err != nil && !errors.Is(err, errNotEnded):
 		// Retryable, and not "this game does not exist" (see resyncEnded).
@@ -199,5 +206,30 @@ func (s *Server) moveOnEndedGame(ctx context.Context, c Conn, uid string, p *cod
 			s.send(ctx, c, gameEndMsg(p.GameID, st.ResultVector, st.Termination))
 		}
 	}
+	return true
+}
+
+// Lookups of games that are not live here read the whole stream from the store
+// (and fold it, for a game the caller played), so each connection gets a small
+// budget: lookupBudget per lookupWindow. A client needs a few (a reconnect, a
+// lost ack); past that it is a bug or abuse, and gets ERROR{RATE_LIMITED}
+// without touching the store. Connection-wide limits are #104.
+const (
+	lookupBudget = 20
+	lookupWindow = time.Minute
+)
+
+// allowLookup spends one lookup from st's budget, or replies RATE_LIMITED and
+// reports false. Only st's own connection goroutine calls it.
+func (s *Server) allowLookup(ctx context.Context, c Conn, st *connState) bool {
+	now := s.now()
+	if now.Sub(st.lookupWindow) >= lookupWindow {
+		st.lookupWindow, st.lookups = now, 0
+	}
+	if st.lookups >= lookupBudget {
+		s.send(ctx, c, errorMsg(codec.ECRateLimited, "too many lookups of games not in play"))
+		return false
+	}
+	st.lookups++
 	return true
 }

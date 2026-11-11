@@ -68,6 +68,10 @@ var (
 // maxConflictRetries bounds reload-and-redecide on ErrSeqConflict.
 const maxConflictRetries = 8
 
+// rereadRetries bounds the stream re-reads that confirm an ambiguous commit
+// (50, 100 ms apart: about 150 ms worst case).
+const rereadRetries = 3
+
 // NewSession loads the game's stream and folds it with the engine. It then
 // makes the stream current before serving (§3.5, §3.6): a half-terminal stream
 // gets its missing GameEnded, and a LIVE game whose clock has not started gets
@@ -185,9 +189,22 @@ func (s *Session) exec(ctx context.Context, cmd game.Command) (game.Decision, er
 // the command as not done, as before. The match compares each event by value;
 // a store whose round trip normalised a body would only fall back to that.
 func (s *Session) committedAnyway(ctx context.Context, at uint32, evs []game.Event) bool {
-	events, err := s.store.Load(ctx, s.stream)
-	if err != nil {
-		return false
+	// The outage that made the write ambiguous often fails the next read too,
+	// so retry the read a few times (bounded: the actor is blocked meanwhile).
+	var events []game.Event
+	var err error
+	for i, wait := 0, 50*time.Millisecond; ; i, wait = i+1, wait*2 {
+		if events, err = s.store.Load(ctx, s.stream); err == nil {
+			break
+		}
+		if i >= rereadRetries-1 {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
 	}
 	st, err := game.FoldWithEngine(ctx, events, s.opts, s.oracle)
 	if err != nil {

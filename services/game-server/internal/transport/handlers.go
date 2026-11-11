@@ -289,7 +289,7 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 		// stream, so a resend of the move that ended the game is re-acked with
 		// the result (#122). A game live here cannot have ended, so a stale
 		// connection's MOVE for it skips the stream read and fold.
-		if !live && s.moveOnEndedGame(ctx, c, st.userID, p) {
+		if !live && s.moveOnEndedGame(ctx, c, st, p) {
 			return true
 		}
 		reason := uint8(codec.ReasonUnknownGame)
@@ -303,8 +303,10 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 	// NFR-7); we send the authoritative outcome only after it returns.
 	out, err := sess.SubmitMove(ctx, seat, p.PlyExpected, p.UCI, uint64(s.now().UnixMilli()))
 	if err != nil {
-		// Persist/engine failure — the move did NOT happen (NFR-7); no ack.
-		s.send(ctx, c, errorMsg(codec.ECInternal, "move not persisted"))
+		// No ack (NFR-7). The session already re-read the stream to confirm an
+		// ambiguous commit (#89), so this means the move is not known to have
+		// happened, not that it certainly did not. A client should RESYNC.
+		s.send(ctx, c, errorMsg(codec.ECInternal, "move not confirmed"))
 		return true
 	}
 	switch {
@@ -329,12 +331,18 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 			// The opponent never heard of this move or the end. Tell them the
 			// move (a duplicate, in a narrow race with the normal path, is a
 			// no-op for the client), then broadcast GAME_END to both seats once
-			// and drop the game. If another path already claimed the broadcast,
-			// it reaches every bound seat, the sender included.
+			// and drop the game.
 			if cc, present := s.connFor(p.GameID, 1-seat); present {
 				s.send(ctx, cc, acc)
 			}
-			s.broadcastGameEnd(ctx, p.GameID)
+			if !s.broadcastGameEnd(ctx, p.GameID) {
+				// Not broadcast by this call: another path holds the claim (and
+				// may have failed after taking it, #88). The sender must still
+				// learn the result; a second GAME_END is harmless, none is not.
+				if sp, err := sess.StateSnapshot(ctx); err == nil && sp.Ended {
+					s.send(ctx, c, gameEndMsg(p.GameID, sp.ResultVector, sp.Terminal))
+				}
+			}
 		}
 	case out.Accepted:
 		// §4A v1.2 (ADR-18): a new move goes to BOTH seats, carrying the
@@ -464,7 +472,7 @@ func (s *Server) handleResync(ctx context.Context, c Conn, st *connState, gameID
 	if !live {
 		// Not live here: an ended game (its session was dropped at GAME_END) is
 		// rebuilt from the stream for a player who was seated in it (#102).
-		s.resyncEnded(ctx, c, st.userID, gameID)
+		s.resyncEnded(ctx, c, st, gameID)
 		return true
 	}
 	seat, seated := s.seatOf(c, gameID)
@@ -520,17 +528,19 @@ func mapSessionErr(gameID string, err error) codec.ServerMsg {
 // (claimGameEnd) so that when a terminal move and the flag tick (or two ending
 // paths) resolve near-simultaneously, exactly ONE goroutine broadcasts + drops —
 // a client never receives two GAME_END frames for one game (reviewer finding).
-func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
+// It reports whether THIS call broadcast the end (false: another path holds
+// the claim, or the game is gone or not ended).
+func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) bool {
 	if !s.claimGameEnd(gameID) {
-		return // another goroutine already broadcast this game's end.
+		return false // another goroutine already broadcast this game's end.
 	}
 	snap, ok := s.reg.Get(gameID)
 	if !ok {
-		return
+		return false
 	}
 	sp, err := snap.StateSnapshot(ctx)
 	if err != nil || !sp.Ended {
-		return
+		return false
 	}
 	rv, term, users := s.endingResult(ctx, gameID, sp)
 	msg := gameEndMsg(gameID, rv, term)
@@ -549,6 +559,7 @@ func (s *Server) broadcastGameEnd(ctx context.Context, gameID string) {
 	// persists in the store, and endedState rebuilds a read-only ended view from
 	// it for a late reconnect (missed ending) or a RESYNC (#102).
 	s.dropGame(gameID)
+	return true
 }
 
 // claimGameEnd returns true to exactly ONE caller per game — the one that should

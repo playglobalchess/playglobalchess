@@ -130,7 +130,7 @@ void    pgc_free(uint8_t* ptr, size_t len);   // Rust frees what Rust allocated
 | Duplicate MOVE (retry) | idempotent on `(game_id, ply_expected)`; re-ack, no second event. **The re-ack rule wins over the phase:** a resend of a committed ply is re-acked even after the game ended, and a resend of the move that ENDED the game also gets `GAME_END`. Only a new (uncommitted) ply on an ended game gets `GAME_OVER` (#122). |
 | Disconnect mid-game | clock keeps running; reconnect → `STATE` resync; flag if clock expires first. |
 | Node failure mid-game | another node resumes from the event store (fold); no game loss (NFR-2). |
-| Persist fails after validation | do NOT ack; surface `ERROR{INTERNAL}`; the move did not happen (no ack-before-persist). |
+| Persist fails after validation | A store error does not prove the write failed: the session re-reads the stream (strongly consistent, retried) and, if its events are there, the move happened and is acked normally (#89). Otherwise do NOT ack; surface `ERROR{INTERNAL}`, which means the move is **not known** to have happened, not that it certainly did not (no ack-before-persist). The client must not resend; it should RESYNC, and STATE says whether the move is in the game (the web client does not do this yet: it shows the error until its next STATE). |
 | Codec decode error on inbound frame | `ERROR{PROTOCOL_VIOLATION}` (truncated/unknown-type/bad-enum — the codec's typed `CodecError`, never a panic/trap in-process). |
 | cgo boundary: Rust returns error code | mapped to the matching `ERROR`/`MOVE_REJECTED`; the Go side never dereferences a null/!0-status out-buffer. |
 | Extensibility | state machine + pool model leave room for N-seat/variants/spectating without reusing a v1 event (SPEC-S2-PROTOCOL §5). |

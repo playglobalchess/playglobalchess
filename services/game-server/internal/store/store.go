@@ -193,6 +193,11 @@ func (s *Store) Load(ctx context.Context, streamID string) ([]game.Event, error)
 			},
 			ScanIndexForward:  aws.Bool(true), // seq ascending
 			ExclusiveStartKey: startKey,
+			// Strongly consistent: every Load decides game state (rebuild, the
+			// seq-conflict reload, and the re-read that confirms an ambiguous
+			// commit, #89). An eventually consistent read can miss the write
+			// that just landed and decide on a stale game.
+			ConsistentRead: aws.Bool(true),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("store: query %s: %w", streamID, err)

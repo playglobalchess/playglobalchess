@@ -91,6 +91,11 @@ type connState struct {
 	userID string
 	// games this connection is seated in, so teardown can unbind them.
 	seats []gameSeAT
+	// The connection's budget for stream-backed lookups of games not live here
+	// (RESYNC or MOVE of an ended game, ended.go): a window start and a count.
+	// Touched only by this connection's own goroutine.
+	lookupWindow time.Time
+	lookups      int
 }
 
 // Handle runs the per-connection loop for the lifetime of c (ADR-12: one

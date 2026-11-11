@@ -39,48 +39,90 @@ func playAllButLast(t *testing.T, white, black *fakeConn, gameID string, line []
 	return black, white
 }
 
-// ambiguousStore commits the first batch that ends the game but reports an
-// error, like a store write that timed out after it succeeded (#89, #95). With
-// failReread, the session's re-read right after that error fails once too, so
-// the session cannot confirm the commit at the time.
+// ambiguousStore fails ONE write that `match` selects with an error, like a
+// store timeout. With commit (the default for the ending tests) the write did
+// land first: an ambiguous commit (#89, #95). Without it, nothing was written.
+// After the failed write, the next loadFails Loads fail too (an outage often
+// hits both).
 type ambiguousStore struct {
 	game.EventStore
-	failReread bool
-
-	mu        sync.Mutex
-	fired     bool
+	match     func([]game.Event) bool // nil: a batch with GameEnded
+	noCommit  bool
 	loadFails int
+
+	mu      sync.Mutex
+	fired   bool
+	pending int // Loads still to fail
 }
 
-func (a *ambiguousStore) AppendBatch(ctx context.Context, stream string, seq uint32, evs []game.Event) error {
-	if err := a.EventStore.AppendBatch(ctx, stream, seq, evs); err != nil {
-		return err
-	}
+func (a *ambiguousStore) fail(evs []game.Event) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, ev := range evs {
-		if ev.Type == game.EvGameEnded && !a.fired {
-			a.fired = true
-			if a.failReread {
-				a.loadFails = 1
+	if a.fired {
+		return false
+	}
+	m := a.match
+	if m == nil {
+		m = func(evs []game.Event) bool {
+			for _, ev := range evs {
+				if ev.Type == game.EvGameEnded {
+					return true
+				}
 			}
-			return errors.New("store: timeout (the write did commit)")
+			return false
 		}
 	}
-	return nil
+	if !m(evs) {
+		return false
+	}
+	a.fired, a.pending = true, a.loadFails
+	return true
+}
+
+var errAmbiguous = errors.New("store: timeout (the write may have committed)")
+
+func (a *ambiguousStore) AppendBatch(ctx context.Context, stream string, seq uint32, evs []game.Event) error {
+	if !a.fail(evs) {
+		return a.EventStore.AppendBatch(ctx, stream, seq, evs)
+	}
+	if !a.noCommit {
+		if err := a.EventStore.AppendBatch(ctx, stream, seq, evs); err != nil {
+			return err
+		}
+	}
+	return errAmbiguous
+}
+
+func (a *ambiguousStore) Append(ctx context.Context, stream string, seq uint32, ev game.Event) error {
+	if !a.fail([]game.Event{ev}) {
+		return a.EventStore.Append(ctx, stream, seq, ev)
+	}
+	if !a.noCommit {
+		if err := a.EventStore.Append(ctx, stream, seq, ev); err != nil {
+			return err
+		}
+	}
+	return errAmbiguous
 }
 
 func (a *ambiguousStore) Load(ctx context.Context, stream string) ([]game.Event, error) {
 	a.mu.Lock()
-	fail := a.loadFails > 0
+	fail := a.pending > 0
 	if fail {
-		a.loadFails--
+		a.pending--
 	}
 	a.mu.Unlock()
 	if fail {
 		return nil, errors.New("store: unavailable")
 	}
 	return a.EventStore.Load(ctx, stream)
+}
+
+// movePlayedAt selects the single MovePlayed write for ply.
+func movePlayedAt(ply uint32) func([]game.Event) bool {
+	return func(evs []game.Event) bool {
+		return len(evs) == 1 && evs[0].MovePlayed != nil && evs[0].MovePlayed.Ply == ply
+	}
 }
 
 func countEvents(t *testing.T, h *harness, gameID string, typ game.EventType) int {
@@ -177,14 +219,15 @@ func TestAmbiguousEndingCommitIsConfirmed(t *testing.T) {
 	}
 }
 
-// #89, when the session cannot confirm the commit at the time (the re-read
+// #89, when the session cannot confirm the commit at the time (every re-read
 // fails too): the mover gets INTERNAL and the opponent hears nothing. A later
 // resend of that move (from a client that does resend) is re-acked, and then
 // the opponent gets the move and both get one GAME_END.
 func TestAmbiguousEndingUnconfirmedThenResend(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
-	amb := &ambiguousStore{EventStore: h.store, failReread: true}
+	// Every re-read the session tries fails, so it cannot confirm the commit.
+	amb := &ambiguousStore{EventStore: h.store, loadFails: 3}
 	h.srv.reg.store = amb
 	ctx := context.Background()
 	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
@@ -304,5 +347,114 @@ func TestMoveAfterEnd_StoreFailureIsInternal(t *testing.T) {
 	move(t, cb, gameID, 1, "e2e4")
 	if e := cb.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECInternal {
 		t.Fatalf("error code = 0x%02x, want INTERNAL", e.Error.Code)
+	}
+}
+
+// The hot path: an ordinary (single-event) move whose Append commits but
+// reports an error is confirmed by the re-read and acked to both seats, with no
+// error to the mover (#95's ambiguous case, on the path every move takes).
+func TestAmbiguousOrdinaryMoveIsConfirmed(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	amb := &ambiguousStore{EventStore: h.store, match: movePlayedAt(1)}
+	h.srv.reg.store = amb
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	if !amb.fired {
+		t.Fatal("the store wrapper never saw the move")
+	}
+	white.noServerMsg(t, codec.SMError, 0)
+	// The game carries on from the confirmed move.
+	moveAndAwaitBoth(t, black, white, gameID, 2, "e7e5")
+	if n := countEvents(t, h, gameID, game.EvMovePlayed); n != 2 {
+		t.Fatalf("%d MovePlayed events, want 2", n)
+	}
+}
+
+// The re-read is retried: an outage that also fails the first two re-reads
+// still confirms the commit on the third.
+func TestAmbiguousCommitConfirmedAfterRereadRetries(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	amb := &ambiguousStore{EventStore: h.store, match: movePlayedAt(1), loadFails: 2}
+	h.srv.reg.store = amb
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	white.noServerMsg(t, codec.SMError, 0)
+}
+
+// A write that errored and did NOT commit: the re-read finds nothing, so the
+// mover gets INTERNAL ("not confirmed"), the opponent hears nothing, and the
+// session is not left inconsistent: the same move can be played again.
+func TestFailedMoveNotCommittedLeavesGamePlayable(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	amb := &ambiguousStore{EventStore: h.store, match: movePlayedAt(1), noCommit: true}
+	h.srv.reg.store = amb
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	move(t, white, gameID, 1, "e2e4")
+	if e := white.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECInternal {
+		t.Fatalf("error 0x%02x, want INTERNAL", e.Error.Code)
+	}
+	black.noServerMsg(t, codec.SMMoveAccepted, 50*time.Millisecond)
+	if n := countEvents(t, h, gameID, game.EvMovePlayed); n != 0 {
+		t.Fatalf("%d MovePlayed events, want 0", n)
+	}
+	moveAndAwaitBoth(t, white, black, gameID, 1, "e2e4")
+	moveAndAwaitBoth(t, black, white, gameID, 2, "e7e5")
+}
+
+// A terminal re-ack while the end claim is already held (by a broadcast that
+// failed after claiming, #88): the sender still gets GAME_END.
+func TestTerminalReackWithClaimHeldStillSendsGameEnd(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	amb := &ambiguousStore{EventStore: h.store, loadFails: 3}
+	h.srv.reg.store = amb
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	_, _ = playAllButLast(t, white, black, gameID, foolsMate)
+	move(t, black, gameID, 4, "d8h4")
+	black.waitForServer(t, codec.SMError, 2*time.Second) // unconfirmed
+
+	h.srv.claimGameEnd(gameID) // another path took the claim and never sent
+	move(t, black, gameID, 4, "d8h4")
+	black.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	if ge := black.waitForServer(t, codec.SMGameEnd, 2*time.Second); game.Termination(ge.GameEnd.Termination) != game.TermMate {
+		t.Fatalf("termination = 0x%02x, want MATE", ge.GameEnd.Termination)
+	}
+}
+
+// Lookups of games not live here are budgeted per connection: past the budget
+// the reply is RATE_LIMITED with no store read, and the budget refills.
+func TestEndedLookupBudget(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	eve := reconnect(t, h, ctx, "eve")
+	const unknown = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+	for i := 0; i < lookupBudget; i++ {
+		resync(t, eve, unknown)
+		if e := eve.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECUnknownGame {
+			t.Fatalf("lookup %d: error 0x%02x, want UNKNOWN_GAME", i, e.Error.Code)
+		}
+	}
+	h.srv.reg.store = failingLoadStore{h.store} // a store read would now be INTERNAL
+	move(t, eve, unknown, 1, "e2e4")
+	if e := eve.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECRateLimited {
+		t.Fatalf("over budget: error 0x%02x, want RATE_LIMITED", e.Error.Code)
+	}
+	h.srv.reg.store = h.store
+	h.clk.add(lookupWindow)
+	resync(t, eve, unknown)
+	if e := eve.waitForServer(t, codec.SMError, 2*time.Second); e.Error.Code != codec.ECUnknownGame {
+		t.Fatalf("after the window: error 0x%02x, want UNKNOWN_GAME", e.Error.Code)
 	}
 }
