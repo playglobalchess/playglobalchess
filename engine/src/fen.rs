@@ -35,6 +35,18 @@ pub enum FenError {
     BadHalfmove(String),
     #[error("invalid fullmove number '{0}'")]
     BadFullmove(String),
+    // Semantic validation (ENGINE-CORE §5, #120): the six fields parsed, but
+    // they do not describe a position that can occur in a game.
+    #[error("{color:?} must have exactly one king, found {count}")]
+    KingCount { color: Color, count: u32 },
+    #[error("pawn on a back rank at {0}")]
+    PawnOnBackRank(Square),
+    #[error("castling right '{0}' without the king and rook on their home squares")]
+    CastlingWithoutPieces(char),
+    #[error("en-passant square '{0}' could not follow a double pawn push")]
+    ImpossibleEnPassant(Square),
+    #[error("the side not to move is in check")]
+    OpponentInCheck,
 }
 
 /// Parse a FEN string into a [`Position`] (lenient ep — OPEN-D, §3.3).
@@ -117,7 +129,80 @@ pub fn parse_fen(s: &str) -> Result<Position, FenError> {
         .parse::<u32>()
         .map_err(|_| FenError::BadFullmove(fields[5].to_string()))?;
 
+    validate(&pos)?;
     Ok(pos)
+}
+
+/// Semantic checks after all six fields parsed (ENGINE-CORE §5, #120). A
+/// position that cannot occur in a game would make move generation and `make`
+/// misbehave (castling moving an enemy piece, ep deleting an arbitrary piece,
+/// a missing king read as stalemate), so it is a typed error instead.
+///
+/// An ep square with no pawn able to capture is still accepted: the internal
+/// target is lenient by design (OPEN-D, §3.3), and the perft corpus relies on it.
+fn validate(pos: &Position) -> Result<(), FenError> {
+    use crate::types::PieceType;
+    for color in [Color::White, Color::Black] {
+        let king = Piece::new(color, PieceType::King);
+        let count = (0..64u8)
+            .filter_map(Square::new)
+            .filter(|&sq| pos.piece_at(sq) == Some(king))
+            .count() as u32;
+        if count != 1 {
+            return Err(FenError::KingCount { color, count });
+        }
+    }
+    for file in 0..8u8 {
+        for rank in [0u8, 7] {
+            let sq = Square::from_file_rank(file, rank).expect("on board");
+            if matches!(pos.piece_at(sq), Some(p) if p.kind == PieceType::Pawn) {
+                return Err(FenError::PawnOnBackRank(sq));
+            }
+        }
+    }
+    for (ch, color, rook_file) in [
+        ('K', Color::White, 7u8),
+        ('Q', Color::White, 0),
+        ('k', Color::Black, 7),
+        ('q', Color::Black, 0),
+    ] {
+        let right = match ch {
+            'K' | 'k' => CastlingRights::king_side(color),
+            _ => CastlingRights::queen_side(color),
+        };
+        if !pos.castling_rights.has(right) {
+            continue;
+        }
+        let rank = if color == Color::White { 0 } else { 7 };
+        let king_home = Square::from_file_rank(4, rank).expect("on board");
+        let rook_home = Square::from_file_rank(rook_file, rank).expect("on board");
+        if pos.piece_at(king_home) != Some(Piece::new(color, PieceType::King))
+            || pos.piece_at(rook_home) != Some(Piece::new(color, PieceType::Rook))
+        {
+            return Err(FenError::CastlingWithoutPieces(ch));
+        }
+    }
+    if let Some(ep) = pos.ep_target {
+        // White to move: Black just pushed from rank 7 to 5 through rank 6.
+        let (ep_rank, pawn_rank, origin_rank, pusher) = match pos.side_to_move {
+            Color::White => (5u8, 4u8, 6u8, Color::Black),
+            Color::Black => (2, 3, 1, Color::White),
+        };
+        let at = |r| Square::from_file_rank(ep.file(), r).expect("on board");
+        if ep.rank() != ep_rank
+            || pos.piece_at(ep).is_some()
+            || pos.piece_at(at(origin_rank)).is_some()
+            || pos.piece_at(at(pawn_rank)) != Some(Piece::new(pusher, PieceType::Pawn))
+        {
+            return Err(FenError::ImpossibleEnPassant(ep));
+        }
+    }
+    let them = pos.side_to_move.flip();
+    let their_king = pos.king_square(them).expect("one king checked above");
+    if crate::movegen::is_square_attacked(pos, their_king, pos.side_to_move) {
+        return Err(FenError::OpponentInCheck);
+    }
+    Ok(())
 }
 
 /// Emit a position as FEN — **strict ep** per OPEN-D (§3.3): the ep square is
@@ -294,5 +379,101 @@ mod tests {
             parse_fen("9/8/8/8/8/8/8/8 w - - 0 1"),
             Err(FenError::WrongFileCount { rank: 0, files: 9 })
         ));
+    }
+
+    /// #120: positions that cannot occur in a game are rejected with a
+    /// distinct error, after all six fields have parsed.
+    #[test]
+    fn semantically_invalid_positions_are_rejected() {
+        use crate::types::Color;
+        let sq = |c: &str| Square::from_coord(c).unwrap();
+        for (why, fen, want) in [
+            // The issue's cases (a) to (f).
+            (
+                "right without own rook",
+                "4k3/8/8/8/8/8/8/4K2n w K - 0 1",
+                FenError::CastlingWithoutPieces('K'),
+            ),
+            (
+                "no white king",
+                "4k3/8/8/8/8/8/8/8 w - - 0 1",
+                FenError::KingCount {
+                    color: Color::White,
+                    count: 0,
+                },
+            ),
+            (
+                "two black kings",
+                "4k2k/8/8/8/8/8/8/4K3 w - - 0 1",
+                FenError::KingCount {
+                    color: Color::Black,
+                    count: 2,
+                },
+            ),
+            (
+                "pawn on rank 1",
+                "4k3/8/8/8/8/8/8/P3K3 w - - 0 1",
+                FenError::PawnOnBackRank(sq("a1")),
+            ),
+            (
+                "side not to move in check",
+                "4k3/8/8/8/8/8/8/4K2r b - - 0 1",
+                FenError::OpponentInCheck,
+            ),
+            (
+                "ep on the wrong rank",
+                "4k3/8/8/8/4P3/8/8/4K3 w - e4 0 1",
+                FenError::ImpossibleEnPassant(sq("e4")),
+            ),
+            // Boundaries.
+            (
+                "pawn on rank 8",
+                "3pk3/8/8/8/8/8/8/4K3 w - - 0 1",
+                FenError::PawnOnBackRank(sq("d8")),
+            ),
+            (
+                "queen-side right, rook moved",
+                "r3k3/8/8/8/8/8/8/1R2K3 w Q - 0 1",
+                FenError::CastlingWithoutPieces('Q'),
+            ),
+            (
+                "black right, king off e8",
+                "3k3r/8/8/8/8/8/8/4K3 w k - 0 1",
+                FenError::CastlingWithoutPieces('k'),
+            ),
+            (
+                "ep without the pushed pawn",
+                "4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1",
+                FenError::ImpossibleEnPassant(sq("d6")),
+            ),
+            (
+                "ep with the origin occupied",
+                "4k3/3p4/8/3pP3/8/8/8/4K3 w - d6 0 1",
+                FenError::ImpossibleEnPassant(sq("d6")),
+            ),
+            (
+                "ep target occupied",
+                "4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1",
+                FenError::ImpossibleEnPassant(sq("d6")),
+            ),
+        ] {
+            assert_eq!(parse_fen(fen).unwrap_err(), want, "{why}");
+        }
+    }
+
+    /// The rules accept every legitimate case: the start position, all four
+    /// rights with pieces home, a lenient ep square with no capturer (OPEN-D),
+    /// the side to move in check, and the Black-to-move ep mirror.
+    #[test]
+    fn valid_positions_are_accepted() {
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "rnbqkbnr/ppp1pppp/8/3p4/8/8/PPPPPPPP/RNBQKBNR w KQkq d6 0 2",
+            "4k3/8/8/8/8/8/8/4K2r w - - 0 1",
+            "4k3/8/8/8/3Pp3/8/8/4K3 b - d3 0 1",
+        ] {
+            assert!(parse_fen(fen).is_ok(), "{fen}");
+        }
     }
 }

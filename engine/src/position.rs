@@ -427,33 +427,59 @@ mod tests {
         }
     }
 
+    /// Build a position with an ep target that `parse_fen` would reject (#120),
+    /// to test that `ep_capture_available` still guards against it: a position
+    /// can also be built by `make`/`unmake` or the FFI, not only by parsing.
+    fn with_raw_ep(fen_without_ep: &str, ep: &str) -> Position {
+        let mut p = Position::from_fen(fen_without_ep).unwrap();
+        p.ep_target = Square::from_coord(ep);
+        p
+    }
+
     /// No ep square counts without the double-pushed enemy pawn beside it.
     #[test]
     fn ep_unavailable_without_the_double_pushed_pawn() {
-        let p = Position::from_fen("4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let p = with_raw_ep("4k3/8/8/4P3/8/8/8/4K3 w - - 0 1", "d6");
         assert!(!p.ep_capture_available());
+        assert!(Position::from_fen("4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1").is_err());
     }
 
     /// Malformed ep squares never count and never panic (#119 review): an
     /// occupied target, the wrong rank for the side to move, and an occupied
-    /// origin square (no double push was possible).
+    /// origin square (no double push was possible). `parse_fen` rejects all of
+    /// them (#120); the availability check must hold up regardless.
     #[test]
     fn ep_unavailable_for_impossible_targets() {
-        for (why, fen) in [
-            ("occupied target", "4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1"),
+        for (why, fen, ep) in [
+            (
+                "occupied target",
+                "4k3/8/3n4/3pP3/8/8/8/4K3 w - - 0 1",
+                "d6",
+            ),
             (
                 "wrong rank for White to move",
-                "4k3/8/8/8/8/8/2Pp4/4K3 w - d3 0 1",
+                "4k3/8/8/8/8/8/2Pp4/4K3 w - - 0 1",
+                "d3",
             ),
-            ("occupied origin", "4k3/3p4/8/3pP3/8/8/8/4K3 w - d6 0 1"),
+            (
+                "occupied origin",
+                "4k3/3p4/8/3pP3/8/8/8/4K3 w - - 0 1",
+                "d6",
+            ),
             (
                 "wrong rank for Black to move",
-                "4k3/2pP4/8/8/8/8/8/4K3 b - d6 0 1",
+                "4k3/2pP4/8/8/8/8/8/4K3 b - - 0 1",
+                "d6",
             ),
         ] {
-            let p = Position::from_fen(fen).unwrap();
+            let p = with_raw_ep(fen, ep);
             assert!(!p.ep_capture_available(), "{why}: ep counted");
             let _ = (p.to_fen(), p.zobrist(), p == p.clone()); // total: no panic
+            let with_ep = fen.replacen(" - - ", &format!(" - {ep} "), 1);
+            assert!(
+                Position::from_fen(&with_ep).is_err(),
+                "{why}: parse accepted"
+            );
         }
     }
 

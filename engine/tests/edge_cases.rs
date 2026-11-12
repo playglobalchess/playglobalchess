@@ -108,7 +108,10 @@ fn e5_castling_out_of_check_illegal() {
 /// E-5 — castling INTO check (destination square attacked) is illegal.
 #[test]
 fn e5_castling_into_check_illegal() {
-    let fen = "6rk/8/8/8/8/8/8/4K2R w K - 0 1"; // Rg8 attacks g1 (O-O destination)
+    // Rg8 attacks g1 (O-O destination). The black king is on a8: on h8 it
+    // would already be in check from Rh1 with White to move, which is not a
+    // legal position (and is rejected since #120).
+    let fen = "k5r1/8/8/8/8/8/8/4K2R w K - 0 1";
     assert!(
         !has_move(fen, "e1g1"),
         "E-5: O-O into attacked g1 must be illegal; got {:?}",
@@ -234,4 +237,18 @@ fn fullmove_counter_saturates() {
     make(&mut p, m);
     assert_eq!(p.fullmove_number, u32::MAX);
     assert!(p.to_fen().ends_with(" 4294967295"));
+}
+
+/// #120 defence in depth: even if a castling right survives into a position
+/// built without `parse_fen` (here set directly), castling is never generated
+/// without our own rook on its corner. It used to move whatever stood on
+/// h1/a1, including an enemy piece.
+#[test]
+fn castling_needs_own_rook_on_the_corner() {
+    use pgc_engine::CastlingRights;
+    let mut p = parse_fen("4k3/8/8/8/8/8/8/n3K2n w - - 0 1").unwrap();
+    p.castling_rights = CastlingRights::all();
+    let ucis: Vec<String> = legal_moves(&p).iter().map(|m| m.to_uci()).collect();
+    assert!(!ucis.contains(&"e1g1".to_string()), "{ucis:?}");
+    assert!(!ucis.contains(&"e1c1".to_string()), "{ucis:?}");
 }
