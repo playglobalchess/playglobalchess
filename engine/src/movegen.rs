@@ -474,7 +474,9 @@ pub fn make(pos: &mut Position, m: Move) -> Undo {
 
     // Fullmove number increments after Black's move.
     if us == Color::Black {
-        pos.fullmove_number += 1;
+        // Saturating, like the halfmove clock: a FEN may carry any u32, and an
+        // unchecked add panics in debug but wraps to 0 in release (#148).
+        pos.fullmove_number = pos.fullmove_number.saturating_add(1);
     }
     pos.side_to_move = them;
 

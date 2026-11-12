@@ -57,7 +57,17 @@ pub fn parse_fen(s: &str) -> Result<Position, FenError> {
         let mut file: u8 = 0;
         for c in rank_str.chars() {
             if let Some(skip) = c.to_digit(10) {
-                file += skip as u8;
+                // Bound before adding (#148): an unchecked `u8` add panics in
+                // debug and wraps in release, so a long run of digits was
+                // rejected or accepted depending on the build profile.
+                let files = u32::from(file) + skip;
+                if files > 8 {
+                    return Err(FenError::WrongFileCount {
+                        rank: i,
+                        files: files as usize,
+                    });
+                }
+                file = files as u8;
             } else {
                 let piece = Piece::from_fen_char(c).ok_or(FenError::BadPieceChar(c))?;
                 let sq = Square::from_file_rank(file, rank).ok_or(FenError::WrongFileCount {
@@ -262,6 +272,27 @@ mod tests {
         assert!(matches!(
             parse_fen("8/8/8/8/8/8/8/8 w - - 0 x"),
             Err(FenError::BadFullmove(_))
+        ));
+    }
+
+    /// #148: a rank made of many digits is rejected the same way in debug
+    /// and release (it used to panic in debug and wrap to a valid rank in
+    /// release).
+    #[test]
+    fn digit_run_overflow_is_rejected_not_wrapped() {
+        let fen = format!("{}/8/8/8/8/8/8/8 w - - 0 1", "8".repeat(33));
+        assert!(matches!(
+            parse_fen(&fen),
+            Err(FenError::WrongFileCount { rank: 0, .. })
+        ));
+        // The overflow is caught at the first digit that passes the 8th file.
+        assert!(matches!(
+            parse_fen("44p/8/8/8/8/8/8/8 w - - 0 1"),
+            Err(FenError::WrongFileCount { rank: 0, .. })
+        ));
+        assert!(matches!(
+            parse_fen("9/8/8/8/8/8/8/8 w - - 0 1"),
+            Err(FenError::WrongFileCount { rank: 0, files: 9 })
         ));
     }
 }
