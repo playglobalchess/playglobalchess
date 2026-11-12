@@ -224,3 +224,14 @@ fn e14_max_legal_moves_218() {
         "E-14: the 218-move position must generate exactly 218 legal moves"
     );
 }
+
+/// #148: the fullmove counter saturates at u32::MAX instead of panicking in
+/// debug or wrapping to 0 in release, like the halfmove clock does.
+#[test]
+fn fullmove_counter_saturates() {
+    let mut p = parse_fen("4k3/8/8/8/8/8/8/4K3 b - - 0 4294967295").unwrap();
+    let m = legal_moves(&p).as_slice()[0];
+    make(&mut p, m);
+    assert_eq!(p.fullmove_number, u32::MAX);
+    assert!(p.to_fen().ends_with(" 4294967295"));
+}
