@@ -130,3 +130,48 @@ proptest! {
         }
     }
 }
+
+/// Does `pos` have a legal en-passant capture? From the legal move list itself:
+/// a pawn move onto the ep target that changes file (onto an empty square).
+fn has_legal_ep_capture(pos: &Position) -> bool {
+    let Some(ep) = pos.ep_target else {
+        return false;
+    };
+    legal_moves(pos).iter().any(|m| {
+        m.to == ep
+            && m.from.file() != m.to.file()
+            && pos.piece_at(m.from).map(|p| p.kind) == Some(pgc_engine::PieceType::Pawn)
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// #119 — strict ep availability (exported FEN, Zobrist key, equality)
+    /// agrees with move generation at EVERY ply of a random game: the ep square
+    /// counts exactly when a legal ep capture exists.
+    #[test]
+    fn prop_ep_availability_matches_legal_moves(seed in any::<u64>()) {
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut pos = Position::startpos();
+        for _ in 0..160 {
+            prop_assert_eq!(
+                pos.ep_capture_available(),
+                has_legal_ep_capture(&pos),
+                "ep availability disagrees with legal_moves at {}", pos.to_fen()
+            );
+            let moves = legal_moves(&pos);
+            if moves.is_empty() {
+                break;
+            }
+            let m = moves.as_slice()[(next() as usize) % moves.len()];
+            make(&mut pos, m);
+        }
+    }
+}

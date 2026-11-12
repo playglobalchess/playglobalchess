@@ -185,6 +185,22 @@ impl Position {
         let Some(victim_sq) = Square::from_file_rank(ep_file, pawn_rank) else {
             return false;
         };
+        // Only a square a double push could have produced counts (#119
+        // review): rank 6 with White to move, rank 3 with Black, the target
+        // and the pushed pawn's origin both empty. Anything else is a
+        // malformed FEN (full validation is #120); it must not drive the key,
+        // and the copy-make below needs an empty target square.
+        let (want_rank, origin_rank) = match mover {
+            Color::White => (5, 6),
+            Color::Black => (2, 1),
+        };
+        if ep_rank != want_rank || self.piece_at(ep).is_some() {
+            return false;
+        }
+        match Square::from_file_rank(ep_file, origin_rank) {
+            Some(origin) if self.piece_at(origin).is_none() => {}
+            _ => return false,
+        }
         let mover_pawn = Piece::new(mover, PieceType::Pawn);
         let victim = Piece::new(mover.flip(), PieceType::Pawn);
         if self.piece_at(victim_sq) != Some(victim) {
@@ -416,5 +432,57 @@ mod tests {
     fn ep_unavailable_without_the_double_pushed_pawn() {
         let p = Position::from_fen("4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1").unwrap();
         assert!(!p.ep_capture_available());
+    }
+
+    /// Malformed ep squares never count and never panic (#119 review): an
+    /// occupied target, the wrong rank for the side to move, and an occupied
+    /// origin square (no double push was possible).
+    #[test]
+    fn ep_unavailable_for_impossible_targets() {
+        for (why, fen) in [
+            ("occupied target", "4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1"),
+            (
+                "wrong rank for White to move",
+                "4k3/8/8/8/8/8/2Pp4/4K3 w - d3 0 1",
+            ),
+            ("occupied origin", "4k3/3p4/8/3pP3/8/8/8/4K3 w - d6 0 1"),
+            (
+                "wrong rank for Black to move",
+                "4k3/2pP4/8/8/8/8/8/4K3 b - d6 0 1",
+            ),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(!p.ep_capture_available(), "{why}: ep counted");
+            let _ = (p.to_fen(), p.zobrist(), p == p.clone()); // total: no panic
+        }
+    }
+
+    /// More legality geometry: a slider behind the victim (discovered check
+    /// once the victim leaves) drops ep; a rook behind it on the ep file does
+    /// not (the capturer lands on that file); edge files and Black pins.
+    #[test]
+    fn ep_geometry_cases() {
+        for (why, fen, want) in [
+            (
+                "bishop behind the victim",
+                "8/1b6/8/3pP3/8/8/6K1/k7 w - d6 0 1",
+                false,
+            ),
+            (
+                "rook behind on the ep file, capturer blocks it",
+                "3r4/8/8/3pP3/8/8/8/3K3k w - d6 0 1",
+                true,
+            ),
+            ("a-file capture", "4k3/8/8/pP6/8/8/8/4K3 w - a6 0 1", true),
+            ("h-file capture", "4k3/8/8/6Pp/8/8/8/4K3 w - h6 0 1", true),
+            (
+                "Black, horizontal pin",
+                "7K/8/8/8/k2pP2R/8/8/8 b - e3 0 1",
+                false,
+            ),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(p.ep_capture_available(), want, "{why}");
+        }
     }
 }
