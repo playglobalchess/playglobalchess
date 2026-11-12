@@ -11,13 +11,12 @@
 //! *text* differs. Legality of an ep capture is enforced at move-gen time
 //! regardless (E-2), so this split never changes which moves are legal.
 //!
-//! NOTE: "could legally capture" currently uses the *pseudo-legal* adjacency
-//! test (an enemy — here, side-to-move — pawn sits on a square that attacks the
-//! ep target). The full pin-aware refinement (the horizontal-pin case, E-2)
-//! lands with move generation in chunk 2; it can only *remove* an ep square
-//! from the exported FEN, never add one, and does not affect internal state,
-//! perft, or the round-trip property (which compares `Position`s, not text).
-//! This limitation is asserted by a test and tracked for chunk 2.
+//! "Could legally capture" is pin-aware (#119): the capture is played on a copy
+//! and counts only if the mover's king is then safe, which covers a pinned
+//! capturer and the horizontal-pin case (E-2). It can only *remove* an ep
+//! square from the exported FEN, never add one, and does not affect internal
+//! state, perft, or the round-trip property (which compares `Position`s, not
+//! text).
 
 use crate::bitboard::BitIter;
 use crate::castling::CastlingRights;
@@ -152,11 +151,18 @@ impl Position {
         }
     }
 
-    /// Whether the side to move has a pawn pseudo-legally able to capture to the
-    /// current (lenient) `ep_target`. Drives the *strict* exported FEN (§3.3).
+    /// Whether the side to move has a pawn that can **legally** capture to the
+    /// current (lenient) `ep_target`. Drives the *strict* exported FEN, the
+    /// Zobrist key and position identity (§3.3, §3.7 / E-11).
     ///
-    /// Pseudo-legal only (adjacency); the pin-aware refinement is chunk 2 (see
-    /// the module doc). Returns `false` when there is no ep target.
+    /// A candidate is a mover pawn one rank behind `ep` on an adjacent file,
+    /// with the double-pushed enemy pawn beside it. The capture counts only if
+    /// the mover's king is not attacked after it: this excludes a pawn pinned
+    /// on a diagonal or file, the horizontal pin where both pawns leave the
+    /// king's rank (E-2), and a capture that leaves the king in check (#119).
+    /// It uses only piece placement (`is_square_attacked` never reads
+    /// `ep_target`), so it cannot recurse. Returns `false` when there is no ep
+    /// target.
     #[must_use]
     pub fn ep_capture_available(&self) -> bool {
         let Some(ep) = self.ep_target else {
@@ -165,7 +171,8 @@ impl Position {
         let mover = self.side_to_move;
         // A pawn capturing *to* `ep` sits one rank behind `ep` (from the mover's
         // perspective) on an adjacent file. White captures upward, so its pawn
-        // is on rank-1 below ep; Black's is on rank+1 above ep.
+        // is on rank-1 below ep; Black's is on rank+1 above ep. The captured
+        // (double-pushed) pawn stands on that same rank, on the ep file.
         let ep_file = ep.file();
         let ep_rank = ep.rank();
         let pawn_rank = match mover {
@@ -175,16 +182,50 @@ impl Position {
         let Some(pawn_rank) = pawn_rank else {
             return false;
         };
+        let Some(victim_sq) = Square::from_file_rank(ep_file, pawn_rank) else {
+            return false;
+        };
+        // Only a square a double push could have produced counts (#119
+        // review): rank 6 with White to move, rank 3 with Black, the target
+        // and the pushed pawn's origin both empty. Anything else is a
+        // malformed FEN (full validation is #120); it must not drive the key,
+        // and the copy-make below needs an empty target square.
+        let (want_rank, origin_rank) = match mover {
+            Color::White => (5, 6),
+            Color::Black => (2, 1),
+        };
+        if ep_rank != want_rank || self.piece_at(ep).is_some() {
+            return false;
+        }
+        match Square::from_file_rank(ep_file, origin_rank) {
+            Some(origin) if self.piece_at(origin).is_none() => {}
+            _ => return false,
+        }
         let mover_pawn = Piece::new(mover, PieceType::Pawn);
+        let victim = Piece::new(mover.flip(), PieceType::Pawn);
+        if self.piece_at(victim_sq) != Some(victim) {
+            return false;
+        }
         for df in [-1i8, 1i8] {
             let f = ep_file as i8 + df;
             if !(0..8).contains(&f) {
                 continue;
             }
-            if let Some(sq) = Square::from_file_rank(f as u8, pawn_rank) {
-                if self.piece_at(sq) == Some(mover_pawn) {
-                    return true;
-                }
+            let Some(from) = Square::from_file_rank(f as u8, pawn_rank) else {
+                continue;
+            };
+            if self.piece_at(from) != Some(mover_pawn) {
+                continue;
+            }
+            // Play the capture on a copy and test king safety.
+            let mut next = self.clone();
+            next.take_piece(from);
+            next.take_piece(victim_sq);
+            next.put_piece(ep, mover_pawn);
+            match next.king_square(mover) {
+                Some(k) if crate::movegen::is_square_attacked(&next, k, mover.flip()) => {}
+                // Legal (or no king: an invalid position, see #120).
+                _ => return true,
             }
         }
         false
@@ -321,5 +362,127 @@ mod tests {
             .unwrap();
         assert_eq!(p.ep_target, Square::from_coord("d6"));
         assert!(!p.ep_capture_available());
+    }
+
+    /// The same FEN with the ep field replaced by `-`.
+    fn without_ep(fen: &str) -> String {
+        let mut f: Vec<&str> = fen.split(' ').collect();
+        f[3] = "-";
+        f.join(" ")
+    }
+
+    /// #119: an ep target whose every capture is illegal does not count. The
+    /// exported FEN drops it and the Zobrist key equals the key of the same
+    /// position written without it, so repetition sees one position.
+    #[test]
+    fn ep_unavailable_when_every_capture_is_illegal() {
+        for (why, fen) in [
+            // exd6 takes both pawns off rank 5 and exposes Ka5 to Rh5 (E-2).
+            ("horizontal pin", "8/8/8/K2pP2r/8/8/8/7k w - d6 0 1"),
+            // e5 is pinned to Kh8 by Bc3 on the long diagonal.
+            ("diagonal pin", "7K/8/8/3pP3/8/2b5/8/k7 w - d6 0 1"),
+            // Ka1 is in check from Nb3, and exd6 does not answer it.
+            ("king left in check", "4k3/8/8/3pP3/8/1n6/8/K7 w - d6 0 1"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(!p.ep_capture_available(), "{why}: ep counted");
+            assert_eq!(p.effective_ep(), None, "{why}");
+            assert_eq!(
+                p.to_fen(),
+                without_ep(fen),
+                "{why}: FEN keeps the ep square"
+            );
+            let plain = Position::from_fen(&without_ep(fen)).unwrap();
+            assert_eq!(p.zobrist(), plain.zobrist(), "{why}: key differs");
+            assert_eq!(p, plain, "{why}: positions differ");
+            assert_eq!(
+                Position::from_fen(&p.to_fen()).unwrap(),
+                p,
+                "{why}: round trip"
+            );
+        }
+    }
+
+    /// The legality check must not remove an ep square that is legal.
+    #[test]
+    fn ep_available_when_some_capture_is_legal() {
+        for (why, fen) in [
+            // The double-pushed d5 pawn gives check; exd6 removes the checker.
+            (
+                "capture removes the checker",
+                "4k3/8/8/3pP3/4K3/8/8/8 w - d6 0 1",
+            ),
+            // e5 is pinned horizontally only together with d5, but c5 can take:
+            // after cxd6 the e5 pawn still blocks Rh5.
+            (
+                "one of two capturers free",
+                "8/8/8/K1PpP2r/8/8/8/7k w - d6 0 1",
+            ),
+            // Black to move, the mirror of the classic case.
+            ("black captures", "4k3/8/8/8/3Pp3/8/8/4K3 b - d3 0 1"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(p.ep_capture_available(), "{why}: ep dropped");
+            assert_eq!(p.to_fen(), fen, "{why}");
+        }
+    }
+
+    /// No ep square counts without the double-pushed enemy pawn beside it.
+    #[test]
+    fn ep_unavailable_without_the_double_pushed_pawn() {
+        let p = Position::from_fen("4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1").unwrap();
+        assert!(!p.ep_capture_available());
+    }
+
+    /// Malformed ep squares never count and never panic (#119 review): an
+    /// occupied target, the wrong rank for the side to move, and an occupied
+    /// origin square (no double push was possible).
+    #[test]
+    fn ep_unavailable_for_impossible_targets() {
+        for (why, fen) in [
+            ("occupied target", "4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1"),
+            (
+                "wrong rank for White to move",
+                "4k3/8/8/8/8/8/2Pp4/4K3 w - d3 0 1",
+            ),
+            ("occupied origin", "4k3/3p4/8/3pP3/8/8/8/4K3 w - d6 0 1"),
+            (
+                "wrong rank for Black to move",
+                "4k3/2pP4/8/8/8/8/8/4K3 b - d6 0 1",
+            ),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(!p.ep_capture_available(), "{why}: ep counted");
+            let _ = (p.to_fen(), p.zobrist(), p == p.clone()); // total: no panic
+        }
+    }
+
+    /// More legality geometry: a slider behind the victim (discovered check
+    /// once the victim leaves) drops ep; a rook behind it on the ep file does
+    /// not (the capturer lands on that file); edge files and Black pins.
+    #[test]
+    fn ep_geometry_cases() {
+        for (why, fen, want) in [
+            (
+                "bishop behind the victim",
+                "8/1b6/8/3pP3/8/8/6K1/k7 w - d6 0 1",
+                false,
+            ),
+            (
+                "rook behind on the ep file, capturer blocks it",
+                "3r4/8/8/3pP3/8/8/8/3K3k w - d6 0 1",
+                true,
+            ),
+            ("a-file capture", "4k3/8/8/pP6/8/8/8/4K3 w - a6 0 1", true),
+            ("h-file capture", "4k3/8/8/6Pp/8/8/8/4K3 w - h6 0 1", true),
+            (
+                "Black, horizontal pin",
+                "7K/8/8/8/k2pP2R/8/8/8 b - e3 0 1",
+                false,
+            ),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(p.ep_capture_available(), want, "{why}");
+        }
     }
 }
