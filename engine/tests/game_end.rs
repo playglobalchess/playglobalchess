@@ -169,3 +169,42 @@ fn status_never_short_circuits_perft() {
     assert_eq!(status(&m), GameStatus::Checkmate);
     assert_eq!(legal_moves(&m).len(), 0);
 }
+
+/// #119: the position right after a double push whose only ep capture is
+/// pinned is the SAME position for repetition as that placement reached later
+/// without the double push (FIDE: an ep capture that is not legal is not a
+/// difference). Ka5, Pe5 vs Rh5: exd6 would expose the king along rank 5.
+#[test]
+fn repetition_ignores_an_illegal_ep_capture() {
+    let mut p = pos("8/3p4/8/K3P2r/8/8/8/7k b - - 0 1");
+    let mut prior_keys = vec![p.zobrist()];
+    let m = uci(&p, "d7d5");
+    make(&mut p, m); // ep target d6, but exd6 is illegal
+    let after_push = p.zobrist();
+    assert_eq!(p.to_fen(), "8/8/8/K2pP2r/8/8/8/7k w - - 0 2");
+
+    // Two king shuffles return to the same placement, White to move.
+    for (i, mv) in [
+        "a5a6", "h1g1", "a6a5", "g1h1", "a5a6", "h1g1", "a6a5", "g1h1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        prior_keys.push(p.zobrist());
+        let m = uci(&p, mv);
+        make(&mut p, m);
+        if i == 3 {
+            assert_eq!(
+                p.zobrist(),
+                after_push,
+                "first return must match the post-push key"
+            );
+        }
+    }
+    assert_eq!(p.zobrist(), after_push);
+    assert_eq!(
+        status_with_history(&p, &prior_keys),
+        GameStatus::DrawRepetition(DrawClaim::Claimable),
+        "post-push visit + two returns = threefold"
+    );
+}
