@@ -34,6 +34,20 @@ lib:
 	cargo build --release --manifest-path $(ENGINE_CGO_DIR)/Cargo.toml $(TARGET_FLAG)
 	mkdir -p $(ENGINE_LIB_DST)
 	cp $(ENGINE_OUT)/libpgc_engine_cgo.a $(ENGINE_LIB_DST)/
+	# Strip embedded LLVM bitcode (ELF section .llvmbc, plus .llvmcmd). Rust's
+	# prebuilt std objects carry it, so no rustc flag removes it, and Go 1.26.11
+	# refuses to link an archive with an LTO section from #cgo LDFLAGS
+	# ("disallowed LTO section"). The section is only an input to linker LTO;
+	# removing it leaves the machine code unchanged. Linux only: Mach-O keeps
+	# bitcode in the __LLVM segment, which the go command does not reject.
+	@if [ "$$(uname -s)" = "Linux" ]; then \
+		for a in $(CODEC_LIB_DST)/libpgc_protocol_cgo.a $(ENGINE_LIB_DST)/libpgc_engine_cgo.a; do \
+			objcopy --remove-section=.llvmbc --remove-section=.llvmcmd "$$a" || exit 1; \
+			if objdump -h "$$a" | grep -q '\.llvmbc'; then \
+				echo "make lib: $$a still has a .llvmbc section" >&2; exit 1; \
+			fi; \
+		done; \
+	fi
 	# Headers are NOT copied — cgo includes them from the canonical crate
 	# include/ dirs via CFLAGS, so there is no copy to drift.
 
