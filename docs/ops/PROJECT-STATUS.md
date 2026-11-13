@@ -4,15 +4,15 @@
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-11-12 (main at PR #171, plus #172 the GAME_END latch) |
+| Last updated | 2026-11-13 (main at PR #199) |
 | Phase | **P0 foundations, with a first playable game.** G-A (engine) GREEN. The three G-D contract specs are RATIFIED (SPEC-S2-PROTOCOL, SPEC-PE-API-CONTRACT, SPEC-S3-DATA-MODEL). The wire codec is at **v1.3** and runs in Rust, iOS/Android bindings, wasm, Go and the web TS mirror. The game server (X-2) and the first web client (F-01) are merged and play a full game end to end in CI (`web-e2e`). X-3 accounts is specced (RATIFIED) and scaffolded. |
-| Next step | **X-3 accounts**, starting with the handle spec (#134), which needs an owner decision. The end-of-game cluster (#88, #89, #102, #122) is closed. Still open in the game server: #95 (ambiguous persist for non-terminal commands; the terminal part is closed), #98 (no path rebuilds a live game after restart or failover), #92 (frame ordering across goroutines), #104 (rate limits, connection cap, auth timeout, heartbeat). On the web: low-time clock warnings (#142). |
+| Next step | **Fix the existing defects before X-3, in the owner's agreed order.** Step 1 (engine) is done: #119, #120, #121, #148 and this scorecard fix (#193); spec drift #149 is in PR #200. Step 2 is game rules and clocks: #100, #97, #125, #99, #124, #183, #182, #95, #176. Then quick safety fixes (#179, #178, #192), then multi-node (#173 with #98). X-3 accounts follows the agreed list. |
 
 ## What is done
 
 | Area | State |
 |---|---|
-| Engine (S1, Rust) | GREEN (G-A). Perft corpus and bench run nightly. `Move::from_uci` non-ASCII panic is fixed. |
+| Engine (S1, Rust) | GREEN (G-A). Perft corpus and bench run nightly. `Move::from_uci` non-ASCII panic is fixed. Audit defects fixed: en passant respects pins (#195, #119), saturating fullmove and bounded FEN rank parsing (#196, #148), `parse_fen` rejects impossible positions (#197, #120), the flag branch uses the Lichess mating-material rule (#199, #121). G-A scorecard box 9 corrected (#193). |
 | Wire codec (ADR-14) | **v1.3 merged** (#161): messages `0x0B-0x0D`, `0x88-0x8A`, events `0x0D-0x11`, `status` enum, the full STATE body with six decode invariants enforced on encode and decode. Golden vectors reproduced byte-for-byte by Rust, Go, wasm; Swift and Kotlin host parity read the v1.3 fields through the bindings. `PROTOCOL.md` carries wire 1.3; the takeback/decline/duplicate-MOVE **behaviour** rows are still in `PROTOCOL-V1.3-TAKEBACK-DRAW-STATE.md` §7 until GS-7 lands. |
 | Game server (X-2, Go) | Lifecycle, clock, engine seam, live session, resign/abort/draw, DynamoDB event store, Redis matchmaking and WS transport, plus **GS-7** (#163): one Evolve/Decide reducer, so a live game always equals a rebuild; takeback with consent and clock rewind; draw decline and a 20-ply cooldown; a durable first-clock start (`ClockStarted`); MOVE idempotency with recurring plies; STATE clocks charged to `server_t`. The invariant harness passes with nothing excused. Since then: the Redis claim requires both seekers to still be waiting, so a matched seeker cannot be re-claimed into a second game (#165, #90); every connection has a write pump (64-frame queue, 5 s write deadline, slow consumers are disconnected), so a peer that stops reading cannot stall the opponent or the flag ticker (#166, #91); the pool decides the clock, not the client (interim catalogue `transport.DefaultPools` until X-13, bounded resolver, refused SEEKs logged; #167, #93). **End of game (#169, #170, #172):**
 - A finished game still serves STATE. RESYNC of an ended game the user played returns STATE(ENDED) rebuilt from the stream, and a seat that missed GAME_END is pushed it once on its next login (24 h, 100k cap; #102).
@@ -37,7 +37,7 @@
 - **Game server:** #90, #91, #93 closed (#165-#167); #88, #89, #102, #122 closed (#169, #170, #172). Still open: #95 (ambiguous persist, non-terminal part), #98 (no rebuild of a live game after restart or failover), #92 (no cross-goroutine frame ordering; GAME_END can overtake MOVE_ACCEPTED), #104 (no rate limit, connection cap, auth timeout or heartbeat). `rated` is still taken from the client until accounts (X-3). Missed-ending records and the reconnect index are node-local until G-E routing.
 - **Protocol:** #131 (`MATCHED.opponent` carries the user id, not the handle), #150 (codec tests miss RESYNC/DRAW_OFFERED; `schema_ver` rule untested).
 - **Web:** #112 closed (#168). Low-time warnings and clock announcements are #142; the WEB-F01 DoD checkbox is #136.
-- Counts by label (after #172): game-server 10, protocol 12, web 12, ci 7, engine 5, specs 4, accounts 3, mobile 1. 21 are `spec-first`.
+- Counts by label (after #199, 79 open): game-server 21, protocol 15, web 17, ci 8, engine 1, specs 6, accounts 3, mobile 1. 19 are `spec-first`. The rise since #172 is the 2026-11 audit (#173-#194).
 
 ## Accounts & infra (external, not in git)
 
