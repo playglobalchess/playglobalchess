@@ -18,6 +18,14 @@ func FoldWithEngine(ctx context.Context, events []Event, opts FoldOptions, oracl
 	s := initialState()
 	for i := range events {
 		var v *Verdict
+		if events[i].Type == EvGameCreated && events[i].GameCreated != nil {
+			// Seed the repetition history with the start position (#100).
+			key, err := oracle.PositionKey(ctx, events[i].GameCreated.StartFEN)
+			if err != nil {
+				return State{}, fmt.Errorf("foldWithEngine: start position key: %w", err)
+			}
+			v = &Verdict{Zobrist: key}
+		}
 		if events[i].Type == EvMovePlayed && events[i].MovePlayed != nil && s.Phase == PhaseLive {
 			mv := events[i].MovePlayed
 			lv, err := oracle.Legality(ctx, s.CurFEN, mv.UCI, s.PriorKeys())

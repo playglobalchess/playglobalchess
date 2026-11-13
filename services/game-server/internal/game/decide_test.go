@@ -860,8 +860,9 @@ func TestFoldWithEngineBasics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if eng.CurFEN != "fen-after-e5" || len(eng.PriorKeys()) != 2 || eng.LastMoveUCI() != "e7e5" {
-		t.Errorf("fen %q keys %d last %q", eng.CurFEN, len(eng.PriorKeys()), eng.LastMoveUCI())
+	// N moves give N+1 prior keys: the start position first (#100).
+	if keys := eng.PriorKeys(); eng.CurFEN != "fen-after-e5" || len(keys) != 3 || keys[0] != fakeStartKey || eng.LastMoveUCI() != "e7e5" {
+		t.Errorf("fen %q keys %v last %q", eng.CurFEN, keys, eng.LastMoveUCI())
 	}
 	// A persisted move the engine rejects is a corrupt stream.
 	if _, err := FoldWithEngine(context.Background(), events, baseOpts(), newFakeOracle()); err == nil {
@@ -869,6 +870,38 @@ func TestFoldWithEngineBasics(t *testing.T) {
 	}
 	if _, err := FoldWithEngine(context.Background(), events, baseOpts(), nil); err == nil {
 		t.Error("nil oracle: expected error")
+	}
+}
+
+// TestPriorKeysStartPosition (#100): the repetition history begins with the
+// start position's key, survives a takeback to ply 0, is absent from the pure
+// (engine-free) fold, and a failing key lookup fails the rebuild.
+func TestPriorKeysStartPosition(t *testing.T) {
+	ctx := context.Background()
+	o := newFakeOracle()
+	created, err := FoldWithEngine(ctx, liveStream(false), baseOpts(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys := created.PriorKeys(); len(keys) != 1 || keys[0] != fakeStartKey {
+		t.Fatalf("at ply 0 PriorKeys = %v, want [start key]", keys)
+	}
+	rewound := created
+	rewound.History = nil // what a takeback to ply 0 leaves
+	if keys := rewound.PriorKeys(); len(keys) != 1 || keys[0] != fakeStartKey {
+		t.Fatalf("after rewind to ply 0 PriorKeys = %v, want [start key]", keys)
+	}
+	pure, err := Fold(liveStream(false), baseOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pure.StartKeyed || len(pure.PriorKeys()) != 0 {
+		t.Fatalf("pure fold carries an engine key: %+v", pure.PriorKeys())
+	}
+	bad := newFakeOracle()
+	bad.fail = fmt.Errorf("engine down")
+	if _, err := FoldWithEngine(ctx, liveStream(false), baseOpts(), bad); err == nil {
+		t.Fatal("start-key failure did not fail the rebuild")
 	}
 }
 

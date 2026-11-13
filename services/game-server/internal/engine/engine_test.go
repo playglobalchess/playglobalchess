@@ -203,66 +203,63 @@ func TestImplementsOracle(t *testing.T) {
 	var _ game.LegalityOracle = newOracle(t)
 }
 
-// TestRepetitionDetectedWithHistory closes Q-GS5: when the folded Zobrist
-// history IS supplied (as the live session now does), the engine detects
-// repetition. This replaces the GS-2 pin TestRepetitionIsNotDetectedYet — the
-// pin did its job (it forced GS-3 to wire the history); this is the positive
-// proof that the wiring works end to end through CgoOracle.
-//
-// Setup: a quiet knight shuffle (Nf3 Nf6 Ng1 Ng8 ...) returns to the start
-// position repeatedly. We simulate what the live session does — accumulate each
-// resulting Zobrist key and pass the prior history on the next call — and assert
-// that once the start position has occurred enough times, the engine reports a
-// repetition draw.
+// TestRepetitionDetectedWithHistory closes Q-GS5 and pins #100: with the
+// history threaded exactly as State.PriorKeys builds it (the START position's
+// key first, from PositionKey, then each resulting key), the knight shuffle
+// Nf3 Nf6 Ng1 Ng8 returns to the start at plies 4, 8, 12, 16, and the fivefold
+// auto-draw fires at ply 16 exactly, never earlier. (Without the start key it
+// fired at ply 17, from the post-Nf3 position.) Claimable threefold is not on
+// the verdict (terminalOf maps it to nil); engine-cgo pins it at ply 8.
 func TestRepetitionDetectedWithHistory(t *testing.T) {
 	o := newOracle(t)
 	ctx := context.Background()
 
-	// Empty history first: a single move reaches no repetition (control).
-	v0, err := o.Legality(ctx, startFEN, "g1f3", nil)
-	if err != nil || !v0.Legal {
-		t.Fatalf("control move: %+v err=%v", v0, err)
+	start, err := o.PositionKey(ctx, startFEN)
+	if err != nil || start == 0 {
+		t.Fatalf("start key = %#x, err=%v", start, err)
 	}
-	if v0.Terminal != nil {
-		t.Fatalf("no-history move reported terminal %v, want nil", *v0.Terminal)
-	}
-	if v0.NewZobrist == 0 {
-		t.Fatal("verdict carried no Zobrist key (Q-GS5 plumbing missing)")
-	}
-
-	// Now shuffle knights back to the start position, threading the history the
-	// way the session will. The move cycle Nf3 Nf6 Ng1 Ng8 returns to startpos.
-	cycle := []struct{ fen, uci string }{
-		{"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "g1f3"},
-		{"rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1", "g8f6"},
-		{"rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 2 2", "f3g1"},
-		{"rnbqkb1r/pppppppp/5n2/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 3 2", "f6g8"},
-	}
-	var history []uint64
-	var sawRepetition bool
+	cycle := []string{"g1f3", "g8f6", "f3g1", "f6g8"}
+	history := []uint64{start}
 	fen := startFEN
-	// Walk the cycle up to the fivefold-automatic threshold. The startpos recurs
-	// once per full cycle; we need it to have occurred 5 times total.
-	for round := 0; round < 6 && !sawRepetition; round++ {
-		for _, step := range cycle {
-			v, err := o.Legality(ctx, step.fen, step.uci, history)
-			if err != nil {
-				t.Fatalf("round %d move %q: %v", round, step.uci, err)
-			}
-			if !v.Legal {
-				t.Fatalf("round %d move %q reported illegal from %q", round, step.uci, step.fen)
-			}
-			history = append(history, v.NewZobrist)
-			fen = v.NewFEN
-			if v.Terminal != nil && *v.Terminal == game.TermRepetition {
-				sawRepetition = true
-				break
-			}
+	for ply := 1; ply <= 20; ply++ {
+		v, err := o.Legality(ctx, fen, cycle[(ply-1)%4], history)
+		if err != nil || !v.Legal {
+			t.Fatalf("ply %d: %+v err=%v", ply, v, err)
 		}
+		if ply%4 == 0 && v.NewZobrist != start {
+			t.Fatalf("ply %d is the start position but its key %#x != start key %#x", ply, v.NewZobrist, start)
+		}
+		if v.Terminal != nil {
+			if *v.Terminal != game.TermRepetition || ply != 16 {
+				t.Fatalf("terminal %v at ply %d, want REPETITION at ply 16", *v.Terminal, ply)
+			}
+			return
+		}
+		history = append(history, v.NewZobrist)
+		fen = v.NewFEN
 	}
-	_ = fen
-	if !sawRepetition {
-		t.Fatal("repetition was never detected despite the position recurring " +
-			"to the fivefold threshold with history threaded — Q-GS5 wiring is broken")
+	t.Fatal("no fivefold auto-draw by ply 20")
+}
+
+// TestPositionKey: the key of a FEN equals the key a move to that position
+// reports, and a bad FEN is an error.
+func TestPositionKey(t *testing.T) {
+	o := newOracle(t)
+	ctx := context.Background()
+	v, err := o.Legality(ctx, startFEN, "e2e4", nil)
+	if err != nil || !v.Legal {
+		t.Fatalf("e2e4: %+v err=%v", v, err)
+	}
+	k, err := o.PositionKey(ctx, v.NewFEN)
+	if err != nil || k != v.NewZobrist {
+		t.Fatalf("PositionKey(after e4) = %#x err=%v, want %#x", k, err, v.NewZobrist)
+	}
+	if _, err := o.PositionKey(ctx, "not a fen"); err == nil {
+		t.Fatal("bad FEN did not error")
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := o.PositionKey(cctx, startFEN); err == nil {
+		t.Fatal("cancelled context did not error")
 	}
 }

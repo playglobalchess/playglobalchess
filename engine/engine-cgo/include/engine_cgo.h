@@ -51,8 +51,11 @@ extern "C" {
  * PGC_ENG_ERR_MOVE  = UCI unparseable. PGC_ENG_ERR_ILLEGAL = parsed but illegal
  * in this position (no out buffer; the pipeline emits MOVE_REJECTED{ILLEGAL}).
  *
- * prior_keys (ptr,len) is the Zobrist history the server folded, EXCLUDING the
- * resulting position (status_with_history's convention). prior_keys may be NULL
+ * prior_keys (ptr,len) is the key of EVERY earlier position of the game, in
+ * order: the START position first (from pgc_engine_zobrist), then the position
+ * after each live ply up to and including `fen`. It EXCLUDES the resulting
+ * position (status_with_history's convention). Leaving out the start position
+ * undercounts every return to it by one (#100). prior_keys may be NULL
  * iff prior_keys_len == 0. fen/uci may NOT be NULL unless their len is 0. */
 int32_t pgc_engine_apply(const uint8_t *fen, size_t fen_len,
                          const uint8_t *uci, size_t uci_len,
@@ -68,6 +71,13 @@ int32_t pgc_engine_apply(const uint8_t *fen, size_t fen_len,
  * *out_can_mate is NOT written. */
 int32_t pgc_engine_mating_material(const uint8_t *fen, size_t fen_len,
                                    uint8_t color_idx, int32_t *out_can_mate);
+
+/* The Zobrist key of a FEN position (the key the engine uses for repetition).
+ * The server calls it once per game for the START position, which seeds
+ * prior_keys; apply only reports keys of resulting positions. On PGC_ENG_OK,
+ * *out_key is written; on non-OK it is NOT written. PGC_ENG_ERR_FEN = the FEN
+ * is malformed or fails parse_fen's position checks (ENGINE-CORE §5). */
+int32_t pgc_engine_zobrist(const uint8_t *fen, size_t fen_len, uint64_t *out_key);
 
 /* Free a buffer handed out by a pgc_engine_apply success (same ptr+len).
  * NULL = no-op. */

@@ -60,14 +60,21 @@ type LegalityOracle interface {
 	// on the method because the real implementation crosses the cgo seam and may
 	// be cancelled/timed-out on the hot path (SPEC-S2-GAME-SERVER §6.1).
 	//
-	// priorKeys is the folded Zobrist-key history of the game BEFORE the
-	// resulting position (status_with_history's convention: it excludes the
-	// position the move produces). The live session accumulates it from each
-	// accepted move's LegalityVerdict.NewZobrist and threads it here so the
-	// engine can detect threefold/fivefold REPETITION (Q-GS5). Callers with no
-	// history (single-move validation, or the GS-1 stub path) pass nil — the
-	// engine then detects every position-derived terminal but never repetition.
+	// priorKeys is the Zobrist key of every earlier position of the game BEFORE
+	// the resulting position (status_with_history's convention: it excludes the
+	// position the move produces): the START position's key first (from
+	// PositionKey), then the key after each live ply. State.PriorKeys builds it;
+	// leaving out the start key undercounts every return to the start by one
+	// (#100). Callers with no history (single-move validation, or the GS-1 stub
+	// path) pass nil — the engine then detects every position-derived terminal
+	// but never repetition.
 	Legality(ctx context.Context, fen, uci string, priorKeys []uint64) (LegalityVerdict, error)
+
+	// PositionKey is the engine's Zobrist key of a FEN. FoldWithEngine calls it
+	// once per game for StartFEN, the first entry of the repetition history; no
+	// Legality call reports it, because a verdict carries only the key of the
+	// position a move produces. Go never hashes (NFR-5).
+	PositionKey(ctx context.Context, fen string) (uint64, error)
 
 	// HasSufficientMaterial reports whether the given seat has enough material to
 	// mate. Used ONLY at a flag: if the opponent of the flagged seat lacks

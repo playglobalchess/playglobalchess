@@ -125,6 +125,22 @@ func (CgoOracle) HasSufficientMaterial(ctx context.Context, fen string, seatIdx 
 	return canMate != 0, nil
 }
 
+// PositionKey returns the engine's Zobrist key of fen (pgc_engine_zobrist). The
+// fold calls it once per game for the start position, the first entry of the
+// repetition history (#100).
+func (CgoOracle) PositionKey(ctx context.Context, fen string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	fenPtr, fenLen := bytesOf(fen)
+	var key C.uint64_t
+	rc := C.pgc_engine_zobrist(fenPtr, fenLen, &key)
+	if int32(rc) != C.PGC_ENG_OK {
+		return 0, errOf(int32(rc))
+	}
+	return uint64(key), nil
+}
+
 // terminalOf maps the engine's (status, claim) scalars to the §4A.5 Termination
 // the pipeline puts on a GameEnded — Q-GS2E-2: GOVERNANCE lives in Go, not the C
 // seam. Only AUTOMATIC terminals end the game from a move; a *claimable* draw
