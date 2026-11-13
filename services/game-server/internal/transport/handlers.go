@@ -22,6 +22,29 @@ const defaultJoinTTL = 30 * time.Second
 // resolution for forfeit purposes while being cheap (one actor command/game/sec).
 const defaultFlagInterval = 1 * time.Second
 
+// defaultFlagBackoffMax caps the delay between flag-check retries while the
+// store or engine is failing (#97): a flag that could not be written is retried
+// at least this often, so it lands within this long of the outage ending.
+const defaultFlagBackoffMax = 5 * time.Second
+
+// tickBackoff is the wait before the next flag check after errs consecutive
+// failures: the tick interval, doubling per failure, capped at max (and never
+// below the interval). Games fail at their own tick phase, so their retries
+// stay spread out rather than arriving in one burst when the store returns.
+func tickBackoff(iv, max time.Duration, errs int) time.Duration {
+	if max < iv {
+		return iv
+	}
+	d := iv
+	for i := 1; i < errs && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
+}
+
 // endBroadcastTimeout bounds the reads behind one GAME_END broadcast (and one
 // flag tick). They run on the server's context, not a connection's (#88).
 const endBroadcastTimeout = 5 * time.Second
@@ -133,13 +156,21 @@ func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match
 // clock runs forever and the game hangs (and its session/goroutines leak). Every
 // flagInterval it charges elapsed time against the side to move; if that flags,
 // the session ends the game (FLAG / TIMEOUT_VS_INSUFFICIENT) and we broadcast
-// GAME_END + drop. The ticker also exits when the game is gone (ended by any
-// other path: mate/resign/draw/abort), so there is exactly one driver per live
-// game and it stops with the game.
+// GAME_END + drop.
+//
+// It is the game's only forfeit driver, so it exits ONLY when the game is gone
+// (ended and dropped by any path) or the server shuts down. A failed check (a
+// store or engine outage, or a flag write that failed) is retried with capped
+// backoff for as long as it takes (#97, GS-6 §3.5): the session adopts no state
+// from a failed write, so the next check re-decides the flag from scratch.
 func (s *Server) armFlagTicker(gameID string) {
 	iv := s.flagInterval
 	if iv == 0 {
 		iv = defaultFlagInterval
+	}
+	backoffMax := s.flagBackoffMax
+	if backoffMax == 0 {
+		backoffMax = defaultFlagBackoffMax
 	}
 	go func() {
 		t := time.NewTicker(iv)
@@ -147,16 +178,25 @@ func (s *Server) armFlagTicker(gameID string) {
 		if s.tickerExited != nil {
 			defer s.tickerExited(gameID)
 		}
-		consecutiveErrs := 0
-		const maxConsecutiveErrs = 10
+		tickErrs := 0 // consecutive failed checks
+		var retryAt time.Time
+		endFails := 0 // consecutive GAME_END broadcasts that did not go out
 		// dropBound is when the ticker gives up on an ended game it cannot
-		// broadcast: maxConsecutiveErrs ticks, and never fewer than two read
-		// timeouts' worth of ticks (see the endHeld note below).
-		dropBound := maxConsecutiveErrs
+		// broadcast: 10 ticks, and never fewer than two read timeouts' worth of
+		// ticks (see the endHeld note below).
+		dropBound := 10
 		if n := int(2*s.endTimeout()/iv) + 1; n > dropBound {
 			dropBound = n
 		}
-		for range t.C {
+		for {
+			select {
+			case <-s.reg.rootCtx.Done():
+				return // server shutdown
+			case <-t.C:
+			}
+			if tickErrs > 0 && time.Now().Before(retryAt) {
+				continue // backing off after failed checks
+			}
 			sess, ok := s.reg.Get(gameID)
 			if !ok {
 				return // game ended/dropped by some path — stop the ticker.
@@ -165,25 +205,26 @@ func (s *Server) armFlagTicker(gameID string) {
 			over, err := sess.TickGameOver(ctx)
 			cancel()
 			if err != nil {
-				// A persistent store/engine outage makes this recur every tick.
-				// Count consecutive failures and give up after a bound rather than
-				// spinning invisibly forever (reviewer finding): the game is
-				// recovered on the next reconnect/rebuild (NewSession folds from the
-				// durable stream), so a stopped ticker is safe. The failure COUNT /
-				// a bare retry each belongs in an X-14 metric/log when observability
-				// is wired (same deferral as GS-4 F2) — tracked, not inlined here.
-				consecutiveErrs++
-				if consecutiveErrs >= maxConsecutiveErrs {
-					return
+				if s.reg.rootCtx.Err() != nil {
+					return // shutting down: the error is the cancelled context
 				}
+				tickErrs++
+				if tickErrs&(tickErrs-1) == 0 { // log at 1, 2, 4, 8, ... failures
+					log.Printf("transport: flag check for %s failed (%d in a row), retrying: %v", gameID, tickErrs, err)
+				}
+				retryAt = time.Now().Add(tickBackoff(iv, backoffMax, tickErrs))
 				continue
+			}
+			if tickErrs > 0 {
+				log.Printf("transport: flag check for %s recovered after %d failures", gameID, tickErrs)
+				tickErrs = 0
 			}
 			if over {
 				// Ended by this tick, or by another path whose GAME_END broadcast
 				// did not go out (#88): (re)try it. The ticker stops once the game
 				// is dropped (the next tick sees it gone). If it keeps failing,
-				// drop the game anyway after the error bound: its result stays in
-				// the stream (RESYNC serves it, #102), and the session and this
+				// drop the game anyway after the bound: its result stays in the
+				// stream (RESYNC serves it, #102), and the session and this
 				// goroutine are reclaimed rather than leaked.
 				if r := s.broadcastGameEnd(gameID); r == endSent || r == endGone {
 					return // broadcast, here or by another path that also dropped it
@@ -192,8 +233,8 @@ func (s *Server) armFlagTicker(gameID string) {
 				// (then the game is gone, or the claim is released), and the bound
 				// spans at least two read timeouts of ticks, so a forced drop can
 				// never cut a live broadcast short whatever the tick interval.
-				consecutiveErrs++
-				if consecutiveErrs >= dropBound {
+				endFails++
+				if endFails >= dropBound {
 					log.Printf("transport: GAME_END for %s never broadcast; dropping the ended game", gameID)
 					// No seat got GAME_END: record both as missed, so each one's
 					// next AUTHENTICATE pushes the ended STATE (#102), before the
@@ -206,7 +247,7 @@ func (s *Server) armFlagTicker(gameID string) {
 				}
 				continue
 			}
-			consecutiveErrs = 0
+			endFails = 0
 		}
 	}()
 }

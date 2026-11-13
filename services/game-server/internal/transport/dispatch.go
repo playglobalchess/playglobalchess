@@ -25,6 +25,9 @@ type Server struct {
 	// idle/disconnect forfeit path §3.4 — GS-3 delegates the ticker to the caller,
 	// "the session does not own a ticker"). 0 = default.
 	flagInterval time.Duration
+	// flagBackoffMax caps the flag ticker's retry delay after failed checks
+	// (#97). 0 = defaultFlagBackoffMax.
+	flagBackoffMax time.Duration
 	// tickerExited, if set (tests only), is called when a game's flag ticker
 	// goroutine returns, so a leak test can see the ticker is gone (#88).
 	tickerExited func(gameID string)
