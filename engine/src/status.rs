@@ -137,8 +137,7 @@ pub fn is_insufficient_material(pos: &Position) -> bool {
 /// NO mating material iff one of:
 /// 1. `color` has only its king;
 /// 2. `color` has king + exactly one knight, and the opponent has only king and
-///    queens (a queen can never be forced to block its own king against a lone
-///    knight);
+///    queens (Lichess classes this as no mating material; see e4ec);
 /// 3. `color` has king + bishops only (any number), no bishops of EITHER side
 ///    stand on both square colours, and the opponent has no knight or pawn (a
 ///    same-colour bishop set can only mate if an opponent knight or pawn — or a
@@ -461,8 +460,11 @@ mod tests {
             ("2b1k3/8/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KB"),
             ("1n2k3/8/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KN"),
             // K+B(s): depends on bishop square colours and opponent N/P.
+            ("3qk3/4p3/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KQP"),
+            ("3qk3/8/8/8/8/8/8/4KNN1 w - - 0 1", true, true, "KNN v KQ"),
             ("4k3/8/8/8/8/8/8/4KB2 w - - 0 1", false, false, "KB v K"),
-            ("2b1k3/8/8/8/8/8/8/4KB2 w - - 0 1", false, false, "KB v KB same colour"),
+            ("2b1k3/8/8/8/8/8/8/4KB2 w - - 0 1", false, false, "KB v KB same colour (c8, f1 light)"),
+            ("2bqk3/8/8/8/8/8/8/4KB2 w - - 0 1", false, true, "KB v KQB same colour"),
             ("4kb2/8/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KB opposite colour"),
             ("2b1kb2/8/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KBB both colours"),
             ("1n2k3/8/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KN"),
