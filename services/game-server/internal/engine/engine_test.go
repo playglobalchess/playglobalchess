@@ -129,6 +129,40 @@ func TestHasSufficientMaterial(t *testing.T) {
 	}
 }
 
+// TestFlagTerminationLichessRule: the flag branch through the real engine
+// (#121, ENGINE-CORE §3.7). The opponent's mating material decides FLAG vs
+// TIMEOUT_VS_INSUFFICIENT, and it depends on the flagger's pieces too.
+func TestFlagTerminationLichessRule(t *testing.T) {
+	o := newOracle(t)
+	ctx := context.Background()
+	cases := []struct {
+		name    string
+		fen     string
+		flagged uint8
+		want    game.Termination
+	}{
+		// White (K+P) flags; Black's K+N can mate it (Nf2#) => loss on time.
+		{"KN v KP", "8/8/8/8/8/3n4/7P/5k1K b - - 0 1", 0, game.TermFlag},
+		// White (bare K) flags; Black's lone knight cannot mate => draw.
+		{"KN v K", "8/8/8/8/8/3n4/8/5k1K b - - 0 1", 0, game.TermTimeoutVsInsufficient},
+		// Black (K+Q) flags; White's lone knight cannot mate K+Q => draw.
+		{"KN v KQ", "3qk3/8/8/8/8/8/8/4KN2 w - - 0 1", 1, game.TermTimeoutVsInsufficient},
+		// Black (bare K) flags; White's same-colour bishops cannot mate => draw.
+		{"KBB same colour v K", "4k3/8/8/8/8/B7/8/2B1K3 w - - 0 1", 1, game.TermTimeoutVsInsufficient},
+		// Black (K+N) flags; White's bishop can mate it => loss on time.
+		{"KB v KN", "1n2k3/8/8/8/8/8/8/4KB2 w - - 0 1", 1, game.TermFlag},
+	}
+	for _, c := range cases {
+		got, err := game.FlagTermination(ctx, o, c.fen, c.flagged, 2)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("%s: termination = 0x%02x, want 0x%02x", c.name, uint8(got), uint8(c.want))
+		}
+	}
+}
+
 // TestDeterminism: the engine is pure — identical inputs give identical results
 // across calls (NFR / §8).
 func TestDeterminism(t *testing.T) {
