@@ -22,11 +22,11 @@ off; **all engine CODE is complete and merged to `main`.**
 | 6 | **Performance §6.1** — `legal_moves` < 1 ms, `is_legal` < 10 µs | ✅ | `engine/benches/movegen.rs` + `PERF.md`: legal_moves ~1.9 µs, dedicated `is_legal` ~0.28 µs; magics skipped by decision (D5), nightly threshold gate `platform/ci/check_bench.py` |
 | 7 | **No panics on malformed input** — typed errors (§5) | ✅ | `FenError`, `MoveError` (thiserror); fuzz in `gate.rs`; FFI boundary returns `FfiError`, never panics |
 | 8 | **Mobile parity §8.8** — perft+golden slice byte-identical on iOS/Android | ✅ | **Device run PASSED (2026-10-12):** iOS 3/3 (iPhone 16 Simulator, iOS 18.6, `xcodebuild test`); Android 2/2 (API 34 emulator, `connectedAndroidTest`). Both clients bind the one engine and match the host oracle byte-for-byte (startpos d5 = 4,865,609 + golden-slice FEN). Fixes along the way: iOS SwiftPM C-interop module target, Android AndroidX + JVM-17 config. |
-| 9 | **No known legal-move defect** (NFR-5) | ✅ | §8.1 corpus exact to deep depths + §8.7 differential vs `shakmaty` agrees on all 6 positions — two independent correctness nets, zero known defects |
+| 9 | **No known legal-move defect** (NFR-5) | ✅ | §8.1 corpus exact to deep depths + §8.7 differential vs `shakmaty` agrees on all 6 positions. **Correction (2026-11-13):** this box was false when signed: three defects existed and the 2026-11 audit found them. They are fixed: #119 en passant ignored pins (#195), #120 `parse_fen` accepted impossible positions (#197), #121 the flag-branch mating-material rule (#199). Neither net could catch them, because no position in the corpus or the 6-position differential exercises them. Each fix added its own regression tests. No engine defect is open (`area:engine` holds only #149, spec text). |
 | 10 | **Public API §4 reviewed** by S2 + architecture group | ✅ | **Approved 2026-10-12** by the project owner acting as S2 + architecture authority, against `docs/ops/S1-ENGINE-API-REVIEW.md` (all 5 decisions confirmed). |
 | 11 | **Spec → RATIFIED** with reviews recorded | ✅ | Review records recorded in `S1-ENGINE-API-REVIEW.md` (sign-off table) + this scorecard; ENGINE-CORE §9 boxes checked. |
 
-## G-A STATUS: GREEN (2026-10-12)
+## G-A STATUS: GREEN (2026-10-12; box 9 re-confirmed 2026-11-13 after #119-#121)
 
 All 11 §9 boxes are satisfied. **G-A is green** — per MASTER §V.2 this unblocks
 S2 live play, S1 variant work, and all puzzle/analysis work. Parked, non-blocking:
@@ -58,5 +58,3 @@ Chunk 1 (board rep + FEN + perft skeleton) → Chunk 2 (make/unmake · §8.1 cor
 golden replay · mobile parity · differential tier). 17 PRs, each reviewed and
 gate-checked.
 
-> **G-A is NOT green yet** — it is code-complete; the three boxes above are the
-> human/infra sign-offs that flip it.
