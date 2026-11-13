@@ -48,6 +48,17 @@ func (o *fakeOracle) Legality(ctx context.Context, fen, uci string, priorKeys []
 	return LegalityVerdict{Legal: false}, nil
 }
 
+// fakeStartKey is the fake's key for every start FEN: the fake carries no chess
+// logic, it only lets tests see that the start key heads PriorKeys (#100).
+const fakeStartKey uint64 = 0x5747_A27C_0000_0100
+
+func (o *fakeOracle) PositionKey(ctx context.Context, fen string) (uint64, error) {
+	if o.fail != nil {
+		return 0, o.fail
+	}
+	return fakeStartKey, nil
+}
+
 func (o *fakeOracle) HasSufficientMaterial(ctx context.Context, fen string, seatIdx uint8) (bool, error) {
 	if o.fail != nil {
 		return false, o.fail

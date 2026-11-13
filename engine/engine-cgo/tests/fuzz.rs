@@ -133,6 +133,36 @@ fn fuzz_mating_material_never_crashes() {
 }
 
 #[test]
+fn fuzz_zobrist_never_crashes() {
+    // Random bytes, plus single-byte mutations of a valid FEN so many inputs get
+    // past the parser: never a panic, and the key is written only on OK.
+    let mut rng = Rng(0x5EED_0100_2026_1113);
+    let base = b"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1".to_vec();
+    for i in 0..20_000u32 {
+        let fen: Vec<u8> = if i % 2 == 0 {
+            (0..(rng.next() % 80) as usize).map(|_| rng.byte()).collect()
+        } else {
+            let mut f = base.clone();
+            let at = (rng.next() as usize) % f.len();
+            f[at] = rng.byte();
+            f
+        };
+        let mut key: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        let (fp, fl) = if fen.is_empty() {
+            (ptr::null(), 0)
+        } else {
+            (fen.as_ptr(), fen.len())
+        };
+        // SAFETY: null-or-valid fen; valid out local.
+        let rc = unsafe { pgc_engine_zobrist(fp, fl, &mut key) };
+        assert_ne!(rc, PGC_ENG_ERR_PANIC);
+        if rc != PGC_ENG_OK {
+            assert_eq!(key, 0xFFFF_FFFF_FFFF_FFFF, "key written on error");
+        }
+    }
+}
+
+#[test]
 fn null_arguments_rejected_not_crash() {
     // Null out-pointers on apply.
     let fen = b"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";

@@ -97,6 +97,11 @@ type State struct {
 	TimeControl string
 	StartFEN    string
 	BaseMs      int64 // each seat's starting time (needed by a rewind to ply 0)
+	// StartZobrist is the engine's key of StartFEN, the first entry of the
+	// repetition history (#100). Engine-derived like CurFEN: set only when
+	// Evolve gets a GameCreated verdict (FoldWithEngine); StartKeyed says so.
+	StartZobrist uint64
+	StartKeyed   bool
 
 	Joined []bool // indexed by seat_idx
 
@@ -133,10 +138,15 @@ func (s State) seatCount() int { return len(s.Seats) }
 // SeatCount is the number of seats in the game.
 func (s State) SeatCount() int { return len(s.Seats) }
 
-// PriorKeys is the Zobrist history of the live plies (one key per ply), the
-// repetition input the engine needs (Q-GS5). Empty without verdicts.
+// PriorKeys is the repetition input the engine needs (Q-GS5): the key of the
+// start position, then the key after each live ply, so every earlier position
+// of the game is counted, the first one included (#100). A takeback truncates
+// History and keeps the start key. Empty without verdicts.
 func (s State) PriorKeys() []uint64 {
-	keys := make([]uint64, 0, len(s.History))
+	keys := make([]uint64, 0, len(s.History)+1)
+	if s.StartKeyed {
+		keys = append(keys, s.StartZobrist)
+	}
 	for _, e := range s.History {
 		keys = append(keys, e.Zobrist)
 	}
@@ -234,6 +244,10 @@ func Evolve(s State, ev Event, v *Verdict, opts FoldOptions) (State, error) {
 	switch ev.Type {
 	case EvGameCreated:
 		next, err = applyGameCreated(s, ev, opts.TimeControl)
+		if err == nil && v != nil {
+			// The engine's key of StartFEN (FoldWithEngine), #100.
+			next.StartZobrist, next.StartKeyed = v.Zobrist, true
+		}
 	case EvPlayerJoined:
 		next, err = applyPlayerJoined(s, ev)
 	case EvClockStarted:

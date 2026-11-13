@@ -190,13 +190,12 @@ func TestFlagUsesAdvancedClock(t *testing.T) {
 // (threefold) and auto-draws only when it becomes automatic (fivefold). A
 // regression that auto-drew early, or never, fails here.
 //
-// Occurrence counting (verified empirically, not assumed): the session
-// accumulates a Zobrist key per MovePlayed RESULTING position; the game's
-// INITIAL position is never a resulting key, so it is not counted. Driving the
-// knight cycle Nf3 Nf6 Ng1 Ng8 (each 4-ply cycle returns to the start and
-// revisits the post-Nf3 position), the FIRST position to reach five counted
-// occurrences is the post-Nf3 position on the 5th cycle's opening move (ply 17).
-// So: no auto-draw through the end of cycle 4 (ply 16), auto-draw at ply 17.
+// Occurrence counting (#100): the history holds the START position's key and
+// then each resulting position's key, so the start counts like any other
+// position. The knight cycle Nf3 Nf6 Ng1 Ng8 returns to the start at plies 4,
+// 8, 12 and 16, its 2nd to 5th occurrences, so the fivefold auto-draw fires at
+// ply 16 exactly. (Before #100 the start was never counted and this test
+// pinned the bug at ply 17.)
 func TestRepetitionAutoDraw(t *testing.T) {
 	fc := &fakeClock{t: time.Unix(0, 0)}
 	s, _, cancel := seedLive(t, startFEN, false, fc.now)
@@ -225,10 +224,10 @@ func TestRepetitionAutoDraw(t *testing.T) {
 				drewAtPly = ply
 				break
 			}
-			// Boundary: no auto-draw may occur at or before ply 16 (the position
-			// has only reached a CLAIMABLE count there; auto-draw before fivefold
-			// would mean a claimable draw was wrongly auto-ended).
-			if ply <= 16 && out.Terminal != nil {
+			// Boundary: no auto-draw before ply 16 (the start has only reached a
+			// CLAIMABLE count there; auto-draw before fivefold would mean a
+			// claimable draw was wrongly auto-ended).
+			if ply < 16 && out.Terminal != nil {
 				t.Fatalf("ply %d auto-ended with terminal %v — a claimable repetition "+
 					"must not auto-end before fivefold", ply, *out.Terminal)
 			}
@@ -237,9 +236,9 @@ func TestRepetitionAutoDraw(t *testing.T) {
 	if drewAtPly == 0 {
 		t.Fatal("fivefold repetition was never auto-drawn — Q-GS5 wiring broken")
 	}
-	if drewAtPly != 17 {
-		t.Fatalf("auto-draw fired at ply %d, want ply 17 (first position to reach "+
-			"five counted occurrences = fivefold-automatic)", drewAtPly)
+	if drewAtPly != 16 {
+		t.Fatalf("auto-draw fired at ply %d, want ply 16 (the start position's "+
+			"fifth occurrence = fivefold-automatic, #100)", drewAtPly)
 	}
 }
 

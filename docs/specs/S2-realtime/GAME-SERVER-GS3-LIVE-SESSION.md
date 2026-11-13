@@ -103,7 +103,9 @@ Session {
 
 `NewSession(ctx, gameID, store, oracle, opts, now)` loads the stream and folds
 it with `FoldWithEngine` (GS-2) to seed `curFEN` + the terminal/clock projection,
-and accumulates `priorKeys` by replaying the stored moves' resulting keys. This
+and accumulates `priorKeys` by replaying the stored moves' resulting keys,
+seeded with the start position's key (`pgc_engine_zobrist`, #100; GS-7 §3.2
+now owns the derivation in `State.PriorKeys`). This
 is the one O(ply) rebuild (resume cost, §3.5) — NOT the per-move path.
 
 ### 3.2 Move handling (drives GS-1 §3.6, closes Q-GS5)

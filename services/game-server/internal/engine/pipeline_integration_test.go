@@ -174,3 +174,47 @@ func TestPipelineRealEngineMate(t *testing.T) {
 		t.Fatalf("result vector = %v, want [win loss]", rv)
 	}
 }
+
+// TestOldStreamPastNewFivefoldStillFolds (#100): a stream written before #100
+// can continue past the ply where the start position now reaches fivefold
+// (ply 16 of the knight shuffle), because the old count did not see it. The
+// rebuild must still fold it: the ply-16 verdict is recorded on that History
+// entry only, and the game stays LIVE at ply 17 with no terminal on the last
+// move, so the recovery path does not end it.
+func TestOldStreamPastNewFivefoldStillFolds(t *testing.T) {
+	ctx := context.Background()
+	st, store, opts := liveState(t, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+	cycle := []string{"g1f3", "g8f6", "f3g1", "f6g8"}
+	// Plies 1-16 shuffle back to the start (its 5th occurrence is ply 16); ply
+	// 17 leaves the cycle, which the old count allowed.
+	uci := func(ply uint32) string {
+		if ply == 17 {
+			return "e2e4"
+		}
+		return cycle[(ply-1)%4]
+	}
+	var evs []game.Event
+	for ply := uint32(1); ply <= 17; ply++ {
+		evs = append(evs, game.Event{Type: game.EvMovePlayed, MovePlayed: &game.MovePlayed{
+			Ply: ply, SeatIdx: uint8((ply - 1) % 2), UCI: uci(ply),
+			ClockAfterMs: 300_000, ServerTS: uint64(ply) * 1000,
+		}})
+	}
+	if err := store.AppendBatch(ctx, streamIDFor(itGameID), st.NextSeq, evs); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	all, err := store.Load(ctx, streamIDFor(itGameID))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got, err := game.FoldWithEngine(ctx, all, opts, newOracle(t))
+	if err != nil {
+		t.Fatalf("FoldWithEngine on an old stream: %v", err)
+	}
+	if got.Phase != game.PhaseLive || got.Ply != 17 || got.LastMoveTerminal() != nil {
+		t.Fatalf("phase %s ply %d last terminal %v, want LIVE at ply 17 with none", got.Phase, got.Ply, got.LastMoveTerminal())
+	}
+	if term := got.History[15].Terminal; term == nil || *term != game.TermRepetition {
+		t.Fatalf("ply 16 verdict = %v, want REPETITION recorded on the entry", term)
+	}
+}

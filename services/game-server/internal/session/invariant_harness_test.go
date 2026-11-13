@@ -281,11 +281,12 @@ func fieldDiff(a, b game.State) string {
 }
 
 // pureDiff compares live with the engine-free Fold on every field the pure
-// fold is exact for (§3.2): everything except CurFEN and the History engine
-// fields.
+// fold is exact for (§3.2): everything except CurFEN, the start key and the
+// History engine fields.
 func pureDiff(live, pure game.State) string {
 	strip := func(s game.State) game.State {
 		s.CurFEN = ""
+		s.StartZobrist, s.StartKeyed = 0, false // engine-derived (#100)
 		h := make([]game.PlyEntry, len(s.History))
 		for i, e := range s.History {
 			e.FEN, e.Zobrist, e.Terminal = "", 0, nil

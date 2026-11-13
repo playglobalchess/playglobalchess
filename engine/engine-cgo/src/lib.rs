@@ -8,6 +8,8 @@
 //! - [`pgc_engine_apply`]: validate+apply one UCI move to a FEN, returning the
 //!   resulting FEN + terminal status/claim + the resulting Zobrist key.
 //! - [`pgc_engine_mating_material`]: the per-side FIDE-6.9 flag-branch query.
+//! - [`pgc_engine_zobrist`]: the Zobrist key of a FEN (seeds the server's
+//!   repetition history with the start position, #100).
 //! - [`pgc_engine_free`] / [`pgc_engine_abi_version`].
 //!
 //! ## Memory ownership (the one unsafe seam)
@@ -266,6 +268,46 @@ pub unsafe extern "C" fn pgc_engine_mating_material(
     }
 }
 
+/// The Zobrist key of a FEN position (ENGINE-CORE §3.7). The server seeds its
+/// repetition history with the key of the game's START position, which no
+/// `pgc_engine_apply` call returns (apply reports only resulting positions), so
+/// the first position is counted like every other (#100).
+///
+/// # Safety
+/// `fen` points to `fen_len` bytes (null only iff 0); `out_key` is non-null,
+/// writable, caller-owned.
+#[no_mangle]
+pub unsafe extern "C" fn pgc_engine_zobrist(
+    fen: *const u8,
+    fen_len: usize,
+    out_key: *mut u64,
+) -> i32 {
+    if out_key.is_null() || (fen.is_null() && fen_len != 0) {
+        return PGC_ENG_ERR_NULL_ARG;
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: validated non-null-or-zero-len above.
+        let fen_s = match unsafe { str_arg(fen, fen_len) } {
+            Some(s) => s,
+            None => return PGC_ENG_ERR_FEN,
+        };
+        let pos = match Position::from_fen(fen_s) {
+            Ok(p) => p,
+            Err(_) => return PGC_ENG_ERR_FEN,
+        };
+        // SAFETY: out_key validated non-null, caller-owned.
+        unsafe { *out_key = pos.zobrist() };
+        PGC_ENG_OK
+    }));
+    match result {
+        Ok(code) => code,
+        Err(payload) => {
+            log_panic("pgc_engine_zobrist", payload.as_ref());
+            PGC_ENG_ERR_PANIC
+        }
+    }
+}
+
 /// Free a buffer previously handed out by a [`pgc_engine_apply`] success. Must
 /// be called exactly once with the SAME ptr+len. A null `ptr` is a no-op.
 ///
@@ -449,6 +491,59 @@ mod tests {
     #[test]
     fn mating_material_bad_color_rejected() {
         assert_eq!(mating(START, 2).0, PGC_ENG_ERR_NULL_ARG);
+    }
+
+    fn key(fen: &str) -> (i32, u64) {
+        let mut k: u64 = 0;
+        // SAFETY: valid slice + out-param; test-local.
+        let rc = unsafe { pgc_engine_zobrist(fen.as_ptr(), fen.len(), &mut k) };
+        (rc, k)
+    }
+
+    #[test]
+    fn zobrist_matches_engine_and_apply() {
+        // The key of a FEN equals the engine's own key, and equals the key apply
+        // reports when a move reaches that same position.
+        let (rc, k) = key(START);
+        assert_eq!(rc, PGC_ENG_OK);
+        assert_eq!(k, Position::from_fen(START).unwrap().zobrist());
+        let (rc, after_fen, _, _, after_key) = apply(START, "e2e4", &[]);
+        assert_eq!(rc, PGC_ENG_OK);
+        assert_eq!(key(&after_fen.unwrap()), (PGC_ENG_OK, after_key));
+    }
+
+    #[test]
+    fn start_seeded_history_claims_threefold_at_ply_8() {
+        // #100: with the start key first in prior_keys, the knight shuffle's
+        // return to the start is claimable at ply 8 (3rd occurrence), not 12.
+        let cycle = ["g1f3", "g8f6", "f3g1", "f6g8"];
+        let (_, start) = key(START);
+        let mut prior = vec![start];
+        let mut fen = START.to_string();
+        for ply in 1..=8 {
+            let (rc, next, st, claim, zob) = apply(&fen, cycle[(ply - 1) % 4], &prior);
+            assert_eq!(rc, PGC_ENG_OK);
+            let want = if ply == 8 {
+                (PGC_ENG_STATUS_REPETITION, PGC_ENG_CLAIM_CLAIMABLE)
+            } else {
+                (PGC_ENG_STATUS_ONGOING, PGC_ENG_CLAIM_NONE)
+            };
+            assert_eq!((st, claim), want, "ply {ply}");
+            prior.push(zob);
+            fen = next.unwrap();
+        }
+    }
+
+    #[test]
+    fn zobrist_errors_write_nothing() {
+        let mut k: u64 = 7;
+        // SAFETY: deliberately invalid args; out-param must stay untouched.
+        let rc = unsafe { pgc_engine_zobrist(b"x".as_ptr(), 1, &mut k) };
+        assert_eq!((rc, k), (PGC_ENG_ERR_FEN, 7));
+        let rc = unsafe { pgc_engine_zobrist(std::ptr::null(), 1, &mut k) };
+        assert_eq!(rc, PGC_ENG_ERR_NULL_ARG);
+        let rc = unsafe { pgc_engine_zobrist(START.as_ptr(), START.len(), std::ptr::null_mut()) };
+        assert_eq!(rc, PGC_ENG_ERR_NULL_ARG);
     }
 
     #[test]

@@ -230,7 +230,7 @@ events write it and whether that event carries everything needed.
 | Ply, TurnIdx | 0 / seat of white | `MovePlayed` (+1), `TakebackRewound` (= `to_ply`) | event body | yes |
 | Clock per seat | `BaseMs` | `MovePlayed` (mover), `TakebackRewound` (both, §5.4), `ClockFlagged` (flagged seat set to 0) | `ClockAfterMs` in History; 0 on flag | yes |
 | Clock.FlaggedSeat | none | `ClockFlagged` | event body | yes |
-| CurFEN, PriorKeys | start FEN / empty | derived from `History` tip and keys; not stored separately | verdicts | yes, when verdicts supplied |
+| CurFEN, PriorKeys | start FEN / empty | `CurFEN` from the `History` tip; `PriorKeys` = the start position's key (`StartZobrist`, from the `GameCreated` verdict) then each `History` key, so the start position counts like any other (#100); not stored separately | verdicts | yes, when verdicts supplied |
 | History | empty | `MovePlayed` (push), `TakebackRewound` (truncate) | body + verdict | yes; engine fields only with verdicts |
 | NextSeq | 0 | every event (+1) | stream position | yes |
 | LastChangeTS, ClockStartedSet | 0 / false | `ClockStarted` (sets both, appended by the first `NewSession`), `MovePlayed` (`ServerTS`), `TakebackRewound` (`server_ts`) | event body | yes (body, not header) |

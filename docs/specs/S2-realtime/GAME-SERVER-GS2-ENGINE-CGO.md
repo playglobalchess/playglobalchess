@@ -141,9 +141,12 @@ nested ownership.
  * fallible work has succeeded, so a mid-computation error cannot leave a
  * partially-written set.
  *
- * prior_keys (ptr,len) is the Zobrist history the server folded, EXCLUDING the
- * resulting position (status_with_history's convention). prior_keys may be NULL
- * iff prior_keys_len == 0. */
+ * prior_keys (ptr,len) is the key of EVERY earlier position of the game, in
+ * order: the START position first (from pgc_engine_zobrist), then the position
+ * after each live ply up to and including `fen`. It EXCLUDES the resulting
+ * position (status_with_history's convention). prior_keys may be NULL iff
+ * prior_keys_len == 0. (Amended for #100: the start key was missing, so every
+ * return to the start position was counted once too few.) */
 int32_t pgc_engine_apply(const uint8_t *fen, size_t fen_len,
                          const uint8_t *uci, size_t uci_len,
                          const uint64_t *prior_keys, size_t prior_keys_len,
@@ -151,10 +154,17 @@ int32_t pgc_engine_apply(const uint8_t *fen, size_t fen_len,
                          int32_t *out_status, int32_t *out_claim,
                          uint64_t *out_zobrist);
 
-/* Insufficient-material query for the flag branch (§3.3). seat_idx picks the
- * side whose material is tested (the opponent of the flagged seat). */
-int32_t pgc_engine_sufficient_material(const uint8_t *fen, size_t fen_len,
-                                       uint8_t seat_idx, int32_t *out_sufficient);
+/* Per-side mating-capacity query for the flag branch (§3.3). color_idx picks
+ * the side whose material is tested (the opponent of the flagged seat). */
+int32_t pgc_engine_mating_material(const uint8_t *fen, size_t fen_len,
+                                   uint8_t color_idx, int32_t *out_can_mate);
+
+/* The Zobrist key of a FEN (#100). The server calls it once per game for the
+ * START position, the first prior_keys entry; apply reports only the keys of
+ * resulting positions. *out_key is written only on PGC_ENG_OK. Additive: the
+ * ABI version stays 1 (the Go binding and the static library are built and
+ * linked together from one commit, so an old library fails at link time). */
+int32_t pgc_engine_zobrist(const uint8_t *fen, size_t fen_len, uint64_t *out_key);
 
 /* Free a buffer handed out by a success (same ptr+len). NULL = no-op. */
 void pgc_engine_free(uint8_t *ptr, size_t len);
