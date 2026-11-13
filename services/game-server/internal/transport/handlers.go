@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
@@ -23,14 +25,17 @@ const defaultJoinTTL = 30 * time.Second
 const defaultFlagInterval = 1 * time.Second
 
 // defaultFlagBackoffMax caps the delay between flag-check retries while the
-// store or engine is failing (#97): a flag that could not be written is retried
-// at least this often, so it lands within this long of the outage ending.
+// store or engine is failing (#97). A flag that could not be written is retried
+// at least this often.
 const defaultFlagBackoffMax = 5 * time.Second
 
-// tickBackoff is the wait before the next flag check after errs consecutive
-// failures: the tick interval, doubling per failure, capped at max (and never
-// below the interval). Games fail at their own tick phase, so their retries
-// stay spread out rather than arriving in one burst when the store returns.
+// tickFailLogEvery is how often a node logs its summary of failing flag
+// checks (#97): one line per node, not one per game, so an outage across many
+// games does not flood the log.
+const tickFailLogEvery = 30 * time.Second
+
+// tickBackoff is the backoff after errs consecutive failed checks: the tick
+// interval, doubling per failure, capped at max (and never below the interval).
 func tickBackoff(iv, max time.Duration, errs int) time.Duration {
 	if max < iv {
 		return iv
@@ -43,6 +48,52 @@ func tickBackoff(iv, max time.Duration, errs int) time.Duration {
 		d = max
 	}
 	return d
+}
+
+// retryTicks is how many ticks to skip after errs consecutive failed checks.
+// The backoff is counted in ticks, so it does not drift against the ticker:
+// one failure retries on the very next tick. Beyond that the wait is jittered
+// over the upper half of the backoff (intn(n) is uniform in [0, n)), so games
+// that all failed in one outage do not retry in lockstep.
+func retryTicks(iv, max time.Duration, errs int, intn func(int) int) int {
+	n := int(tickBackoff(iv, max, errs) / iv) // ticks of backoff, >= 1
+	low := (n + 1) / 2
+	wait := low + intn(n-low+1) // in [ceil(n/2), n]
+	return wait - 1
+}
+
+// tickFailLog is a node's summary of games whose flag checks are failing (#97).
+// It logs at most once per tickFailLogEvery, and once when the last failing
+// game recovers. The zero value is ready to use.
+type tickFailLog struct {
+	mu      sync.Mutex
+	failing int // games currently retrying
+	last    time.Time
+}
+
+// fail records a failed check; first is true when the game was not already
+// failing.
+func (l *tickFailLog) fail(first bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if first {
+		l.failing++
+	}
+	if now := time.Now(); now.Sub(l.last) >= tickFailLogEvery {
+		l.last = now
+		log.Printf("transport: flag checks failing for %d game(s), retrying with backoff; latest error: %v", l.failing, err)
+	}
+}
+
+// clear records that a failing game recovered (or its ticker exited).
+func (l *tickFailLog) clear(recovered bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.failing--
+	if l.failing == 0 && recovered {
+		l.last = time.Time{}
+		log.Printf("transport: flag checks recovered")
+	}
 }
 
 // endBroadcastTimeout bounds the reads behind one GAME_END broadcast (and one
@@ -179,7 +230,12 @@ func (s *Server) armFlagTicker(gameID string) {
 			defer s.tickerExited(gameID)
 		}
 		tickErrs := 0 // consecutive failed checks
-		var retryAt time.Time
+		skip := 0     // ticks still to skip before the next check (backoff)
+		defer func() {
+			if tickErrs > 0 {
+				s.tickLog.clear(false) // exiting while failing: no longer counted
+			}
+		}()
 		endFails := 0 // consecutive GAME_END broadcasts that did not go out
 		// dropBound is when the ticker gives up on an ended game it cannot
 		// broadcast: 10 ticks, and never fewer than two read timeouts' worth of
@@ -194,12 +250,13 @@ func (s *Server) armFlagTicker(gameID string) {
 				return // server shutdown
 			case <-t.C:
 			}
-			if tickErrs > 0 && time.Now().Before(retryAt) {
-				continue // backing off after failed checks
-			}
 			sess, ok := s.reg.Get(gameID)
 			if !ok {
 				return // game ended/dropped by some path — stop the ticker.
+			}
+			if skip > 0 {
+				skip-- // backing off after failed checks
+				continue
 			}
 			ctx, cancel := context.WithTimeout(s.reg.rootCtx, s.endTimeout())
 			over, err := sess.TickGameOver(ctx)
@@ -208,15 +265,16 @@ func (s *Server) armFlagTicker(gameID string) {
 				if s.reg.rootCtx.Err() != nil {
 					return // shutting down: the error is the cancelled context
 				}
-				tickErrs++
-				if tickErrs&(tickErrs-1) == 0 { // log at 1, 2, 4, 8, ... failures
-					log.Printf("transport: flag check for %s failed (%d in a row), retrying: %v", gameID, tickErrs, err)
+				if _, ok := s.reg.Get(gameID); !ok {
+					return // dropped mid-check (a normal end): not a failure
 				}
-				retryAt = time.Now().Add(tickBackoff(iv, backoffMax, tickErrs))
+				s.tickLog.fail(tickErrs == 0, err)
+				tickErrs++
+				skip = retryTicks(iv, backoffMax, tickErrs, rand.IntN)
 				continue
 			}
 			if tickErrs > 0 {
-				log.Printf("transport: flag check for %s recovered after %d failures", gameID, tickErrs)
+				s.tickLog.clear(true)
 				tickErrs = 0
 			}
 			if over {

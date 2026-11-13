@@ -139,6 +139,12 @@ func TestFlagSurvivesStoreOutage(t *testing.T) {
 		t.Fatalf("termination = 0x%02x/0x%02x, want FLAG or TIMEOUT_VS_INSUFFICIENT", geA.GameEnd.Termination, geB.GameEnd.Termination)
 	}
 	wantReclaimed(t, h, w, gameID)
+	h.srv.tickLog.mu.Lock()
+	failing := h.srv.tickLog.failing
+	h.srv.tickLog.mu.Unlock()
+	if failing != 0 {
+		t.Fatalf("node still counts %d failing game(s) after recovery", failing)
+	}
 }
 
 // TestFlagTickerStopsOnShutdown: with the store down for good, the ticker
@@ -184,5 +190,46 @@ func TestTickBackoff(t *testing.T) {
 	}
 	if got := tickBackoff(iv, iv/2, 3); got != iv {
 		t.Errorf("a cap below the interval gives %v, want the interval %v", got, iv)
+	}
+}
+
+// TestRetryTicks pins the effective schedule in ticks: one failure retries on
+// the next tick (no extra interval), and later waits are jittered over the
+// upper half of the backoff.
+func TestRetryTicks(t *testing.T) {
+	iv, max := time.Second, 5*time.Second
+	lowest := func(int) int { return 0 }
+	highest := func(n int) int { return n - 1 }
+	for _, c := range []struct{ errs, lo, hi int }{
+		{1, 0, 0}, // backoff 1 tick: retry on the next tick
+		{2, 0, 1}, // backoff 2 ticks: wait 1 or 2
+		{3, 1, 3}, // backoff 4 ticks: wait 2 to 4
+		{4, 2, 4}, // capped at 5 ticks: wait 3 to 5
+		{50, 2, 4},
+	} {
+		if got := retryTicks(iv, max, c.errs, lowest); got != c.lo {
+			t.Errorf("errs %d: lowest skip %d, want %d", c.errs, got, c.lo)
+		}
+		if got := retryTicks(iv, max, c.errs, highest); got != c.hi {
+			t.Errorf("errs %d: highest skip %d, want %d", c.errs, got, c.hi)
+		}
+	}
+}
+
+// TestTickFailLogCounts: the node summary counts each failing game once and
+// returns to zero when they recover or their tickers exit.
+func TestTickFailLogCounts(t *testing.T) {
+	var l tickFailLog
+	err := errors.New("down")
+	l.fail(true, err)
+	l.fail(false, err) // same game, second failure
+	l.fail(true, err)  // another game
+	if l.failing != 2 {
+		t.Fatalf("failing = %d, want 2", l.failing)
+	}
+	l.clear(true)
+	l.clear(false)
+	if l.failing != 0 {
+		t.Fatalf("failing = %d after both cleared, want 0", l.failing)
 	}
 }

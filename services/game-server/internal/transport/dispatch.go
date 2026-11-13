@@ -28,6 +28,8 @@ type Server struct {
 	// flagBackoffMax caps the flag ticker's retry delay after failed checks
 	// (#97). 0 = defaultFlagBackoffMax.
 	flagBackoffMax time.Duration
+	// tickLog is the node's rate-limited summary of failing flag checks (#97).
+	tickLog tickFailLog
 	// tickerExited, if set (tests only), is called when a game's flag ticker
 	// goroutine returns, so a leak test can see the ticker is gone (#88).
 	tickerExited func(gameID string)

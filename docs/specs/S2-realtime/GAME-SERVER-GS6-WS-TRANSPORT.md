@@ -220,13 +220,26 @@ only forfeit driver, it exits only when the game is gone or the server shuts
 down (its root context is cancelled). A failed check (a store or engine
 outage, or a flag write that failed) changes nothing in the session: the
 session adopts state only after a successful write, so the next check decides
-the flag again from the unchanged state. Failed checks are retried with
-backoff: the tick interval, doubling per consecutive failure, capped at
-`flagBackoffMax` (config, default 5 s), so a flag lands within that cap of the
-store coming back. Each game fails at its own tick phase, so retries across
-games stay spread out. Failures are logged at 1, 2, 4, 8, … in a row, and
-recovery is logged once. A failed write that did commit is handled by the
-session's re-read (§5, #89, #95).
+the flag again from the unchanged state. A check that fails because the game
+was dropped mid-check is a normal end, not a failure. Failed checks are retried
+with backoff counted in ticks: one failure retries on the next tick; after
+that the backoff doubles per consecutive failure up to `flagBackoffMax`
+(config, default 5 s), and each wait is jittered over the upper half of the
+backoff so games that failed together do not retry together. A flag therefore
+lands at most `flagBackoffMax` plus one tick after the store comes back, plus
+any check still in flight, which is bounded by the 5 s read bound. A node logs
+one summary line at most every 30 s while any game's checks are failing (how
+many games, the latest error), and one line when the last one recovers. A
+failed write that did commit is handled by the session's re-read (§5, #89,
+#95). A check that keeps failing for a non-store reason (a corrupt stream, an
+engine error) is retried the same way until shutdown, at one check per 5 s.
+
+**Known limitation: clocks keep running through a store outage.** While the
+store is down no move can be persisted, so the side to move cannot stop its
+clock, and when the store returns the ticker flags every game whose clock ran
+out meanwhile. Each failed check also holds that game's session actor for up
+to the 5 s read bound. Whether clocks should pause, or flags get a grace
+period, during a detected server outage is an open product decision (§10).
 
 **The end broadcast cannot latch (#88).** One end path claims the right to
 broadcast `GAME_END` and drop the game, so a client never gets two. That
@@ -263,11 +276,11 @@ the transport's own end-to-end test (which acts as a client) do. Additive C-ABI,
 
 ### 3.8 Observability (deferred to X-14) & dependency notes
 
-The transport has no metrics yet, and logs only a few plain lines (the flag
-ticker's failed and recovered checks, #97, and a forced drop of an ended game,
-#88). The server-side failure points — `deliverMatched` session-build failure,
-`handleMove` persist failure, `send`'s write error, the flag ticker's
-`TickFlagCheck` error (retried with capped backoff, §3.5), and `dropGame` — have
+The transport has no metrics yet, and logs only a few plain lines (the node's
+rate-limited summary of failing flag checks, #97, and a forced drop of an ended
+game, #88). The server-side failure points — `deliverMatched` session-build
+failure, `handleMove` persist failure, `send`'s write error, the flag ticker's
+`TickGameOver` error (retried with capped backoff, §3.5), and `dropGame` — have
 no metric or alert today. These are the X-14 punch-list: wire a
 log/metric at each when the observability stack lands, rather than scattering
 ad-hoc logging now that X-14 would have to unify. Named here so the list is not
@@ -402,6 +415,14 @@ closed by) the §4A v1.1 amendment:
 > once and deliberately rather than eroded.
 
 
+- **Q-GS6f — clocks during a store outage (OPEN, owner decision; #97).** While
+  the store is down no move can be persisted, yet clocks keep running, so when it
+  returns the ticker flags every game whose clock ran out in the meantime, and
+  those players lose on time through no fault of their own. Options: (a) leave
+  as is; (b) a grace period, so no flag lands within N seconds of the store
+  recovering, where N is at least the outage length; (c) pause every live clock
+  while the node detects a store outage, and resume on recovery. Not decided;
+  today's behaviour is (a).
 - **Q-GS6a — WS library.** `nhooyr.io/websocket` (modern, context-aware, smaller)
   vs `gorilla/websocket` (ubiquitous, battle-tested). **Proposed:
   nhooyr.io/websocket** (context.Context-native, cleaner read/write API fitting
