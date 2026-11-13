@@ -76,7 +76,7 @@ int32_t pgc_engine_mating_material(const uint8_t *fen, size_t fen_len,
  * The server calls it once per game for the START position, which seeds
  * prior_keys; apply only reports keys of resulting positions. On PGC_ENG_OK,
  * *out_key is written; on non-OK it is NOT written. PGC_ENG_ERR_FEN = the FEN
- * is malformed or not a reachable position. */
+ * is malformed or fails parse_fen's position checks (ENGINE-CORE §5). */
 int32_t pgc_engine_zobrist(const uint8_t *fen, size_t fen_len, uint64_t *out_key);
 
 /* Free a buffer handed out by a pgc_engine_apply success (same ptr+len).
