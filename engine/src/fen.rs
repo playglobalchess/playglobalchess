@@ -456,6 +456,50 @@ mod tests {
                 "4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1",
                 FenError::ImpossibleEnPassant(sq("d6")),
             ),
+            // Colour mirrors (#120 review): each rule for the other colour.
+            (
+                "no black king",
+                "8/8/8/8/8/8/8/4K3 w - - 0 1",
+                FenError::KingCount {
+                    color: Color::Black,
+                    count: 0,
+                },
+            ),
+            (
+                "black pawn on rank 1",
+                "4k3/8/8/8/8/8/8/p3K3 w - - 0 1",
+                FenError::PawnOnBackRank(sq("a1")),
+            ),
+            (
+                "white pawn on rank 8",
+                "P3k3/8/8/8/8/8/8/4K3 w - - 0 1",
+                FenError::PawnOnBackRank(sq("a8")),
+            ),
+            (
+                "black queen-side right, rook moved",
+                "1r2k3/8/8/8/8/8/8/R3K3 w q - 0 1",
+                FenError::CastlingWithoutPieces('q'),
+            ),
+            (
+                "black in check with White to move",
+                "4k2R/8/8/8/8/8/8/4K3 w - - 0 1",
+                FenError::OpponentInCheck,
+            ),
+            (
+                "Black to move: ep on the wrong rank",
+                "4k3/8/8/8/8/8/2Pp4/4K3 b - d6 0 1",
+                FenError::ImpossibleEnPassant(sq("d6")),
+            ),
+            (
+                "Black to move: ep without the pushed pawn",
+                "4k3/8/8/8/8/8/8/4K3 b - e3 0 1",
+                FenError::ImpossibleEnPassant(sq("e3")),
+            ),
+            (
+                "Black to move: ep with the origin occupied",
+                "4k3/8/8/8/3Pp3/8/3P4/4K3 b - d3 0 1",
+                FenError::ImpossibleEnPassant(sq("d3")),
+            ),
         ] {
             assert_eq!(parse_fen(fen).unwrap_err(), want, "{why}");
         }

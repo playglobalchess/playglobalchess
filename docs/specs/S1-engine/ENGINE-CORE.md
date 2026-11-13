@@ -212,7 +212,7 @@ Failure modes to defend against:
   4. the en-passant square could not follow a double push (`ImpossibleEnPassant`). That means it is on the wrong rank for the side to move (rank 6 when White moves, rank 3 when Black moves), or it is occupied, or the pushed pawn is not beside it, or that pawn's start square is not empty;
   5. the side not to move is in check (`OpponentInCheck`).
 
-  An en-passant square that passes rule 4 but has no pawn able to capture is still **accepted**: the internal target is lenient by design (OPEN-D, §3.3), and the perft corpus relies on it. As defence in depth, castling is never generated without that side's rook on its corner, even for a position built without `parse_fen`.
+  An en-passant square that passes rule 4 but has no pawn able to capture is still **accepted**: the internal target is lenient by design (OPEN-D, §3.3), and the perft corpus relies on it. As defence in depth, castling is never generated without that side's rook on its corner, even for a position built without `parse_fen`. Piece counts other than kings (for example nine pawns, or more pieces than promotions allow) are deliberately **not** checked: they cannot make move generation misbehave.
 - **`make` called with an illegal move** → debug-build assertion; release-build contract is "callers must `is_legal` first" (S2 always does). The convenience `apply` returns `Result`.
 - **Bitboard/mailbox divergence** → debug invariant check (§3.2).
 - **Hash collision on repetition** → full-equality guard (§3.7) so a Zobrist collision can never cause a wrong draw/not-draw ruling.
