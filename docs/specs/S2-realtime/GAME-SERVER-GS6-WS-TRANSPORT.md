@@ -215,6 +215,32 @@ players both disconnect (the session + goroutines + indices are freed, not
 leaked). Without this driver a disconnected or stalled player's clock would run
 forever and the game would hang; it is NOT a deferred limitation.
 
+**The ticker never gives up on a live game (#97).** Because it is the game's
+only forfeit driver, it exits only when the game is gone or the server shuts
+down (its root context is cancelled). A failed check (a store or engine
+outage, or a flag write that failed) changes nothing in the session: the
+session adopts state only after a successful write, so the next check decides
+the flag again from the unchanged state. A check that fails because the game
+was dropped mid-check is a normal end, not a failure. Failed checks are retried
+with backoff counted in ticks: one failure retries on the next tick; after
+that the backoff doubles per consecutive failure up to `flagBackoffMax`
+(config, default 5 s), and each wait is jittered over the upper half of the
+backoff so games that failed together do not retry together. A flag therefore
+lands at most `flagBackoffMax` plus one tick after the store comes back, plus
+any check still in flight, which is bounded by the 5 s read bound. A node logs
+one summary line at most every 30 s while any game's checks are failing (how
+many games, the latest error), and one line when the last one recovers. A
+failed write that did commit is handled by the session's re-read (§5, #89,
+#95). A check that keeps failing for a non-store reason (a corrupt stream, an
+engine error) is retried the same way until shutdown, at one check per 5 s.
+
+**Known limitation: clocks keep running through a store outage.** While the
+store is down no move can be persisted, so the side to move cannot stop its
+clock, and when the store returns the ticker flags every game whose clock ran
+out meanwhile. Each failed check also holds that game's session actor for up
+to the 5 s read bound. Whether clocks should pause, or flags get a grace
+period, during a detected server outage is an open product decision (§10).
+
 **The end broadcast cannot latch (#88).** One end path claims the right to
 broadcast `GAME_END` and drop the game, so a client never gets two. That
 broadcast reads on a server-owned context with a 5 s bound, never on the
@@ -250,11 +276,12 @@ the transport's own end-to-end test (which acts as a client) do. Additive C-ABI,
 
 ### 3.8 Observability (deferred to X-14) & dependency notes
 
-The transport is deliberately logger-free, like the GS-1 pipeline (GS-4 F2): the
-server-side failure points — `deliverMatched` session-build failure,
-`handleMove` persist failure, `send`'s write error, the flag ticker's
-`TickFlagCheck` error (now bounded-retry), and `dropGame` — each produce a client
-`ERROR` but NO operator signal today. These are the X-14 punch-list: wire a
+The transport has no metrics yet, and logs only a few plain lines (the node's
+rate-limited summary of failing flag checks, #97, and a forced drop of an ended
+game, #88). The server-side failure points — `deliverMatched` session-build
+failure, `handleMove` persist failure, `send`'s write error, the flag ticker's
+`TickGameOver` error (retried with capped backoff, §3.5), and `dropGame` — have
+no metric or alert today. These are the X-14 punch-list: wire a
 log/metric at each when the observability stack lands, rather than scattering
 ad-hoc logging now that X-14 would have to unify. Named here so the list is not
 lost.
@@ -303,6 +330,7 @@ closed by) the §4A v1.1 amendment:
 | Persist fails (pipeline error) | A store error does not prove the write failed (#89, #95): the session re-reads the stream (strongly consistent, up to 3 tries), and if its events are there the command happened and is acked normally (both seats, and `GAME_END` if it ended the game). Otherwise NO ack; `ERROR{INTERNAL}`, and the session adopts the store's state. If the re-read itself fails and a later resend of that move is re-acked while the game is still live, the opponent is sent the `MOVE_ACCEPTED` and `GAME_END` is broadcast to both seats once, then the game is dropped. (Clients must not resend `MOVE`, PROTOCOL §5; a client that gets `INTERNAL` should `RESYNC`.) |
 | `MOVE` on an ended game (session dropped) | for a player seated in it, the duplicate-MOVE rule against the game rebuilt from the stream: a resend of a committed ply is re-acked, plus `GAME_END` (sender only) if that move ended the game; a new ply is `GAME_OVER`. Others keep `NOT_YOUR_SEAT` (#122). |
 | Disconnect mid-game | seat unbound, clock keeps running; reconnect → `STATE`; flag if the clock expires first. |
+| Store outage when a clock expires | the flag check fails and the session is unchanged; the ticker retries with capped backoff (default cap 5 s) for as long as the outage lasts, then flags the game and broadcasts `GAME_END` (§3.5, #97). |
 | Game ends while a seat is offline | that seat's next `AUTHENTICATE` (within 24 h, same node) pushes `STATE{status=ENDED, result}` once; `RESYNC` returns it at any time (§3.4, #102). |
 | MATCHED seat never joins (ghost-claim) | join-timeout → abort the game (resolves the GS-5 residual). |
 | SEEK into an unknown pool, or with another pool's time control | `ERROR{PROTOCOL_VIOLATION}`, logged, no enqueue, no game (#93). |
@@ -387,6 +415,14 @@ closed by) the §4A v1.1 amendment:
 > once and deliberately rather than eroded.
 
 
+- **Q-GS6f — clocks during a store outage (OPEN, owner decision; #97).** While
+  the store is down no move can be persisted, yet clocks keep running, so when it
+  returns the ticker flags every game whose clock ran out in the meantime, and
+  those players lose on time through no fault of their own. Options: (a) leave
+  as is; (b) a grace period, so no flag lands within N seconds of the store
+  recovering, where N is at least the outage length; (c) pause every live clock
+  while the node detects a store outage, and resume on recovery. Not decided;
+  today's behaviour is (a).
 - **Q-GS6a — WS library.** `nhooyr.io/websocket` (modern, context-aware, smaller)
   vs `gorilla/websocket` (ubiquitous, battle-tested). **Proposed:
   nhooyr.io/websocket** (context.Context-native, cleaner read/write API fitting
