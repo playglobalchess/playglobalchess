@@ -439,6 +439,11 @@ mod tests {
         let fen = "4k1n1/8/8/8/8/8/8/3QK3 w - - 0 1";
         assert_eq!(mating(fen, 0), (PGC_ENG_OK, 1));
         assert_eq!(mating(fen, 1), (PGC_ENG_OK, 0));
+        // #121: K+N vs K+P — Black CAN mate (the pawn blocks its own king).
+        let kn_kp = "8/8/8/8/8/3n4/7P/5k1K b - - 0 1";
+        assert_eq!(mating(kn_kp, 1), (PGC_ENG_OK, 1));
+        // K+N vs bare K — cannot.
+        assert_eq!(mating("4k3/8/8/8/8/8/8/4KN2 w - - 0 1", 0), (PGC_ENG_OK, 0));
     }
 
     #[test]

@@ -129,14 +129,25 @@ pub fn is_insufficient_material(pos: &Position) -> bool {
 /// position for either call of `is_insufficient_material` (it returns `false` —
 /// a queen is present). The two functions answer different questions.
 ///
-/// Definition (the settled FIDE-6.9 reading): `color` has mating material unless
-/// it holds ONLY one of — a lone king, K+one knight, or K+one bishop. Concretely
-/// `color` CAN mate iff it has any pawn, rook, or queen, OR two-or-more minors
-/// (two knights, bishop+knight, two bishops — all can force or allow mate
-/// against a cooperating king, which "any series of legal moves" permits). A
-/// lone king or a single minor cannot. This mirrors how Lichess/chess.com rule
-/// timeouts and is the capacity needed for the §3.3 split; it is NOT the
-/// dead-position rule and must not be "unified" with it.
+/// Definition — Lichess's rule, adopted verbatim (scalachess
+/// `InsufficientMatingMaterial.apply(board, color)`, after
+/// <http://www.e4ec.org/immr.html>). Mating material depends on the OPPONENT's
+/// pieces too, because the opponent's own men can block its king's escape
+/// squares (e.g. K+N mates K+P: `8/8/8/8/8/3n4/7P/5k1K b` → Nf2#). `color` has
+/// NO mating material iff one of:
+/// 1. `color` has only its king;
+/// 2. `color` has king + exactly one knight, and the opponent has only king and
+///    queens (Lichess classes this as no mating material; see e4ec);
+/// 3. `color` has king + bishops only (any number), no bishops of EITHER side
+///    stand on both square colours, and the opponent has no knight or pawn (a
+///    same-colour bishop set can only mate if an opponent knight or pawn — or a
+///    bishop on the other colour — blocks a flight square).
+///
+/// Everything else CAN mate: any pawn, rook, or queen; K+N+N; K+B+N; K+N vs
+/// anything but bare K/queens; K+B vs a pawn, a knight, or an opposite-colour
+/// bishop. This is a per-side *possibility* test ("any series of legal moves"),
+/// NOT the dead-position rule, and must not be "unified" with it. Chess.com's
+/// implementation is closed source; this claims parity with Lichess only.
 ///
 /// The engine only reports this capacity; whether a flag ends the game as FLAG
 /// or TIMEOUT_VS_INSUFFICIENT is S2 governance (detect-don't-govern, §3.7).
@@ -144,23 +155,38 @@ pub fn is_insufficient_material(pos: &Position) -> bool {
 pub fn has_mating_material(pos: &Position, color: Color) -> bool {
     use crate::types::Piece;
 
-    // Any pawn, rook, or queen ⇒ this side can mate.
-    for kind in [PieceType::Pawn, PieceType::Rook, PieceType::Queen] {
-        if pos.piece_bb(Piece::new(color, kind)) != 0 {
-            return true;
-        }
+    /// Dark squares under LERF (a1 = bit 0 is dark).
+    const DARK_SQUARES: u64 = 0xAA55_AA55_AA55_AA55;
+
+    let opp = color.flip();
+    let bb = |c: Color, k: PieceType| pos.piece_bb(Piece::new(c, k));
+    let king = bb(color, PieceType::King);
+    let own = pos.color_bb(color);
+    let knights = bb(color, PieceType::Knight);
+    let bishops = bb(color, PieceType::Bishop);
+
+    // 1. Lone king.
+    if own == king {
+        return false;
     }
 
-    // Otherwise capacity hinges on this side's minor count. Two or more minors
-    // (NN, BN, BB — same or opposite colour) can force or allow mate against a
-    // cooperating king; a lone king or a single minor cannot.
-    let minors = pos
-        .piece_bb(Piece::new(color, PieceType::Knight))
-        .count_ones()
-        + pos
-            .piece_bb(Piece::new(color, PieceType::Bishop))
-            .count_ones();
-    minors >= 2
+    // 2. King + exactly one knight, opponent has only king and queens.
+    if own == king | knights && knights.count_ones() == 1 {
+        let opp_k_q = bb(opp, PieceType::King) | bb(opp, PieceType::Queen);
+        return pos.color_bb(opp) != opp_k_q;
+    }
+
+    // 3. King + bishops only: no mate unless bishops (either side) span both
+    //    square colours, or the opponent has a knight or pawn to block with.
+    if own == king | bishops {
+        let all_bishops = bishops | bb(opp, PieceType::Bishop);
+        let both_colours = all_bishops & DARK_SQUARES != 0 && all_bishops & !DARK_SQUARES != 0;
+        let opp_blockers = bb(opp, PieceType::Knight) | bb(opp, PieceType::Pawn);
+        return both_colours || opp_blockers != 0;
+    }
+
+    // Any pawn, rook, or queen, or a mixed/multi-knight minor set.
+    true
 }
 
 /// End-condition status of a single position (ENGINE-CORE §4.1).
@@ -394,48 +420,105 @@ mod tests {
 
     // --- has_mating_material: the per-side FIDE-6.9 timeout capacity test ------
 
-    #[test]
-    fn mating_material_lone_king_and_single_minor_cannot() {
-        // Lone king: no mating material.
-        let p = pos("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
-        assert!(!has_mating_material(&p, Color::White));
-        assert!(!has_mating_material(&p, Color::Black));
-        // K + single knight: cannot mate.
-        let kn = pos("4k3/8/8/8/8/8/8/4KN2 w - - 0 1");
-        assert!(!has_mating_material(&kn, Color::White));
-        // K + single bishop: cannot mate.
-        let kb = pos("4k3/8/8/8/8/8/8/4KB2 w - - 0 1");
-        assert!(!has_mating_material(&kb, Color::White));
+    /// Colour-mirror a FEN: flip ranks, swap piece case and side to move. Only
+    /// for the table below, whose FENs all have `-` castling and ep fields.
+    fn mirror(fen: &str) -> String {
+        let f: Vec<&str> = fen.split(' ').collect();
+        let board: Vec<String> = f[0]
+            .split('/')
+            .rev()
+            .map(|r| {
+                r.chars()
+                    .map(|c| {
+                        if c.is_ascii_uppercase() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            c.to_ascii_uppercase()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let stm = if f[1] == "w" { "b" } else { "w" };
+        format!("{} {stm} - - {} {}", board.join("/"), f[4], f[5])
     }
 
+    /// The Lichess per-side rule (scalachess `InsufficientMatingMaterial.apply(
+    /// board, color)`), ENGINE-CORE §3.7. Each row: FEN, can White mate, can
+    /// Black mate. Every row is also checked colour-mirrored.
     #[test]
-    fn mating_material_two_minors_can() {
-        // K+N+N: two knights CAN mate a cooperating king (6.9 "any series").
-        let knn = pos("4k3/8/8/8/8/8/8/4KNN1 w - - 0 1");
-        assert!(has_mating_material(&knn, Color::White));
-        // K+B+N: can mate.
-        let kbn = pos("4k3/8/8/8/8/8/8/4KBN1 w - - 0 1");
-        assert!(has_mating_material(&kbn, Color::White));
-        // K+B+B (same or opposite colour — the per-side test does not care): can.
-        let kbb = pos("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1");
-        assert!(has_mating_material(&kbb, Color::White));
+    fn mating_material_matches_lichess_table() {
+        #[rustfmt::skip]
+        let table: &[(&str, bool, bool, &str)] = &[
+            ("4k3/8/8/8/8/8/8/4K3 w - - 0 1", false, false, "bare kings"),
+            // K+N: no mate only against bare king or king + queens.
+            ("4k3/8/8/8/8/8/8/4KN2 w - - 0 1", false, false, "KN v K"),
+            ("3qk3/8/8/8/8/8/8/4KN2 w - - 0 1", false, true, "KN v KQ"),
+            ("2qqk3/8/8/8/8/8/8/4KN2 w - - 0 1", false, true, "KN v KQQ"),
+            ("4k3/4p3/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KP"),
+            ("r3k3/8/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KR"),
+            ("2b1k3/8/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KB"),
+            ("1n2k3/8/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KN"),
+            // K+B(s): depends on bishop square colours and opponent N/P.
+            ("3qk3/4p3/8/8/8/8/8/4KN2 w - - 0 1", true, true, "KN v KQP"),
+            ("3qk3/8/8/8/8/8/8/4KNN1 w - - 0 1", true, true, "KNN v KQ"),
+            ("4k3/8/8/8/8/8/8/4KB2 w - - 0 1", false, false, "KB v K"),
+            ("2b1k3/8/8/8/8/8/8/4KB2 w - - 0 1", false, false, "KB v KB same colour (c8, f1 light)"),
+            ("2bqk3/8/8/8/8/8/8/4KB2 w - - 0 1", false, true, "KB v KQB same colour"),
+            ("4kb2/8/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KB opposite colour"),
+            ("2b1kb2/8/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KBB both colours"),
+            ("1n2k3/8/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KN"),
+            ("4k3/4p3/8/8/8/8/8/4KB2 w - - 0 1", true, true, "KB v KP"),
+            ("3qk3/8/8/8/8/8/8/4KB2 w - - 0 1", false, true, "KB v KQ"),
+            ("r3k3/8/8/8/8/8/8/4KB2 w - - 0 1", false, true, "KB v KR"),
+            ("4k3/8/8/8/8/B7/8/2B1K3 w - - 0 1", false, false, "KBB same colour v K"),
+            ("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1", true, false, "KBB opposite colour v K"),
+            // Two mixed or multiple knights, and any major or pawn: can mate.
+            ("4k3/8/8/8/8/8/8/4KNN1 w - - 0 1", true, false, "KNN v K"),
+            ("4k3/8/8/8/8/8/8/4KBN1 w - - 0 1", true, false, "KBN v K"),
+            ("4k3/8/8/8/8/8/8/3QK3 w - - 0 1", true, false, "KQ v K"),
+            ("4k3/8/8/8/8/8/8/3RK3 w - - 0 1", true, false, "KR v K"),
+            ("4k3/8/8/8/8/4P3/8/4K3 w - - 0 1", true, false, "KP v K"),
+            // #121: K+N mates K+P (the pawn blocks its own king): 1...Nf2#.
+            ("8/8/8/8/8/8/5n1P/5k1K w - - 0 1", true, true, "#121 KN v KP"),
+            ("8/8/8/8/8/3n4/7P/5k1K b - - 0 1", true, true, "#121 KN v KP, Nf2#"),
+        ];
+        for &(fen, white, black, what) in table {
+            let p = pos(fen);
+            assert_eq!(
+                has_mating_material(&p, Color::White),
+                white,
+                "{what}: White in {fen}"
+            );
+            assert_eq!(
+                has_mating_material(&p, Color::Black),
+                black,
+                "{what}: Black in {fen}"
+            );
+            let m = mirror(fen);
+            let pm = pos(&m);
+            assert_eq!(
+                has_mating_material(&pm, Color::Black),
+                white,
+                "{what} mirrored: Black in {m}"
+            );
+            assert_eq!(
+                has_mating_material(&pm, Color::White),
+                black,
+                "{what} mirrored: White in {m}"
+            );
+        }
     }
 
+    /// #121's motivating line: after 1...Nf2# Black really has mated, so a
+    /// "Black cannot mate" answer for this material would be wrong.
     #[test]
-    fn mating_material_major_or_pawn_can() {
-        // A queen, a rook, or a pawn each means this side can mate.
-        assert!(has_mating_material(
-            &pos("4k3/8/8/8/8/8/8/3QK3 w - - 0 1"),
-            Color::White
-        ));
-        assert!(has_mating_material(
-            &pos("4k3/8/8/8/8/8/8/3RK3 w - - 0 1"),
-            Color::White
-        ));
-        assert!(has_mating_material(
-            &pos("4k3/8/8/8/8/4P3/8/4K3 w - - 0 1"),
-            Color::White
-        ));
+    fn knight_mates_king_and_pawn() {
+        let mut p = pos("8/8/8/8/8/3n4/7P/5k1K b - - 0 1");
+        let m = crate::san::uci_to_move(&p, "d3f2").expect("legal move");
+        crate::movegen::make(&mut p, m);
+        assert_eq!(status(&p), GameStatus::Checkmate);
+        assert!(has_mating_material(&p, Color::Black));
     }
 
     #[test]
@@ -446,7 +529,7 @@ mod tests {
         // telling S2 nothing about the per-side timeout ruling).
         let p = pos("4k1n1/8/8/8/8/8/8/3QK3 w - - 0 1");
         assert!(has_mating_material(&p, Color::White)); // queen side
-        assert!(!has_mating_material(&p, Color::Black)); // lone-ish: K + one knight
+        assert!(!has_mating_material(&p, Color::Black)); // K + one knight v K+Q
         assert!(!is_insufficient_material(&p)); // NOT a dead position (queen present)
     }
 }
