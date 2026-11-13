@@ -238,10 +238,9 @@ pub fn status(pos: &Position) -> GameStatus {
 /// - total 5+ ⇒ `DrawRepetition(Automatic)` (fivefold).
 /// - total 3+ ⇒ `DrawRepetition(Claimable)` (threefold).
 ///
-/// Counts by Zobrist key. A caller treating a *claim* as game-ending should
-/// re-verify with full position equality (§3.7) to rule out a hash collision;
-/// this reports availability, matching the engine's "detect, don't govern"
-/// contract.
+/// Counts by Zobrist key alone; there is no full-equality check, and the
+/// collision bound is accepted (ENGINE-CORE §5). This reports availability,
+/// matching the engine's "detect, don't govern" contract.
 #[must_use]
 pub fn status_with_history(pos: &Position, prior_keys: &[u64]) -> GameStatus {
     // Position-derived conditions win over repetition.
