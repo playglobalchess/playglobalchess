@@ -374,6 +374,23 @@ mod tests {
         assert_eq!(rc, PGC_ENG_ERR_FEN);
     }
 
+    /// #120: semantically impossible positions are ERR_FEN over the C ABI,
+    /// never applied (castling used to move an enemy piece from h1).
+    #[test]
+    fn impossible_positions_are_err_fen() {
+        for (fen, uci) in [
+            ("4k3/8/8/8/8/8/8/4K2n w K - 0 1", "e1g1"), // right without own rook
+            ("4k3/8/8/8/8/8/8/8 w - - 0 1", "a1a2"),    // no white king
+            ("4k2k/8/8/8/8/8/8/4K3 w - - 0 1", "e1e2"), // two black kings
+            ("4k3/8/8/8/8/8/8/P3K3 w - - 0 1", "e1e2"), // pawn on rank 1
+            ("4k3/8/8/8/8/8/8/4K2r b - - 0 1", "e8e7"), // side not to move in check
+            ("4k3/8/8/8/4P3/8/8/4K3 w - e4 0 1", "e1e2"), // ep on the wrong rank
+        ] {
+            let (rc, _, _, _, _) = apply(fen, uci, &[]);
+            assert_eq!(rc, PGC_ENG_ERR_FEN, "{fen}");
+        }
+    }
+
     #[test]
     fn scholars_mate_reports_checkmate() {
         // Position one move before Qxf7#.

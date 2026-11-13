@@ -275,9 +275,14 @@ fn gen_castling(pos: &Position, us: Color, list: &mut MoveList) {
         return;
     }
     let all = pos.all_occ();
+    // Defence in depth (#120): never castle without our rook on its corner,
+    // even if a right survived into a position built without `parse_fen`.
+    let own_rook = Some(Piece::new(us, PieceType::Rook));
 
     // King side: squares f,g empty; king path e,f,g not attacked.
-    if pos.castling_rights.has(CastlingRights::king_side(us)) {
+    if pos.castling_rights.has(CastlingRights::king_side(us))
+        && pos.piece_at(Square::from_file_rank(7, rank).unwrap()) == own_rook
+    {
         let f = Square::from_file_rank(5, rank).unwrap();
         let g = Square::from_file_rank(6, rank).unwrap();
         if all & f.bb() == 0
@@ -289,7 +294,9 @@ fn gen_castling(pos: &Position, us: Color, list: &mut MoveList) {
         }
     }
     // Queen side: squares b,c,d empty; king path e,d,c not attacked (b may be).
-    if pos.castling_rights.has(CastlingRights::queen_side(us)) {
+    if pos.castling_rights.has(CastlingRights::queen_side(us))
+        && pos.piece_at(Square::from_file_rank(0, rank).unwrap()) == own_rook
+    {
         let b = Square::from_file_rank(1, rank).unwrap();
         let c = Square::from_file_rank(2, rank).unwrap();
         let d = Square::from_file_rank(3, rank).unwrap();

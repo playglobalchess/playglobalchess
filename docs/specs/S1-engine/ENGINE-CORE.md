@@ -205,6 +205,14 @@ The non-happy paths (CONVENTIONS: "state the edge cases, not just the happy path
 
 Failure modes to defend against:
 - **Malformed FEN / UCI / SAN** → typed error (`FenError`, `MoveError`), never a panic. S2 treats a parse error as a protocol error, not a legal-move rejection.
+- **A FEN that parses but describes an impossible position** → typed error from `parse_fen` (#120), checked after all six fields parse. Otherwise move generation and `make` misbehave: castling could move an enemy piece, en passant could delete an arbitrary piece, and a missing king reads as stalemate. A FEN is rejected (`FenError` variant in brackets) when:
+  1. a side does not have exactly one king (`KingCount`);
+  2. a pawn stands on rank 1 or 8 (`PawnOnBackRank`);
+  3. a castling right is set without that side's king on e1/e8 and its rook on the matching corner, h1/a1 or h8/a8 (`CastlingWithoutPieces`);
+  4. the en-passant square could not follow a double push (`ImpossibleEnPassant`). That means it is on the wrong rank for the side to move (rank 6 when White moves, rank 3 when Black moves), or it is occupied, or the pushed pawn is not beside it, or that pawn's start square is not empty;
+  5. the side not to move is in check (`OpponentInCheck`).
+
+  An en-passant square that passes rule 4 but has no pawn able to capture is still **accepted**: the internal target is lenient by design (OPEN-D, §3.3), and the perft corpus relies on it. As defence in depth, castling is never generated without that side's rook on its corner, even for a position built without `parse_fen`. Piece counts other than kings (for example nine pawns, or more pieces than promotions allow) are deliberately **not** checked: they cannot make move generation misbehave.
 - **`make` called with an illegal move** → debug-build assertion; release-build contract is "callers must `is_legal` first" (S2 always does). The convenience `apply` returns `Result`.
 - **Bitboard/mailbox divergence** → debug invariant check (§3.2).
 - **Hash collision on repetition** → full-equality guard (§3.7) so a Zobrist collision can never cause a wrong draw/not-draw ruling.

@@ -31,7 +31,6 @@ fn gate_fen_roundtrip_fixed_positions() {
         "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", // Position 5
         "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", // Position 6
         "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3", // ep capturable
-        "8/8/8/8/8/8/8/8 w - - 0 1",                                // empty board
         "4k3/8/8/8/8/8/8/4K3 b - - 99 150",                         // high clocks, black to move
     ];
     for fen in fens {
@@ -39,6 +38,8 @@ fn gate_fen_roundtrip_fixed_positions() {
         let round = parse_fen(&p.to_fen()).expect("re-parse of emitted FEN");
         assert_eq!(round, p, "round-trip changed the position for: {fen}");
     }
+    // An empty board has no kings: rejected since #120, not round-tripped.
+    assert!(parse_fen("8/8/8/8/8/8/8/8 w - - 0 1").is_err());
 }
 
 /// Shallow perft **smoke check** (NOT the §8.1 corpus, which lives in
