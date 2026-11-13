@@ -247,9 +247,8 @@ impl Position {
 
     /// The Zobrist key over this position's repetition-identity fields (§3.7,
     /// OPEN-B): placement + side + castling rights + ep availability. Clocks are
-    /// excluded. Stable across builds (pinned seed). Used as the hash key for
-    /// repetition detection — a claim re-checks full equality to guard against
-    /// hash collisions.
+    /// excluded. Stable across builds (pinned seed). Repetition is counted by
+    /// this key alone; the collision bound is accepted (§5).
     #[must_use]
     pub fn zobrist(&self) -> u64 {
         crate::zobrist::zobrist(self)

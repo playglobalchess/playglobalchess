@@ -10,9 +10,10 @@
 //! build and platform — required for golden tests and cross-client agreement
 //! (§1.4.1, §6.2). Changing `SEED` invalidates stored keys, so it is frozen.
 //!
-//! The key is a **hint**, never the truth: repetition claims re-check full
-//! position equality (§3.7, §5 "hash collision guard"), so a collision can
-//! never cause a wrong draw ruling.
+//! Repetition is counted by this key alone, with no full-equality re-check: a
+//! wrong ruling needs two different positions in one game to share a 64-bit
+//! key, at most P²/2 · 2⁻⁶⁴ per game of P plies. ENGINE-CORE §5 records the
+//! bound and why it is accepted.
 
 use crate::position::Position;
 use crate::types::Color;

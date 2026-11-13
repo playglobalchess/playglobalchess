@@ -29,15 +29,12 @@
 //! — and move encoding (§4.2) [2e]: [`move_to_san`], [`san_to_move`],
 //! position-aware [`uci_to_move`] / [`move_to_uci`].
 //!
-//! **Deferred to later chunks (NOT yet verified) — the rest of G-A:** magic
-//! bitboards and the §6.1 performance gate; full golden replay (§8.5); mobile
-//! parity (§8.8); the differential tier as a standing gate (§8.7). The variant
-//! seam (§3.9) is forward-looking. Chunk 2 is complete: the engine is
-//! correctness-complete for Standard, but G-A also needs the performance,
-//! golden-replay, and mobile-parity work.
+//! G-A is complete (see `docs/ops/G-A-SCORECARD.md`); the variant seam (§3.9)
+//! is forward-looking.
 //!
 //! Design tenets honored: pure, deterministic, no RNG / clock / global state
-//! (§1.4.1); stable move order by (from, to, promotion) (§3.8).
+//! (§1.4.1); a stable move order, the generator's emission order pinned by
+//! `tests/move_order.rs` (§3.8).
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
