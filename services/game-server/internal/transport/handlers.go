@@ -214,16 +214,24 @@ func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match
 // armFlagTicker starts the per-game idle/disconnect FORFEIT driver (§3.4). GS-3's
 // session does not own a ticker — "the transport/scheduler calls TickFlagCheck on
 // a timer" — so the transport must drive it, or a disconnected/stalled player's
-// clock runs forever and the game hangs (and its session/goroutines leak). Every
-// flagInterval it charges elapsed time against the side to move; if that flags,
-// the session ends the game (FLAG / TIMEOUT_VS_INSUFFICIENT) and we broadcast
-// GAME_END + drop.
+// clock runs forever and the game hangs (and its session/goroutines leak).
+//
+// It sleeps until the session's published deadline (session.NextTick: the
+// instant the side to move flags, or the first-move timeout) and checks then,
+// so a flag lands at the instant the clock runs out and no per-game work runs
+// while no clock is near zero (#182). Every committed command republishes the
+// deadline and wakes the timer, so a move that hands the clock to a side with
+// less time re-arms it earlier. The flag ends the game (FLAG /
+// TIMEOUT_VS_INSUFFICIENT) and we broadcast GAME_END + drop.
 //
 // It is the game's only forfeit driver, so it exits ONLY when the game is gone
 // (ended and dropped by any path) or the server shuts down. A failed check (a
 // store or engine outage, or a flag write that failed) is retried with capped
 // backoff for as long as it takes (#97, GS-6 §3.5): the session adopts no state
-// from a failed write, so the next check re-decides the flag from scratch.
+// from a failed write, so the next check re-decides the flag from scratch. An
+// ended game is checked one interval after it ends, to repair a GAME_END
+// broadcast another path could not send (#88), and then every interval until
+// it is broadcast or the drop bound is reached.
 func (s *Server) armFlagTicker(gameID string) {
 	iv := s.flagInterval
 	if iv == 0 {
@@ -233,14 +241,17 @@ func (s *Server) armFlagTicker(gameID string) {
 	if backoffMax == 0 {
 		backoffMax = defaultFlagBackoffMax
 	}
+	sess, ok := s.reg.Get(gameID)
+	if !ok {
+		return
+	}
 	go func() {
-		t := time.NewTicker(iv)
+		t := time.NewTimer(time.Hour)
 		defer t.Stop()
 		if s.tickerExited != nil {
 			defer s.tickerExited(gameID)
 		}
 		tickErrs := 0 // consecutive failed checks
-		skip := 0     // ticks still to skip before the next check (backoff)
 		defer func() {
 			if tickErrs > 0 {
 				s.tickLog.clear(false) // exiting while failing: no longer counted
@@ -249,28 +260,68 @@ func (s *Server) armFlagTicker(gameID string) {
 		// endFails counts GAME_END broadcasts that did not go out. A failed
 		// check in between does not reset it (an ended game's checks do not
 		// touch the store, so this needs a flapping store), so it counts failed
-		// broadcasts, not consecutive ticks. dropBound is when the ticker gives
+		// broadcasts, not consecutive checks. dropBound is when the ticker gives
 		// up on an ended game it cannot broadcast: 10 failed broadcasts, and
-		// never fewer than two read timeouts' worth, each at least one tick
+		// never fewer than two read timeouts' worth, each at least one interval
 		// apart (see the endHeld note below).
 		endFails := 0
 		dropBound := 10
 		if n := int(2*s.endTimeout()/iv) + 1; n > dropBound {
 			dropBound = n
 		}
+		// retryAt, when non-zero, is a check already scheduled on the wall
+		// clock (a backoff after a failure, or an ended game's repair); a wake
+		// does not move it.
+		var retryAt time.Time
 		for {
+			wait, armed := time.Duration(0), true
+			switch tk := sess.NextTick(); {
+			case !retryAt.IsZero():
+				wait = time.Until(retryAt)
+			case tk.Ended:
+				retryAt = time.Now().Add(iv)
+				wait = iv
+			case tk.Due:
+				wait = time.UnixMilli(int64(tk.AtMs)).Sub(s.now())
+			default:
+				armed = false // no clock can run out: sleep until a wake
+			}
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+			if armed {
+				if wait < 0 {
+					wait = 0
+				}
+				t.Reset(wait)
+			}
 			select {
 			case <-s.reg.rootCtx.Done():
 				return // server shutdown
+			case <-sess.Closed():
+				// The session stopped (dropped). Follow a replacement opened
+				// for the same game, as the per-tick lookup used to.
+				if next, ok := s.reg.Get(gameID); ok && next != sess {
+					sess = next
+					continue
+				}
+				return
+			case <-sess.TickChanged():
+				if _, ok := s.reg.Get(gameID); !ok {
+					return
+				}
+				continue // re-read the deadline
 			case <-t.C:
 			}
-			sess, ok := s.reg.Get(gameID)
-			if !ok {
+			if _, ok := s.reg.Get(gameID); !ok {
 				return // game ended/dropped by some path — stop the ticker.
 			}
-			if skip > 0 {
-				skip-- // backing off after failed checks
-				continue
+			retryAt = time.Time{}
+			if s.tickChecked != nil {
+				s.tickChecked(gameID)
 			}
 			ctx, cancel := context.WithTimeout(s.reg.rootCtx, s.endTimeout())
 			over, err := sess.TickGameOver(ctx)
@@ -284,7 +335,7 @@ func (s *Server) armFlagTicker(gameID string) {
 				}
 				s.tickLog.fail(tickErrs == 0, err)
 				tickErrs++
-				skip = retryTicks(iv, backoffMax, tickErrs, rand.IntN)
+				retryAt = time.Now().Add(time.Duration(retryTicks(iv, backoffMax, tickErrs, rand.IntN)+1) * iv)
 				continue
 			}
 			if tickErrs > 0 {
@@ -292,19 +343,19 @@ func (s *Server) armFlagTicker(gameID string) {
 				tickErrs = 0
 			}
 			if over {
-				// Ended by this tick, or by another path whose GAME_END broadcast
+				// Ended by this check, or by another path whose GAME_END broadcast
 				// did not go out (#88): (re)try it. The ticker stops once the game
-				// is dropped (the next tick sees it gone). If it keeps failing,
-				// drop the game anyway after the bound: its result stays in the
-				// stream (RESYNC serves it, #102), and the session and this
-				// goroutine are reclaimed rather than leaked.
+				// is dropped. If it keeps failing, drop the game anyway after the
+				// bound: its result stays in the stream (RESYNC serves it, #102),
+				// and the session and this goroutine are reclaimed rather than
+				// leaked.
 				if r := s.broadcastGameEnd(gameID); r == endSent || r == endGone {
 					return // broadcast, here or by another path that also dropped it
 				}
 				// endHeld counts too: a holder finishes within one read timeout
 				// (then the game is gone, or the claim is released), and the bound
-				// spans at least two read timeouts of ticks, so a forced drop can
-				// never cut a live broadcast short whatever the tick interval.
+				// spans at least two read timeouts of intervals, so a forced drop
+				// can never cut a live broadcast short whatever the interval.
 				endFails++
 				if endFails >= dropBound {
 					log.Printf("transport: GAME_END for %s never broadcast; dropping the ended game", gameID)
@@ -317,9 +368,15 @@ func (s *Server) armFlagTicker(gameID string) {
 					s.dropGame(gameID)
 					return
 				}
+				retryAt = time.Now().Add(iv)
 				continue
 			}
 			endFails = 0
+			if tk := sess.NextTick(); tk.Due && !time.UnixMilli(int64(tk.AtMs)).After(s.now()) {
+				// The check did nothing although the deadline has passed (the
+				// two disagree): never spin, look again one interval later.
+				retryAt = time.Now().Add(iv)
+			}
 		}
 	}()
 }

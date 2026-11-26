@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
@@ -55,6 +56,52 @@ type Session struct {
 	// behind the store. The next command tries to rebuild, and carries on if
 	// it cannot (a seq conflict on its write heals it).
 	stale bool
+
+	// tick is the published flag deadline (#182), rewritten by the actor
+	// after every command; tickWake is signalled (coalesced, capacity 1) when
+	// it changes. One reader: the transport's flag timer.
+	tick     atomic.Pointer[Tick]
+	tickWake chan struct{}
+}
+
+// Tick is when the session next needs a flag check (#182).
+type Tick struct {
+	// AtMs is the epoch ms at which a tick can first end the game; valid only
+	// when Due. No tick can change anything while Due is false.
+	AtMs uint64
+	Due  bool
+	// Ended reports the game is over; the transport still checks it once, to
+	// repair a GAME_END broadcast that did not go out (#88).
+	Ended bool
+}
+
+// NextTick returns the session's current flag deadline. Safe from any goroutine.
+func (s *Session) NextTick() Tick {
+	if t := s.tick.Load(); t != nil {
+		return *t
+	}
+	return Tick{}
+}
+
+// TickChanged is signalled when NextTick changes (coalesced: one pending
+// signal at most). It has a single intended reader, the flag timer.
+func (s *Session) TickChanged() <-chan struct{} { return s.tickWake }
+
+// Closed is closed when the session's actor has stopped.
+func (s *Session) Closed() <-chan struct{} { return s.quit }
+
+// publishTick recomputes the flag deadline from s.st. Actor goroutine only.
+func (s *Session) publishTick() {
+	at, due := game.NextTickMs(s.st, s.opts)
+	next := Tick{AtMs: at, Due: due, Ended: s.st.Phase == game.PhaseEnded}
+	if old := s.tick.Load(); old != nil && *old == next {
+		return
+	}
+	s.tick.Store(&next)
+	select {
+	case s.tickWake <- struct{}{}:
+	default:
+	}
 }
 
 // Config bundles a Session's dependencies. Now may be nil (time.Now).
@@ -112,6 +159,7 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		now:            now,
 		commands:       make(chan command),
 		quit:           make(chan struct{}),
+		tickWake:       make(chan struct{}, 1),
 		abortBeforePly: cfg.AbortBeforePly,
 	}
 	s.cmdTimeout = cfg.CommandTimeout
@@ -133,6 +181,7 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 	if _, err := s.exec(ctx, game.CmdStartClock{}); err != nil {
 		return nil, fmt.Errorf("session: start clock: %w", err)
 	}
+	s.publishTick()
 	return s, nil
 }
 
@@ -272,6 +321,9 @@ func (s *Session) Run(ctx context.Context) {
 // process alive. finish runs last, so the caller wakes after the result is set.
 func (s *Session) applyRecovered(ctx context.Context, cmd command) {
 	defer cmd.finish()
+	// Any command, a failed or panicked one included, may have changed s.st
+	// (a reload, a confirmed commit): republish before the caller wakes.
+	defer s.publishTick()
 	cctx, cancel := context.WithTimeout(ctx, s.cmdTimeout)
 	defer cancel()
 	defer func() {
