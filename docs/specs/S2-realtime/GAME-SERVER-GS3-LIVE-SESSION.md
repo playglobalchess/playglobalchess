@@ -281,6 +281,29 @@ tweak.
   than a discipline reviewers must re-check. The mutex form is simpler for GS-3's
   no-network tests but pushes the ownership question to the transport chunk.
   Flag if you want the mutex form for now and the actor loop at the transport.
+  **Lifecycle rules (#125, accepted with the actor loop).**
+  - *Shutdown:* when `Run` returns, for any reason, it closes the session, so
+    a command sent before or after that fails with `errSessionClosed` instead
+    of blocking. A caller with no deadline can never hang on a dead actor.
+  - *Deadline:* each command's store and engine calls run under a deadline
+    from `Config.CommandTimeout` (default 10 s), derived from the Run context.
+    The caller's context still only abandons a command the actor has not
+    accepted (a committed move is never reported as failed). A hung store call
+    fails that command at the deadline and the next command is served.
+  - *Panic:* a command that panics is logged with its stack and fails with
+    `errCommandPanic` (never a silent zero-value success). The projection is
+    then untrusted, so the next command first rebuilds it from the store. A
+    failed rebuild fails that command and is retried on the next.
+  - *Seats:* `Resign` and `Abort` refuse an out-of-range seat with
+    `ErrSeatOutOfRange` before any append. `SystemActor` (0xFF) is also
+    accepted as the aborter (the fold allows it); today's join timeout aborts
+    with seat 0, and no wire path can send 0xFF.
+  - *Unconfirmed writes:* a persist error whose re-read cannot confirm the
+    write (the deadline or an outage can fail the re-read too) makes the
+    next command try a rebuild first (best effort: if the store is still
+    down it runs anyway, and a seq conflict on its write heals the
+    projection), so a stale projection is not served once the store is back. A command that finished is never
+    reported as closed, even when Run exits at that moment.
 - **Q-GS3B — where the repetition plumbing lands — PROPOSED (a: one coordinated
   interface change here).** Closing Q-GS5 needs the `LegalityOracle` to accept
   the prior Zobrist history and the `LegalityVerdict` to carry the resulting

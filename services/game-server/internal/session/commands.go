@@ -74,18 +74,18 @@ func (s *Session) StateSnapshot(ctx context.Context) (Snapshot, error) {
 	if err := s.dispatch(ctx, c, c.done); err != nil {
 		return Snapshot{}, err
 	}
-	return c.snap, nil
+	return c.snap, c.err
 }
 
 type snapCmd struct {
 	snap Snapshot
+	err  error
 	done chan struct{}
 }
 
-func (c *snapCmd) apply(_ context.Context, s *Session) {
-	defer close(c.done)
-	c.snap = s.snapshot()
-}
+func (c *snapCmd) apply(_ context.Context, s *Session) { c.snap = s.snapshot() }
+func (c *snapCmd) fail(err error)                      { c.snap, c.err = Snapshot{}, err }
+func (c *snapCmd) finish()                             { close(c.done) }
 
 // SubmitMove decides one MOVE for the authenticated seat (§4). The serverTS
 // argument is ignored: the session's own clock times every move (never trust
