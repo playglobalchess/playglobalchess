@@ -1,288 +1,250 @@
-# Game-server GS-9 — clock credit and abort after an outage (design spec)
+# Game-server GS-9 — a clock that never charges players for our downtime (design spec)
 
 | Field | Value |
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS9 (closes GS-6 Q-GS6f; amends GS-6 §3.5, GS-7 §3.5, PROTOCOL §4A) |
 | Owner | S2 Real-time |
 | Status | DRAFT |
-| Version | 0.2 (answers the first independent review, section 12) |
+| Version | 0.3 (fresh design; supersedes 0.1 and 0.2, section 11) |
 | Last updated | 2026-11-27 |
 | Fixes (issues) | #207; also supplies the restart-downtime rule GS-8 stage 1 needs (GS-8 Q1) |
-| Depends on | GS-4 (event store), GS-6 (ticker, #97 retry), GS-7 (fold, `LastChangeTS`, first-move rule, #183 receipt time) |
-| Owner decisions | 2026-11-27: exact credit, T = 2 min, no bonus time, additive wire change (section 9), heartbeat in its own table (section 3) |
+| Depends on | GS-4 (event store), GS-6 (ticker, #97, #182), GS-7 (fold, `LastChangeTS`, first-move rule, #183 receipt time) |
+| Owner decisions | 2026-11-27: exact credit, T = 2 min, no bonus time |
 
-> **Why this exists.** While the store is down no move can be saved, but clocks
-> keep running. When the store returns, the flag ticker flags every game whose
-> clock ran out meanwhile, so players lose on time for a fault that was ours.
-> A node restart does the same. The owner decided on 2026-11-26: **credit time
-> for short outages and abort games after long ones**.
+## 1. What the player gets
 
-## 1. Scope
+| What happens | What the player sees |
+|---|---|
+| A hiccup under 1.5 s | Nothing. This is network lag (#82). |
+| We cannot serve for 1.5 s to 2 min (store outage, pause, restart, deploy) | A "server problem, clocks paused" notice. Nobody flags. When service returns both clocks show exactly what they were when we stopped. A move sent meanwhile is played when service returns. |
+| We cannot serve for more than 2 min | The game is aborted with no rating change and a message saying why. |
 
-**In scope**
-- Detecting an outage, a node pause or a restart, with a start and an end.
-- A durable event that gives the time back, so a rebuilt session has the same
-  clocks (GS-7 invariant I3, #203).
-- Aborting every affected live game when the outage is longer than T.
-- Not flagging anyone while a credit may still be owed.
-- Telling clients.
+Lichess gives a fixed +10 to +20 s on a planned restart and nothing for a crash,
+and it never aborts. Chess.com aborts live games on a restart. This design
+gives back exactly the lost time, in every case, and aborts only when a game
+cannot sensibly continue.
 
-**Out of scope**
-- Moving a game to another node (GS-8 stage 2 reuses the event, section 8).
-- Lichess-style fixed bonus time. The credit is exactly the lost time.
-- Rating (NFR-4): an outage abort is unrated, like any abort.
+## 2. The idea in one paragraph
 
-## 2. Requirements traced
+Earlier drafts tried to detect an outage after it happened and then patch a
+credit into every game's clock. That produced double credits, ordering
+problems, a write storm at recovery and a race between a flag and the credit.
+The root cause is that the clock was a running total that someone had to
+correct. Here the clock is **a pure function of two stored facts**: the game's
+own events, and the node's **service record**, a small append-only list of the
+intervals in which the node could not prove it was serving. A game is never
+patched. Nothing needs deduplicating, because the credit is the length of the
+overlap of two stored intervals, and the same inputs give the same answer on
+any node, live or rebuilt.
+
+## 3. Requirements traced
 
 | Req | How this spec meets it |
 |---|---|
-| NFR-4 | An outage abort ends with no result and no rating change (section 6). |
-| NFR-7 | The credit is a stored event written before any flag decision. |
-| NFR-9 | The fold reads only stored events and real timestamps (section 4). |
-| GS-7 I3 | Live and rebuilt clocks agree because the credit is stored. |
-| #95 | One failed or ambiguous write never opens a window (section 3). |
+| NFR-4 | An outage abort ends with no result and no rating change (section 8). |
+| NFR-7 | A flag or an abort is decided only with proof that no unrecorded gap exists (section 6). |
+| NFR-9 | A live clock is replayable from the game stream and the service record, both durable (section 5). |
+| GS-7 I3 | Live and rebuilt sessions read the same two inputs, so they agree. |
+| #95 | One failed or ambiguous write opens no gap. Only a missed lease renewal does (section 4). |
 
-## 3. Detecting a window
+## 4. The service record: lease and gaps
 
-A game's own failures cannot tell an outage from a bad moment, and the flag
-timer is deadline-driven (#182), so detection is node-wide. A window is
-`{start_ts, end_ts, reason}` in wall-clock milliseconds. Its length is measured on
-the monotonic clock, so an NTP step cannot change it.
+**Lease.** Each node holds a lease item `lease/{node_id}` in the event table,
+reserved key space, same table and write path as game events. Fields:
+`{incarnation, renewed_ms}`. The node renews it every **P = 1 s** (timeout 1 s)
+with a conditional put that requires its own incarnation. The lease probes the
+exact dependency games need: if the event table cannot take a write, the
+lease fails, and a lease on any other table would not say so. Cost: one small
+write per node per second.
 
-**Heartbeat.** Each node writes one item every 2 s (timeout 1 s) to a small
-table `node_health`, keyed by `node_id`: `{incarnation, ok_ms, windows}`. It is
-a separate table so that throttling of the event table cannot starve it and
-the event table's change feed carries no heartbeat noise. The put is
-conditional on `incarnation <= mine`, so a zombie older process cannot
-overwrite a newer one's item and learns it is superseded. One item per node, no
-growth. This is inside ADR-16's amended scope (index and hint tables only, no
-game state).
+**Incarnation.** A counter, not a time. At start the node reads its lease item
+with a consistent read and writes `incarnation + 1` with a condition on the old
+value. A zombie older process fails its next renewal, learns it is superseded,
+and **must stop serving**, not just stop writing the lease.
 
-**Three signals open a window.**
-1. **Store failure.** Two consecutive failed heartbeats, or three consecutive
-   store errors (not seq conflicts) on game writes with no success between. One
-   failed or ambiguous write opens nothing (#95). `start_ts` is the last
-   successful heartbeat or game write, so it is backdated by at most 2 s plus the
-   timeout. `end_ts` is the first success of both a heartbeat and a game write.
-2. **Pause.** A gap between two successful heartbeats of more than 4 s (a GC
-   stop, VM freeze or sleep produces no failed write) is the window
-   `[previous ok, now]`, reason 3.
-3. **Restart.** At start the node reads its own previous item with a consistent
-   read. The window is `[previous ok_ms, build time of each game]`, reason 2.
-   The end is per game, because a game is rebuilt after the node starts. If the
-   read fails, the node does not serve and retries; it treats "no item" as a
-   first start only when a consistent read confirms the item is absent.
+**Gap.** Two consecutive successful renewals at `t1` and `t2` with
+`t2 - t1 > S = 1.5 s` mean the node was not provably serving in `(t1, t2)`.
+This single rule covers a store outage, a process pause (GC, VM freeze), a
+restart (the new incarnation compares its first renewal with the old item's
+`renewed_ms`), and a slow deploy. There is no failure counting. The credit
+starts at `t1`, the last proof of service, so it can be up to one renewal
+period early, a bounded advantage for the player on move. It is never late.
+Time wrongly missed is below `S`, indistinguishable from lag, and #82 owns it.
 
-**Durable windows.** A closed window is written into the item's `windows` list
-(at most 16, kept 1 hour) before any game credits it. A node that crashes
-between a window closing and the credits being written therefore loses nothing:
-the next incarnation reads the list and applies it. Applying is idempotent
-(section 4), so reading a window twice is harmless.
+**Service record.** Before a node serves again after a gap it appends one
+`ServiceGap{start_ms, end_ms, node_id, incarnation}` to the service stream
+`svc/{cluster}` (event-table stream, conditional append, retried until it
+succeeds). One write per gap, whatever the number of games. The record is
+append-only and tiny. Gaps are read into memory at start and on each append.
 
-**Limits, stated.** An outage shorter than one missed heartbeat (about 3 s) is
-not credited, and the cliff is deliberate. Windows are not merged: each is
-applied on its own, and overlap is removed by the watermark.
+**First start.** If a consistent read confirms there is no lease item, there is
+no gap. If the read fails, the node does not serve.
 
-**False windows.** A heartbeat that fails while game writes succeed (a
-permissions fault, a stuck goroutine) opens a window of at most T and never an
-abort: a window longer than T aborts games only if a real game write or read
-also failed inside it. Otherwise the node alarms and credits at most T.
+**Clock source.** Stamps are wall-clock milliseconds, since a freeze stops the
+monotonic clock. A wall step forward of 1.5 s or more reads as a gap, which
+favours players, and one of T or more aborts games. Operations must slew
+clocks, not step them, and the node alarms on a step.
 
-## 4. The credit: real timestamps and a watermark
+## 5. The clock projection
 
-v0.1 shifted `LastChangeTS` by the credit. That made it a non-real timestamp,
-so comparing a window with it was wrong, and a rebuilt session could credit an
-older window a second time. v0.2 keeps `LastChangeTS` real.
+`Gaps.Overlap(a, b)` is the length of the union of recorded gaps inside
+`[a, b]`. The game fold and the stored events do not change: `LastChangeTS` stays
+a real timestamp and `ClockAfterMs` is stored per move as today. Only the
+functions that read the running clock take a `Gaps` argument:
 
-**State added to the fold (GS-7).**
-- `CreditedMs`: time credited since the last `LastChangeTS` write. Reset to 0
-  every time `LastChangeTS` is written (a move, a takeback rewind, the start).
-- `CreditedThrough`: a watermark in wall-clock milliseconds. It never goes down
-  and is not reset.
+- **Elapsed.** `elapsed(now) = max(0, (now - LastChangeTS) - Overlap(LastChangeTS, now))`.
+  `ClocksAt`, flag decisions and the first-move timeout use it, so one change
+  covers the STATE projection, the tick and the move charge.
+- **Move charge (#183).** A move received at `r` is charged
+  `(r - LastChangeTS) - Overlap(LastChangeTS, r)`, with `r` clamped as today.
+  A gap before `r` is not charged. A gap after `r`, while the move waited, is
+  charged to nobody: the opponent's clock starts when the move is processed.
+- **Next tick (#182).** The deadline is computed with the gaps known now. When
+  the timer fires, the node re-checks with the gaps known then and re-arms if
+  time was credited meanwhile.
+- **Only the running clock gains.** The opponent's clock was not running, so
+  its overlap with the gap changes nothing: it is not charged either.
+- **Takeback and first moves.** A rewind sets `LastChangeTS` to the rewind time,
+  so older gaps fall outside `[LastChangeTS, now]`. The first-move timeout and the
+  join abort use the same elapsed function.
+- **Ended games** need no gaps: `GameEnded` and the per-move clocks are stored.
+  Fair-play think time is `ServerTS` difference minus `Overlap` over the same
+  interval.
 
-**Elapsed time.** `elapsed = max(0, now - LastChangeTS - CreditedMs)`. Flag
-decisions, the first-move timeout and `NextTickMs` (#182) all use it.
+## 6. The serving proof: one rule for every clock decision
 
-**Event.** `ClockCredited{start_ts: u64, end_ts: u64, reason: u8}`, code `0x12`.
-It carries real times only. There is no `credit_ms` and no `server_ts`, so
-re-deciding the same window gives byte-identical events (needed for the #95
-ambiguous-commit comparison).
+A decision that reads a running clock is valid only if the node holds a
+**serving proof** at that moment:
 
-**Fold rule.** With `s = max(start_ts, LastChangeTS, CreditedThrough)`:
-`CreditedMs += max(0, end_ts - s)` and
-`CreditedThrough = max(CreditedThrough, end_ts)`. The fold rejects an event with
-`end_ts <= start_ts`, and rejects `ClockCredited` unless the game is live with
-its clock started. Because of the watermark, an overlapping or repeated window
-adds nothing the second time, a rebuild cannot double credit, and two nodes
-that saw the same outage credit it once. A credit is never negative.
+1. its lease was renewed within the last `S` (1.5 s), and
+2. every gap up to that renewal is already in the service record, and
+3. its incarnation is current.
 
-**Who is credited.** Only the clock that is running: the side to move after
-ply 2, or the first-move timeout before it. The opponent's clock is not
-running, so it gets nothing.
+Without a proof, the node does not decide, it waits. The proof comes back as
+soon as the next renewal succeeds and the gap is appended. This one rule
+replaces the earlier hold, ordering and corroboration rules:
 
-**A queued move (#183).** A MOVE is charged only up to its receipt time `r`.
-Before the move is decided, an unapplied window is clipped to `end_ts = min(end,
-r)`, so credit covers only the part of the window the mover spent waiting. A
-window that ended after `r` is credited to nobody: the opponent's clock starts at
-processing time, which is after the window. A move received before the window
-starts gets no credit for it.
+- **Flag tick, first-move abort, join abort.** The timer fires, checks the
+  proof, and if there is none waits for it, then recomputes with the new gaps.
+  A pause that stops the process cannot flag anyone, because after the pause
+  the lease age is above `S`.
+- **MOVE and takeback accept.** They wait in the game's queue, keeping the
+  receipt time `r` (stamped at the socket read, #183). With the proof back they
+  are decided with the gaps, so the outage is never charged. If the wait passes
+  the command timeout the player gets `ERROR{INTERNAL}` as today. The client does
+  not resend (ADR-19 (a)), and the credited `STATE` shows the true clock.
+- **Resign, draw offer and accept, abort.** They do not read the clock and
+  proceed. A resign is never held back by an outage.
+- **No starvation.** The proof depends only on the lease and the service stream,
+  never on a game's stream, so one poisoned game cannot hold the others. If the
+  store is down, no write can succeed anyway; the wait ends with the first
+  successful renewal and gap append.
+- **No write storm.** Recovery is one lease write and one gap write. Games
+  need no write to get their credit.
 
-**When it is applied.** Before any other decision for that game, in the same
-atomic write as the command's own events, in window order. A node tells idle
-sessions the moment a window closes. Credit writes are spread over up to 1 s
-with jitter and retried on the game's own backoff (at most 5 s), so a node with
-many games does not throttle its own recovery. A takeback or a move in the
-gap resets the baseline, so an older window is clamped away by `LastChangeTS`.
+## 7. Rebuild and restart
 
-## 5. No flag while a credit may be owed
+- A rebuilt session loads the game stream and the in-memory service record.
+  Live and rebuilt agree because they read the same two durable inputs.
+- **Restart.** The new incarnation writes the gap `(old renewed_ms, first
+  renewal)` before serving. The gap is the node's downtime, whatever the number
+  of games or when each is rebuilt. A slow rebuild adds no gap and aborts
+  nothing.
+- A node never serves while the lease read, the lease write or the gap append is
+  failing.
+- **Planned deploy.** It is the same gap, with the same exact credit. A drain
+  that hands games to another node first is GS-8 stage 2 (D5).
 
-A store write can recover before the heartbeat closes the window, so a tick in
-that gap would flag a player for outage time. The rule:
+## 8. The abort (gap longer than T)
 
-- **Hold.** While the node is in a window, or within **H = 5 s** after the last
-  failed heartbeat or game write, or while any closed window is not yet applied
-  to a game, `decideTick` does not flag that game and does not abort it for the
-  first-move timeout or the join window. The deadlines of both are measured
-  from `LastChangeTS` plus `CreditedMs`, so they move with the credit.
-- **Order on a tick.** Abort for a long window, then credit, then flag. An abort
-  on an ended game is a no-op.
-- **Cost.** A flag can be late by at most H plus the credit retry. That is an
-  acceptable cost against an unfair flag, and it is only paid after a fault.
-- **Join window.** The join abort is held and its deadline extended by the
-  overlap in the same way, so an outage during the join wait does not abort a
-  game nobody could join.
+T is **2 minutes**. The rule is the same for every cause, because the lease
+itself proves the absence of service. No corroboration is needed.
 
-## 6. The abort (window longer than T)
+- After appending a gap longer than T, the node aborts every live game whose
+  `LastChangeTS` is before the gap's end, with the session command
+  `CmdAbortOutage`. It appends `Aborted{by: SystemActor}` and
+  `GameEnded{termination: ABORT_OUTAGE}` in one write. A client command can
+  never produce `SystemActor` or `ABORT_OUTAGE`. The fold requires
+  `ABORT_OUTAGE` to come with `Aborted{0xFF}` in the same write.
+- **No lost abort.** A crash between the gap append and the aborts is repaired
+  at build: a live game whose clock span overlaps a gap longer than T aborts at
+  its next decision, from stored facts alone.
+- **Too much credit.** A game whose total overlap with gaps exceeds 10 minutes is
+  aborted the same way, so flapping cannot give unlimited free time.
+- **Unrated.** `ABORT` and `ABORT_OUTAGE` never count as a draw (GS-7 §3.5).
+- **A slow deploy.** A deploy that takes longer than T aborts every live game.
+  This follows from the owner's choice of T.
 
-When a window is longer than **T = 2 minutes** (monotonic), and was corroborated
-by a failed game write or read (section 3), every game that was live during it is
-aborted instead of credited:
+## 9. Clients and wire
 
-- A new command `CmdAbortOutage` is decided by the session, never by a client.
-  It appends `Aborted{by: SystemActor}` and `GameEnded{termination:
-  ABORT_OUTAGE}` in one atomic write. A client command can never produce
-  `SystemActor` or `ABORT_OUTAGE`. The fold accepts `ABORT_OUTAGE` only
-  directly after `Aborted{0xFF}` and rejects it otherwise.
-- `abortBeforePly` is enforced in `CmdAbort` and stays so. `CmdAbortOutage` is
-  valid at any ply.
-- **Unrated.** A consumer must treat `ABORT` and `ABORT_OUTAGE` as unrated. The
-  draw-shaped result vector must never count as a draw (GS-7 §3.5).
-- **A slow deploy.** A restart that takes longer than T aborts every live game.
-  This is the owner's chosen trade-off, and it means a deploy must finish well
-  inside T.
-
-## 7. Clients
-
-- **Credit.** After a credit the node pushes a `STATE` to both seats (the
-  existing message). WEB-F01 §3 gets one sentence saying clients replace their
-  clocks from it.
-- **Abort.** Both players get `GAME_END` with the new termination; the client
-  shows "Game aborted: server problem, no rating change".
-- **A MOVE during the outage** gets `ERROR{INTERNAL}` as today and the client
-  does not resend (ADR-19 (a)). A move that committed but whose reply was lost
-  (the #95 case) shows an error until the client resyncs; the client already
-  resyncs on `INTERNAL` (#171), and the credited `STATE` then shows the move.
-- **Think-time consumers** (fair play) read `ServerTS` differences between
-  plies. They must subtract the `ClockCredited` overlap between those plies, or
-  outage time will look like thinking time.
-
-## 8. Restarts and failover (how GS-8 uses this)
-
-- **Restart on one node (GS-8 stage 1).** A restart is signal 3 of section 3, so
-  its downtime is credited exactly, or aborts the game if longer than T. GS-8
-  Q1 is answered, and stage 1 may ship with rated play on **only once this spec
-  is implemented and #203 has an outage phase**. Until then GS-8 §4.5 holds.
-- **Rebuild timing.** A node rebuilds adopted games eagerly at start, so the gap
-  between node start and a game's rebuild is small. The window's end for a game
-  is its own build time, and a game built later still gets the credit.
-- **Failover to another node (GS-8 stage 2).** The adopting node reads the dead
-  node's `node_health` item and uses `[ok_ms, adoption time]` with reason 4
-  (reserved now). The two nodes' clocks differ, so the credit is clamped at 0
-  and the GS-7 skew bound (100 ms) applies. The watermark makes a window seen by
-  both nodes credit once. GS-8 §6.4's `gap_ms` is replaced by this event.
-- **Limits, stated.** A node that dies and is never replaced produces no window
-  until someone adopts its games. A window is only as accurate as the 2 s
-  heartbeat; the backdate favours the player on move by at most that much.
-
-## 9. Wire and codec change (needs ADR-20)
-
-PROTOCOL §4A changes only additively:
-
-| Change | Detail |
-|---|---|
-| Event `0x12 ClockCredited` | `start_ts: u64, end_ts: u64, reason: u8` (1 store, 2 restart, 3 pause, 4 adoption reserved) |
-| Termination `0x0B ABORT_OUTAGE` | a new value in the frozen u8 table (0x01-0x0A used) |
-| `Aborted.by` | unchanged; the outage abort uses `SystemActor` (`0xFF`) |
-
-`0x12` is reserved here and `0x13` for GS-8's `OwnerClaimed`. Process per
-ADR-19: a protocol version bump, review by S2, S4 and S5 and the architecture
-group, golden vectors, and decoders in Rust, Go, TypeScript, Swift and Kotlin.
-
-**Fail closed, not skip.** #187 must classify events as skippable or
-safety-relevant. `ClockCredited` and `ABORT_OUTAGE` are safety-relevant: a node
-that does not know them must refuse to fold the game, not skip the event,
-because skipping a credit would flag the player. All nodes must be able to read
-the event before any node writes it, so the rollout has two steps (readers,
-then writers), and rolling back below the reader version is a one-way door.
+- **No new game event.** A credit is not an event in the game stream, so the
+  frozen event set is unchanged and no old game stream holds anything new.
+- **Notice.** While a node has no proof but can still talk to clients, it
+  sends a `SERVICE_STATUS{paused: true}` push, then `{paused: false}` followed
+  by a `STATE` for each affected game when service returns. Clients stop their
+  local clock tick while paused. This message is additive, and the client
+  notice can ship after the server rule. Its code is set in ADR-20.
+- **Abort.** Both players get `GAME_END` with the new termination `0x0B
+  ABORT_OUTAGE` (the u8 table uses 0x01 to 0x0A today). The client shows "Game
+  aborted: server problem, no rating change".
+- **Fail closed.** A node that does not know `0x0B` refuses to fold the game, as
+  today. The new rule needs every node to be gap-aware before any real rated
+  game, and stage 1 has one node.
+- **Consumers.** The ended-game view, rating, fair play and replay read
+  `ABORT_OUTAGE` as unrated. Think-time readers subtract `Overlap`.
+- ADR-19 process applies: version bump, review, golden vector for `0x0B` and
+  the new message, decoders in Rust, Go, TypeScript, Swift and Kotlin.
 
 ## 10. Tests (the #203 harness gets an outage phase)
 
-- **Credit.** An outage of D at most T gives no flag for time lost; the mover's
-  clock after recovery equals the clock before it; a rebuilt session agrees.
-- **Watermark.** Two windows in order, then a rebuild that sees the older one;
-  overlapping windows; a window extended after it was applied; a crash between
-  window close and credit. Each credits exactly once.
-- **Flag hold.** A tick in the 2 s gap after the store recovers, for a game with
-  a nearly spent clock, does not flag. The same with a window longer than T.
-- **Queued move.** A move received inside the window, one received before it,
-  and one received after it. Mutation check: charging up to receipt after a
-  shift.
-- **Detection.** Heartbeat healthy while moves fail; heartbeat failing while
-  moves succeed (no abort); a transaction path throttled; a process pause with
-  no failed write; a forward and a backward clock step across a window.
-- **States.** A credit for a game that is matched, not yet clock-started, ended;
-  a takeback before and after a credit.
-- **Abort.** Every live game ends `ABORT_OUTAGE`, unrated, both players told,
-  including a game past `abortBeforePly`; a client cannot produce it; abort on
-  an ended game is a no-op.
-- **Restart.** A previous heartbeat gives the right window; first start gives
-  none; store down at start does not serve; a zombie cannot overwrite the item;
-  a crash loop; lazy rebuild after start.
-- **Ambiguous commit** on the credit-plus-move batch with a rebuild between.
-- **Herd.** N games credited at once while the heartbeat keeps succeeding.
-- **Codec.** Golden vectors for `0x12` and `0x0B` and parity in every decoder.
-  Mixed version: an old node fails closed on both.
-- **Mutations.** Credit ignored, watermark not applied, flag judged before
-  credit, window start not clamped, hold removed.
+- **Credit.** A store outage of D under T: no flag for time lost, the mover's
+  clock afterwards equals the clock before, a rebuilt session agrees.
+- **Pause.** A process pause with no failed write: a tick right after resume
+  does not flag. A pause shorter than `S` is not credited (boundary test).
+- **Gap race.** Writes recover before the lease: a MOVE and a TAKEBACK_ACCEPT
+  in that gap are held and charged nothing for the outage.
+- **Queued move.** Received before the gap, inside it, and after it.
+- **Poisoned stream.** One game that always fails does not delay another game's
+  flag. A throttled event table at 30%: flags fire after proof returns.
+- **Restart.** The previous lease gives the right gap; first start gives none; a
+  failing lease read means no serving; a zombie fails renewal and stops serving;
+  a crash loop; a rebuild after start adds nothing.
+- **Idempotence.** The same gap seen twice, overlapping gaps and out-of-order
+  appends give the same clock. A retried gap append after a conflict adds one.
+- **Abort.** Every live game ends `ABORT_OUTAGE`, unrated; a game past
+  `abortBeforePly` still aborts; a client cannot produce it; a crash between
+  the gap and the aborts is repaired at build; the cumulative cap aborts.
+- **Takeback and first moves.** An older gap does not affect a rewound clock;
+  the first-move and join timeouts move with a gap.
+- **Resign** during an outage proceeds.
+- **Wall step.** A forward and a backward step: forward reads as a gap, backward
+  as none.
+- **Codec.** Golden vectors for `0x0B` and `SERVICE_STATUS`, parity in every
+  decoder, an old node fails closed.
+- **Mutations.** Overlap ignored, flag decided without proof, move charged
+  without the gap, lease checked after the decision, gap not appended before
+  serving.
 
-## 11. Decisions
+## 11. Designs rejected, and why
 
-Decided by the owner on 2026-11-27, on the v0.1 recommendations:
-- **T = 2 minutes.** Chess.com aborts on any restart; Lichess never aborts but
-  adds 10 to 20 s.
-- **Exact credit, no bonus.** A bonus would give one side time the other never
-  gets.
-- **The wire change** in section 9 (ADR-20).
-- **Heartbeat store.** v0.1 proposed an item in the event table. The review
-  showed that this shares the event table's failure modes and change feed, so
-  v0.2 uses a separate `node_health` table, inside the ADR-16 index-table scope.
-  This is a change after the owner's approval and is flagged for confirmation.
-
-## 12. How the first review's findings are answered
-
-| Finding | Answer |
+| Design | Why not |
 |---|---|
-| B1 shifted baseline, double credit | Real `LastChangeTS`, `CreditedMs`, `CreditedThrough` (section 4) |
-| B2 merge vs dedup | No merging; watermark (sections 3, 4) |
-| B3 flag race at recovery | Hold H and order abort, credit, flag (section 5) |
-| B4 queued move | Window clipped to receipt time (section 4) |
-| B5 detection | Three signals, corroborated abort, separate table, jitter (sections 3, 4) |
-| B6 restart and adoption | Per-game window end, durable windows, consistent read, conditional put (sections 3, 8) |
-| Should-fix 1-9 | Fail closed (9), `CmdAbortOutage` (6), ordering (5), idempotent event (4), states (4), codes (9), think time (7), client resync (7), heartbeat cost (3) |
+| A `ClockCredited` event per game (v0.1, v0.2) | N writes at recovery, a race with the flag, double credit on rebuild, a watermark with ordering rules, and a stored baseline shift. Two review rounds found 12 blockers, all from here. |
+| Detecting an outage by counting failed writes | It misses pauses and partial throttling and can starve flags. |
+| A separate health table | It can be healthy while the event table is down, so players would be flagged unfairly. |
+| Lichess-style fixed bonus | It cannot cover a crash, and it gives one side time the other never gets. |
 
-## 13. Specs that change when this is accepted
+## 12. Specs that change when this is accepted
 
-GS-6 §3.5 and Q-GS6f (decided); GS-7 §3.5 (`CreditedMs`, `CreditedThrough`, the
-abort exception); GS-8 (Q1 answered; §6.4 `gap_ms` replaced; code `0x13`);
-PROTOCOL §4A and WEB-F01 (sections 9 and 7); MASTER-PLAN (ADR-20; ADR-16
-`node_health` table); #187 (event classes).
+GS-6 §3.5 and Q-GS6f (decided); GS-7 §3.5 (clock projection takes the service
+record; the abort exception); GS-4 (lease item, `svc/` stream); GS-8 (Q1
+answered; adoption writes a gap for the dead owner; gaps are scoped to the game's
+owner at that time; its liveness can use the lease); PROTOCOL §4A and WEB-F01;
+MASTER-PLAN (ADR-20).
+
+## 13. Build order
+
+1. Lease, incarnation and the service stream (store and node state, no
+   behaviour change).
+2. The clock projection with `Gaps`, and the serving proof on clock decisions.
+3. `CmdAbortOutage`, the notice, `0x0B` and the clients.
