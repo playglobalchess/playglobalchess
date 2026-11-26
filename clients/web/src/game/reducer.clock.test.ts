@@ -38,9 +38,22 @@ describe("ticking clocks (#112)", () => {
     expect(displayClocks(s, 6000)).toEqual([295000, 300000]);
   });
 
+  it("each side's first move is clockless; the clocks start after ply 2 (#124)", () => {
+    let s = matched(1, 1000);
+    s = accepted(s, 1, "e2e4", 300000, 4500);
+    // No clock runs after White's first move: nothing is charged.
+    expect(s.clockRun).toBeNull();
+    expect(displayClocks(s, 9000)).toEqual([300000, 300000]);
+    s = accepted(s, 2, "e7e5", 300000, 5000);
+    expect(s.clockRun).toEqual({ seat: 0, since: 5000 });
+    expect(displayClocks(s, 7000)).toEqual([298000, 300000]);
+  });
+
   it("MOVE_ACCEPTED sets the mover's clock and starts the other side's", () => {
     let s = matched(1, 1000);
-    s = accepted(s, 1, "e2e4", 296500, 4500);
+    s = accepted(s, 1, "e2e4", 300000, 2000);
+    s = accepted(s, 2, "e7e5", 300000, 3000);
+    s = accepted(s, 3, "g1f3", 296500, 4500);
     expect(s.clockRun).toEqual({ seat: 1, since: 4500 });
     // White is frozen at the server value; Black ticks from the accept.
     expect(displayClocks(s, 7500)).toEqual([296500, 297000]);
@@ -93,8 +106,8 @@ describe("ticking clocks (#112)", () => {
     expect(s.clockRun).toBeNull();
     expect(displayClocks(s, 9000)).toEqual([298000, 300000]);
     s = accepted(s, 1, "e2e4", 297900, 3100);
-    expect(s.clockRun).toEqual({ seat: 1, since: 3100 });
-    expect(displayClocks(s, 4100)).toEqual([297900, 299000]);
+    expect(s.clockRun).toBeNull(); // first move: clockless, no clock starts (#124)
+    expect(displayClocks(s, 4100)).toEqual([297900, 300000]);
   });
 
   it("a rejected move restarts our clock as if it never stopped", () => {

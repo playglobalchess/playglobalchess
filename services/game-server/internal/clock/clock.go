@@ -139,6 +139,31 @@ func (c Clock) CloneWith(seat int, remainingMs int64) Clock {
 //     (Fischer increment grows time).
 //
 // A clock that is already flagged rejects further moves (the game is over).
+// FirstMoveTimeoutMs is how long the side to move may take for its FIRST move
+// (plies 0 and 1) before the game is aborted with no result (#124). The values
+// are Lichess's non-tournament table (lila Game.timeForFirstMove), keyed by the
+// scalachess speed of the estimated duration BaseMs + 40*IncrementMs (the
+// ranges of scalachess Speed): ultrabullet 15 s, bullet 20 s, blitz 25 s, rapid
+// 30 s, classical 35 s. Zero means no first-move timeout (correspondence, at
+// least 6 h estimated).
+func (tc TimeControl) FirstMoveTimeoutMs() int64 {
+	est := (tc.BaseMs + 40*tc.IncrementMs) / 1000 // estimated seconds
+	switch {
+	case est < 30:
+		return 15_000
+	case est < 180:
+		return 20_000
+	case est < 480:
+		return 25_000
+	case est < 1500:
+		return 30_000
+	case est < 21600:
+		return 35_000
+	default:
+		return 0
+	}
+}
+
 func (c Clock) Apply(tc TimeControl, seat int, elapsedMs int64) (Clock, error) {
 	if err := tc.Validate(); err != nil {
 		return c, err

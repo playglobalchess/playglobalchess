@@ -121,6 +121,7 @@ func pairTiny(t *testing.T, h *harness) (*fakeConn, *fakeConn, string) {
 	seekTC(t, cb, "bob", "tiny")
 	m := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+	openTiny(t, ca, cb, m)
 	return ca, cb, m.Matched.GameID
 }
 
@@ -200,6 +201,7 @@ func TestFlagSurvivesStoreOutage(t *testing.T) {
 	seekTC(t, cb, "bob", "tiny")
 	m := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+	openTiny(t, ca, cb, m)
 	gameID := m.Matched.GameID
 
 	// White's 80 ms clock runs out; the flag write trips the outage. Hold it
@@ -251,6 +253,7 @@ func TestFlagTickerStopsOnShutdown(t *testing.T) {
 	seekTC(t, cb, "bob", "tiny")
 	m := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+	openTiny(t, ca, cb, m)
 
 	waitUntil(t, 5*time.Second, "the outage to start", func() bool {
 		down, n := out.refused()
@@ -348,4 +351,35 @@ func TestTickFailLogRateLimitsAFlappingStore(t *testing.T) {
 	if out := buf.String(); !strings.Contains(out, "failing for 1 game(s)") || !strings.Contains(out, "no flag checks failing") {
 		t.Fatalf("exit while failing: log = %q, want a failing line and a closing line", out)
 	}
+}
+
+// TestFirstMoveTimeoutAbortsAndNotifiesBoth (#124): a game whose first move is
+// never played is aborted by the ticker (no result, no flag), both seats get
+// GAME_END{ABORT} with a draw-shaped result, and the game is reclaimed.
+func TestFirstMoveTimeoutAbortsAndNotifiesBoth(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	h.srv.flagInterval = 20 * time.Millisecond
+	h.srv.reg.firstMoveTimeoutMs = 150
+	h.useRealClock()
+	w := watchTickers(h)
+	ctx := context.Background()
+	ca, cb := newFakeConn(), newFakeConn()
+	h.handle(ctx, ca)
+	h.handle(ctx, cb)
+	seekTC(t, ca, "alice", "tiny")
+	time.Sleep(20 * time.Millisecond)
+	seekTC(t, cb, "bob", "tiny")
+	m := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
+	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+
+	// White never moves: the 80 ms clock must NOT flag it (no clock runs before
+	// both seats have moved), the 150 ms first-move timeout aborts the game.
+	for _, c := range []*fakeConn{ca, cb} {
+		ge := c.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+		if ge.GameEnd.Termination != 0x04 {
+			t.Fatalf("termination = 0x%02x, want ABORT (0x04)", ge.GameEnd.Termination)
+		}
+	}
+	wantReclaimed(t, h, w, m.Matched.GameID)
 }

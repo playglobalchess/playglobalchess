@@ -100,9 +100,19 @@ func TestStateChargesRunningClockToServerT(t *testing.T) {
 		return codec.StateBody{}
 	}
 
+	// Before both seats have moved no clock runs and nothing is charged (#124).
+	tNone := resync()
+	if tNone.RunningSeat != 255 {
+		t.Fatalf("running_seat at ply 0 = %d, want none (255)", tNone.RunningSeat)
+	}
+	h.clk.add(7 * time.Second)
+	if tIdle := resync(); tIdle.Clocks[0] != tNone.Clocks[0] || tIdle.Clocks[1] != tNone.Clocks[1] {
+		t.Fatalf("clocks changed before both seats moved: %v -> %v", tNone.Clocks, tIdle.Clocks)
+	}
+	playTwoPlies(t, white, cb2(ca, cb, white), gameID)
 	t0 := resync()
 	if t0.RunningSeat != 0 {
-		t.Fatalf("running_seat at ply 0 = %d, want 0 (white, clock started)", t0.RunningSeat)
+		t.Fatalf("running_seat after both first moves = %d, want 0", t0.RunningSeat)
 	}
 	h.clk.add(7 * time.Second)
 	t1 := resync()
@@ -116,7 +126,7 @@ func TestStateChargesRunningClockToServerT(t *testing.T) {
 		t.Fatalf("idle seat clock changed %d -> %d, want unchanged", t0.Clocks[1], t1.Clocks[1])
 	}
 	// After white moves, the running seat flips to black and white's clock stops.
-	moveAndAwaitBoth(t, white, cb2(ca, cb, white), gameID, 1, "e2e4")
+	moveAndAwaitBoth(t, white, cb2(ca, cb, white), gameID, 3, "g1f3")
 	h.clk.add(3 * time.Second)
 	t2 := resync()
 	if t2.RunningSeat != 1 {

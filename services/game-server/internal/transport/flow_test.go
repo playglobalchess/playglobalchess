@@ -569,8 +569,12 @@ func TestReconnectDerivesEverythingFromState(t *testing.T) {
 	if wantTurn := uint8(wantPly % 2); b.Turn != wantTurn {
 		t.Fatalf("turn = %d, want %d", b.Turn, wantTurn)
 	}
-	if b.RunningSeat != b.Turn {
-		t.Fatalf("running_seat = %d, want the side to move %d", b.RunningSeat, b.Turn)
+	wantRunning := b.Turn
+	if wantPly < 2 {
+		wantRunning = 255 // no clock runs before both seats have moved (#124)
+	}
+	if b.RunningSeat != wantRunning {
+		t.Fatalf("running_seat = %d, want %d", b.RunningSeat, wantRunning)
 	}
 	if b.LastMoveUCI == "" || b.ServerT != uint64(h.clk.now().UnixMilli()) {
 		t.Fatalf("last_move_uci/server_t = %q/%d", b.LastMoveUCI, b.ServerT)
@@ -599,10 +603,11 @@ func TestFlagForfeitOnIdle(t *testing.T) {
 	seekTC(t, ca, "alice", "tiny")
 	time.Sleep(20 * time.Millisecond)
 	seekTC(t, cb, "bob", "tiny")
-	ca.waitForServer(t, codec.SMMatched, 2*time.Second)
+	ma := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+	openTiny(t, ca, cb, ma)
 
-	// Neither side moves. White's clock (80ms) runs out; the flag ticker ends it.
+	// Neither side moves again. White's clock (80ms) runs out; the flag ticker ends it.
 	geA := ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
 	geB := cb.waitForServer(t, codec.SMGameEnd, 2*time.Second)
 	// Termination is FLAG(0x03) or TIMEOUT_VS_INSUFFICIENT(0x0A) — either is a
@@ -827,4 +832,12 @@ func TestReAckEchoesPersistedUCI(t *testing.T) {
 	if n := count(t, white, codec.SMMoveAccepted); n != 1 {
 		t.Fatalf("sender has %d MOVE_ACCEPTED, want only the original 1 (no re-ack of a different uci)", n)
 	}
+}
+
+// openTiny plays 1.e4 e5 on a freshly matched tiny-clock game. Each side's
+// first move is clockless (#124), so the 80 ms clock starts only after both.
+func openTiny(t *testing.T, ca, cb *fakeConn, ma codec.ServerMsg) {
+	t.Helper()
+	white, black := whiteBlack(ca, cb, ma.Matched.SeatIdx, 1-ma.Matched.SeatIdx)
+	playTwoPlies(t, white, black, ma.Matched.GameID)
 }

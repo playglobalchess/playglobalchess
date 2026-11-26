@@ -303,10 +303,12 @@ function reduceServer(state: GameState, msg: ServerMsg, at: number): GameState {
         clocks[moverSeat] = a.clock_after_ms;
       }
       // The mover's clock stops; the other seat's starts now (#112). Not after
-      // the game is over (a GAME_END that overtook this frame, #92).
+      // the game is over (a GAME_END that overtook this frame, #92), and not
+      // before both seats have moved: each side's first move is clockless and
+      // the clocks start after ply 2 (#124, GS-7 §3.5).
       const nextSeat = (moverSeat + 1) % 2;
       const clockRun: ClockRun | null =
-        state.phase === "playing" && nextSeat < clocks.length ? { seat: nextSeat, since: at } : null;
+        state.phase === "playing" && a.ply >= 2 && nextSeat < clocks.length ? { seat: nextSeat, since: at } : null;
       // GS-7 §6.4: a NEW move by the opponent declines our pending prompts; a
       // new move by us declines theirs. (A duplicate MOVE_ACCEPTED, a re-ack,
       // returned above without clearing anything.)

@@ -256,14 +256,20 @@ func decideMove(ctx context.Context, s State, c CmdMove, nowMs uint64, opts Fold
 	}
 	// The flag check: a move that arrives after the mover's time ran out ends
 	// the game by flag (no refund, no MovePlayed).
-	cl, clkErr := s.Clock.Apply(opts.TimeControl, int(c.Seat), s.ElapsedMs(nowMs))
-	if clkErr != nil {
-		if errors.Is(clkErr, clock.ErrFlagged) {
-			d, err := flagDecision(ctx, s, c.Seat, oracle)
-			d.Move = MoveOutcome{Flagged: true, FlaggedSeat: c.Seat, Ply: s.Ply}
-			return d, err
+	// Each side's first move is clockless (#124): nothing is charged and no
+	// increment is granted, so the clock after it is the clock before it.
+	cl := s.Clock
+	if s.Ply >= firstMovePlies {
+		var clkErr error
+		cl, clkErr = s.Clock.Apply(opts.TimeControl, int(c.Seat), s.ElapsedMs(nowMs))
+		if clkErr != nil {
+			if errors.Is(clkErr, clock.ErrFlagged) {
+				d, err := flagDecision(ctx, s, c.Seat, oracle)
+				d.Move = MoveOutcome{Flagged: true, FlaggedSeat: c.Seat, Ply: s.Ply}
+				return d, err
+			}
+			return Decision{}, fmt.Errorf("decide: clock: %w", clkErr)
 		}
-		return Decision{}, fmt.Errorf("decide: clock: %w", clkErr)
 	}
 	if oracle == nil {
 		return Decision{}, fmt.Errorf("decide: nil oracle")
@@ -298,6 +304,9 @@ func decideMove(ctx context.Context, s State, c CmdMove, nowMs uint64, opts Fold
 // decideTick is the idle flag check (§3.5): charge the side to move up to now
 // from the CURRENT state, so after a rewind the right seat is charged.
 func decideTick(ctx context.Context, s State, nowMs uint64, opts FoldOptions, oracle LegalityOracle) (Decision, error) {
+	if firstMoveTimedOut(s, nowMs, opts) {
+		return abortDecision(SystemActor), nil
+	}
 	if s.RunningSeat() == NoSeat {
 		return Decision{}, nil
 	}
@@ -305,6 +314,27 @@ func decideTick(ctx context.Context, s State, nowMs uint64, opts FoldOptions, or
 		return Decision{}, err
 	}
 	return flagDecision(ctx, s, s.TurnIdx, oracle)
+}
+
+// firstMoveTimedOut reports whether the side to move has used up the
+// first-move timeout while plies 0 or 1 are still to be played (#124). The
+// baseline is the last change (ClockStarted, the first move, or a rewind), so
+// each side gets the full timeout.
+func firstMoveTimedOut(s State, nowMs uint64, opts FoldOptions) bool {
+	if s.Phase != PhaseLive || !s.ClockStartedSet || s.HalfTerminal != nil || s.Ply >= firstMovePlies {
+		return false
+	}
+	limit := opts.firstMoveTimeoutMs()
+	return limit > 0 && s.ElapsedMs(nowMs) > limit
+}
+
+// abortDecision ends the game with no result: Aborted + GameEnded{ABORT} as one
+// batch.
+func abortDecision(by uint8) Decision {
+	d := Decision{Effect: EffectEnded}
+	d.add(Event{Type: EvAborted, Aborted: &Aborted{By: by}}, nil)
+	d.add(Event{Type: EvGameEnded, GameEnded: &GameEnded{ResultVector: []Result{ResultDraw, ResultDraw}, Termination: TermAbort}}, nil)
+	return d
 }
 
 func sideToMoveFlagged(s State, nowMs uint64, opts FoldOptions) (bool, error) {
@@ -373,10 +403,7 @@ func decideAbort(s State, c CmdAbort) (Decision, error) {
 	if c.By != SystemActor && int(c.By) >= s.seatCount() {
 		return Decision{}, fmt.Errorf("%w: abort by seat %d", ErrSeatOutOfRange, c.By)
 	}
-	d := Decision{Effect: EffectEnded}
-	d.add(Event{Type: EvAborted, Aborted: &Aborted{By: c.By}}, nil)
-	d.add(Event{Type: EvGameEnded, GameEnded: &GameEnded{ResultVector: []Result{ResultDraw, ResultDraw}, Termination: TermAbort}}, nil)
-	return d, nil
+	return abortDecision(c.By), nil
 }
 
 // drawCooldownPlies: a seat may not offer again within 20 plies of its last
