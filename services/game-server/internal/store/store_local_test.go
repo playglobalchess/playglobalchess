@@ -45,28 +45,48 @@ func dynamoLocal(t *testing.T) *dynamodb.Client {
 	})
 }
 
-// ensureTable creates game_events (idempotently) so the integration test is
-// self-contained — mirrors the IaC table definition (ADR-16): stream_id (S)
-// partition key, seq (N) sort key, on-demand billing.
-func ensureTable(t *testing.T, db *dynamodb.Client) {
-	t.Helper()
-	ctx := context.Background()
-	_, err := db.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName:   aws.String(tableName),
+type tableDef struct {
+	name, pk string
+	pkType   ddbtypes.ScalarAttributeType
+	sk       string
+	skType   ddbtypes.ScalarAttributeType
+}
+
+// allTables mirrors the IaC definitions: the event table (ADR-16) and the three
+// live-game index tables (GS-8 §4.3).
+var allTables = []tableDef{
+	{tableName, "stream_id", ddbtypes.ScalarAttributeTypeS, "seq", ddbtypes.ScalarAttributeTypeN},
+	{"user_live_games", "user_id", ddbtypes.ScalarAttributeTypeS, "game_id", ddbtypes.ScalarAttributeTypeS},
+	{"live_games", "shard", ddbtypes.ScalarAttributeTypeN, "game_id", ddbtypes.ScalarAttributeTypeS},
+	{"user_recent_games", "user_id", ddbtypes.ScalarAttributeTypeS, "game_id", ddbtypes.ScalarAttributeTypeS},
+}
+
+func createTable(db *dynamodb.Client, d tableDef) error {
+	_, err := db.CreateTable(context.Background(), &dynamodb.CreateTableInput{
+		TableName:   aws.String(d.name),
 		BillingMode: ddbtypes.BillingModePayPerRequest,
 		AttributeDefinitions: []ddbtypes.AttributeDefinition{
-			{AttributeName: aws.String("stream_id"), AttributeType: ddbtypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String("seq"), AttributeType: ddbtypes.ScalarAttributeTypeN},
+			{AttributeName: aws.String(d.pk), AttributeType: d.pkType},
+			{AttributeName: aws.String(d.sk), AttributeType: d.skType},
 		},
 		KeySchema: []ddbtypes.KeySchemaElement{
-			{AttributeName: aws.String("stream_id"), KeyType: ddbtypes.KeyTypeHash},
-			{AttributeName: aws.String("seq"), KeyType: ddbtypes.KeyTypeRange},
+			{AttributeName: aws.String(d.pk), KeyType: ddbtypes.KeyTypeHash},
+			{AttributeName: aws.String(d.sk), KeyType: ddbtypes.KeyTypeRange},
 		},
 	})
-	if err != nil {
-		var inUse *ddbtypes.ResourceInUseException
-		if !errors.As(err, &inUse) {
-			t.Fatalf("create table: %v", err)
+	return err
+}
+
+// ensureTable creates the event table and the index tables (idempotently) so
+// the integration tests are self-contained.
+func ensureTable(t *testing.T, db *dynamodb.Client) {
+	t.Helper()
+	for _, d := range allTables {
+		if err := createTable(db, d); err != nil {
+			var inUse *ddbtypes.ResourceInUseException
+			if !errors.As(err, &inUse) {
+				t.Fatalf("create table %s: %v", d.name, err)
+			}
 		}
 	}
 }
@@ -134,4 +154,31 @@ func TestIntegration_RealDynamo(t *testing.T) {
 	if fin[len(fin)-1].Type != game.EvGameEnded {
 		t.Fatalf("last event type %d, want GameEnded", fin[len(fin)-1].Type)
 	}
+}
+
+// recreateTables drops and recreates every table, so each contract subtest
+// starts empty against the real engine.
+func recreateTables(t *testing.T, db *dynamodb.Client) {
+	t.Helper()
+	for _, d := range allTables {
+		_, _ = db.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(d.name)})
+		if err := createTable(db, d); err != nil {
+			t.Fatalf("create %s: %v", d.name, err)
+		}
+	}
+}
+
+// TestIntegration_IndexContract runs the whole index contract against real
+// DynamoDB Local: real TransactWriteItems cancellation reasons for the seq guard
+// and for a missing IndexUpdate target, real Query paging and key types.
+func TestIntegration_IndexContract(t *testing.T) {
+	db := dynamoLocal(t)
+	runIndexContract(t, func(t *testing.T) game.IndexedStore {
+		recreateTables(t, db)
+		s, err := New(context.Background(), db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	})
 }

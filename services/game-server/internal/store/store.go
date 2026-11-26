@@ -70,10 +70,14 @@ func New(ctx context.Context, db DynamoAPI) (*Store, error) {
 	if db == nil {
 		return nil, errors.New("store: nil DynamoDB client")
 	}
-	if _, err := db.DescribeTable(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(tableName),
-	}); err != nil {
-		return nil, fmt.Errorf("store: table %q not reachable: %w", tableName, err)
+	// The event table and the three live-game index tables (GS-8 §4.3): a
+	// missing table must fail here, not on the first game's opening write.
+	for _, name := range append([]string{tableName}, indexTableNames()...) {
+		if _, err := db.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+			TableName: aws.String(name),
+		}); err != nil {
+			return nil, fmt.Errorf("store: table %q not reachable: %w", name, err)
+		}
 	}
 	return &Store{db: db, now: time.Now}, nil
 }
@@ -138,43 +142,7 @@ func (s *Store) AppendBatch(ctx context.Context, streamID string, expectedSeq ui
 	if len(evs) == 0 {
 		return nil
 	}
-	if len(evs) > 100 {
-		// TransactWriteItems hard-caps at 100 items; an ending is 2, so this is a
-		// guardrail, not a limit we expect to hit.
-		return fmt.Errorf("store: batch of %d exceeds the 100-item transaction limit", len(evs))
-	}
-	writes := make([]ddbtypes.TransactWriteItem, 0, len(evs))
-	for i, ev := range evs {
-		it, err := s.item(streamID, expectedSeq+uint32(i), ev)
-		if err != nil {
-			return err
-		}
-		writes = append(writes, ddbtypes.TransactWriteItem{
-			Put: &ddbtypes.Put{
-				TableName:           aws.String(tableName),
-				Item:                it,
-				ConditionExpression: aws.String("attribute_not_exists(seq)"),
-			},
-		})
-	}
-	_, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: writes,
-	})
-	if err != nil {
-		var tc *ddbtypes.TransactionCanceledException
-		if errors.As(err, &tc) {
-			// A conditional-check failure inside the transaction means some seq was
-			// occupied — the all-or-nothing batch lost a race. Surface as the typed
-			// conflict so the session reconciles.
-			for _, r := range tc.CancellationReasons {
-				if r.Code != nil && *r.Code == "ConditionalCheckFailed" {
-					return fmt.Errorf("store: batch seq from %d occupied on %s: %w", expectedSeq, streamID, game.ErrSeqConflict)
-				}
-			}
-		}
-		return fmt.Errorf("store: transact: %w", err)
-	}
-	return nil
+	return s.appendTx(ctx, streamID, expectedSeq, evs, nil)
 }
 
 // Load returns the full ordered event slice for a stream (seq 0..n), decoding

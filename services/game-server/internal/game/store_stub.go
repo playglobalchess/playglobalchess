@@ -24,6 +24,8 @@ type MemStore struct {
 	// (SPEC-S2-GAME-SERVER §5 "persist fails after validation"), proving the
 	// pipeline does not ack on a failed commit.
 	failAppend error
+	// index is the live-game index (store_index.go); lazily created.
+	index *memIndex
 }
 
 // NewMemStore returns an empty in-memory store.
