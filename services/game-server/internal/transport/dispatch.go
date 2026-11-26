@@ -286,7 +286,9 @@ func (s *Server) seatOf(c Conn, gameID string) (uint8, bool) {
 // drives reconnection resync, Option A).
 func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
 	gs := gameSeAT{gameID: gameID, seat: seat}
-	s.bindLocked(c, st.userID, gameID, seat, false)
+	if !s.bindLocked(c, st.userID, gameID, seat, false, true) {
+		return // the game was dropped meanwhile; nothing to bind
+	}
 	// Record on the conn-state only once (a reconnect re-binds the same seat).
 	for _, existing := range st.seats {
 		if existing == gs {
@@ -298,23 +300,33 @@ func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
 
 // bindLocked binds (gameID, seat) to c for uid in both indices, atomically with
 // respect to dropGame's cleanup of them. markJoined also closes the game's join
-// signal. Lock order: userMu, then the game's shard.
-func (s *Server) bindLocked(c Conn, uid, gameID string, seat uint8, markJoined bool) {
+// signal. Lock order: userMu, then the game's shard. With requireLive, nothing
+// is bound (false is returned) unless the game's session is still registered:
+// dropGame unregisters the session before it clears the entry under the shard
+// lock, so a bind either lands first and is cleaned by that drop, or sees the
+// dropped session and leaves no orphan entry behind (#174 review).
+func (s *Server) bindLocked(c Conn, uid, gameID string, seat uint8, markJoined, requireLive bool) bool {
 	sh := s.gt.shard(gameID)
 	s.userMu.Lock()
 	defer s.userMu.Unlock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if requireLive {
+		if _, live := s.reg.Get(gameID); !live {
+			return false
+		}
+	}
 	if s.userGames[uid] == nil {
 		s.userGames[uid] = make(map[string]uint8)
 	}
 	s.userGames[uid][gameID] = seat
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	e := sh.entryLocked(gameID)
 	e.conns[seat] = c
 	e.users[seat] = uid
 	if markJoined {
 		e.markJoinedLocked()
 	}
+	return true
 }
 
 // connFor returns the connection seated at (gameID, seat), if any.

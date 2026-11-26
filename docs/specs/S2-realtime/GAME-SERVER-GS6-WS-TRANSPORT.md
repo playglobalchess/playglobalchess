@@ -175,6 +175,10 @@ node-wide lock or iterate a map sized by the node's games or connections.
   engine fold, first appends) runs outside it, once per game (concurrent callers
   share the build), and is bounded by a 10 s deadline. A `Drop` or `CloseAll`
   during a build discards the result, so a dropped game never reappears live.
+  A panic in a build fails its waiters with an error and leaves the game
+  buildable again. A reconnect resync binds a seat only while the game's session
+  is still registered, so a bind that loses the race with `dropGame` leaves no
+  entry behind.
 - `BenchmarkMoveLookup` and `BenchmarkEndAndDisconnect` show the per-operation
   cost is flat from 100 to 200,000 unrelated games.
 

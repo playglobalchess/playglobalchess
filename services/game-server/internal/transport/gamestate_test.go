@@ -2,6 +2,7 @@ package transport
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -141,5 +142,57 @@ func BenchmarkEndAndDisconnect(b *testing.B) {
 				s.unbindAll(st, c)
 			}
 		})
+	}
+}
+
+// bind, drop, claim and disconnect racing on one game must leave no state behind
+// once the game is dropped for good (run under -race for the lock order).
+func TestBindDropClaimUnbindRace(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	s := h.srv
+	for round := 0; round < 300; round++ {
+		gid := fmt.Sprintf("race%d", round)
+		c1, c2 := newFakeConn(), newFakeConn()
+		st1, st2 := &connState{userID: "u1"}, &connState{userID: "u2"}
+		var wg sync.WaitGroup
+		run := func(f func()) { wg.Add(1); go func() { defer wg.Done(); f() }() }
+		run(func() { s.bindSeatForUser(c1, "u1", gid, 0) })
+		run(func() { s.bindSeatForUser(c2, "u2", gid, 1) })
+		run(func() { s.claimGameEnd(gid); s.releaseGameEnd(gid) })
+		run(func() { s.unbindAll(st1, c1) })
+		run(func() { s.unbindAll(st2, c2) })
+		run(func() { s.seatOf(c1, gid); s.connFor(gid, 1); s.seatUsers(gid) })
+		wg.Wait()
+		s.dropGame(gid)
+		if s.gt.tracked(gid) {
+			t.Fatalf("round %d: game state left after the final drop", round)
+		}
+		s.userMu.Lock()
+		_, a := s.userGames["u1"][gid]
+		_, b := s.userGames["u2"][gid]
+		s.userMu.Unlock()
+		if a || b {
+			t.Fatalf("round %d: user index left after the final drop", round)
+		}
+	}
+}
+
+// A resync bind that loses the race with dropGame binds nothing (review of #223):
+// no entry without a live session, so nothing is left for disconnect to miss.
+func TestResyncBindToADroppedGameLeavesNothing(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	s := h.srv
+	c := newFakeConn()
+	s.bindSeat(c, &connState{userID: "u1"}, "gone-game", 0)
+	if s.gt.tracked("gone-game") {
+		t.Fatal("a bind to a game with no live session left an entry")
+	}
+	s.userMu.Lock()
+	_, left := s.userGames["u1"]
+	s.userMu.Unlock()
+	if left {
+		t.Fatal("a bind to a game with no live session left a user index entry")
 	}
 }

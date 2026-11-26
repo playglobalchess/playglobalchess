@@ -413,7 +413,7 @@ func (s *Server) userConn(uid string) (Conn, bool) {
 // bind the OTHER player's connection whose handler is elsewhere). The owning
 // connection's own teardown reconciles the per-game state by identity.
 func (s *Server) bindSeatForUser(c Conn, uid, gameID string, seat uint8) {
-	s.bindLocked(c, uid, gameID, seat, true)
+	s.bindLocked(c, uid, gameID, seat, true, false)
 }
 
 // markJoinedLocked closes the game's joined signal the first time any seat binds.

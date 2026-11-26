@@ -23,6 +23,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,8 +254,29 @@ func (r *Registry) GetOrCreate(gameID, timeControlID string) (*session.Session, 
 	epoch := r.epoch
 	r.mu.Unlock()
 
-	s, cancel, err := r.buildSession(gameID, timeControlID)
+	r.finishBuild(gameID, b, epoch, timeControlID)
+	return b.s, b.err
+}
 
+// finishBuild runs the build and publishes its result. The cleanup is deferred,
+// so a panic in the resolver, the engine or the store cannot leave waiters
+// blocked on b.done or the game stuck in r.building: they get an error.
+func (r *Registry) finishBuild(gameID string, b *build, epoch uint64, timeControlID string) {
+	var cancel context.CancelFunc
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("transport: building the session for game %s panicked: %v\n%s", gameID, p, debug.Stack())
+			if cancel != nil {
+				cancel()
+			}
+			b.s, b.err = nil, fmt.Errorf("transport: building the session panicked: %v", p)
+			r.mu.Lock()
+			delete(r.building, gameID)
+			r.mu.Unlock()
+			close(b.done)
+		}
+	}()
+	s, cancel, err := r.buildSession(gameID, timeControlID)
 	r.mu.Lock()
 	delete(r.building, gameID)
 	switch {
@@ -268,7 +291,6 @@ func (r *Registry) GetOrCreate(gameID, timeControlID string) (*session.Session, 
 	}
 	r.mu.Unlock()
 	close(b.done)
-	return b.s, b.err
 }
 
 // buildSession folds the game's session and starts its actor. No registry lock
