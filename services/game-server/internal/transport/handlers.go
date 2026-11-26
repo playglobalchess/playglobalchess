@@ -63,12 +63,16 @@ func retryTicks(iv, max time.Duration, errs int, intn func(int) int) int {
 }
 
 // tickFailLog is a node's summary of games whose flag checks are failing (#97).
-// It logs at most once per tickFailLogEvery, and once when the last failing
-// game recovers. The zero value is ready to use.
+// It logs a "failing" line at most once per tickFailLogEvery. Once the failing
+// set drains to zero (games recovered, or their tickers exited), it logs one
+// closing line, but only if a "failing" line went out since the last closing
+// line. So a flapping store gives at most two lines per tickFailLogEvery. The
+// zero value is ready to use.
 type tickFailLog struct {
-	mu      sync.Mutex
-	failing int // games currently retrying
-	last    time.Time
+	mu        sync.Mutex
+	failing   int // games currently retrying
+	last      time.Time
+	announced bool // a "failing" line was logged and not yet closed
 }
 
 // fail records a failed check; first is true when the game was not already
@@ -80,19 +84,25 @@ func (l *tickFailLog) fail(first bool, err error) {
 		l.failing++
 	}
 	if now := time.Now(); now.Sub(l.last) >= tickFailLogEvery {
-		l.last = now
+		l.last, l.announced = now, true
 		log.Printf("transport: flag checks failing for %d game(s), retrying with backoff; latest error: %v", l.failing, err)
 	}
 }
 
-// clear records that a failing game recovered (or its ticker exited).
+// clear records that a failing game stopped failing: it recovered, or its
+// ticker exited (the game ended or was dropped, or the server is shutting down).
 func (l *tickFailLog) clear(recovered bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.failing--
-	if l.failing == 0 && recovered {
-		l.last = time.Time{}
+	if l.failing > 0 || !l.announced {
+		return
+	}
+	l.announced = false
+	if recovered {
 		log.Printf("transport: flag checks recovered")
+	} else {
+		log.Printf("transport: no flag checks failing (the last failing game's ticker exited)")
 	}
 }
 
@@ -236,10 +246,14 @@ func (s *Server) armFlagTicker(gameID string) {
 				s.tickLog.clear(false) // exiting while failing: no longer counted
 			}
 		}()
-		endFails := 0 // consecutive GAME_END broadcasts that did not go out
-		// dropBound is when the ticker gives up on an ended game it cannot
-		// broadcast: 10 ticks, and never fewer than two read timeouts' worth of
-		// ticks (see the endHeld note below).
+		// endFails counts GAME_END broadcasts that did not go out. A failed
+		// check in between does not reset it (an ended game's checks do not
+		// touch the store, so this needs a flapping store), so it counts failed
+		// broadcasts, not consecutive ticks. dropBound is when the ticker gives
+		// up on an ended game it cannot broadcast: 10 failed broadcasts, and
+		// never fewer than two read timeouts' worth, each at least one tick
+		// apart (see the endHeld note below).
+		endFails := 0
 		dropBound := 10
 		if n := int(2*s.endTimeout()/iv) + 1; n > dropBound {
 			dropBound = n

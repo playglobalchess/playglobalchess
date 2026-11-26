@@ -224,12 +224,15 @@ the flag again from the unchanged state. A check that fails because the game
 was dropped mid-check is a normal end, not a failure. Failed checks are retried
 with backoff counted in ticks: one failure retries on the next tick; after
 that the backoff doubles per consecutive failure up to `flagBackoffMax`
-(config, default 5 s), and each wait is jittered over the upper half of the
-backoff so games that failed together do not retry together. A flag therefore
-lands at most `flagBackoffMax` plus one tick after the store comes back, plus
-any check still in flight, which is bounded by the 5 s read bound. A node logs
-one summary line at most every 30 s while any game's checks are failing (how
-many games, the latest error), and one line when the last one recovers. A
+(config, default 5 s, rounded down to whole ticks), and each wait is jittered
+over the upper half of the backoff so games that failed together do not retry
+together. A flag therefore lands at most `flagBackoffMax` plus one tick after
+the store comes back, plus any check still in flight, which is bounded by the
+5 s read bound. A node logs one "failing" summary line at most every 30 s
+while any game's checks are failing (how many games, the latest error). When
+the failing set drains to zero, because games recovered or their tickers
+exited, it logs one closing line, but only after a "failing" line, so a
+flapping store gives at most two lines per 30 s. A
 failed write that did commit is handled by the session's re-read (§5, #89,
 #95). A check that keeps failing for a non-store reason (a corrupt stream, an
 engine error) is retried the same way until shutdown, at one check per 5 s.
@@ -253,7 +256,8 @@ nothing itself: the holder is broadcasting to every bound seat, or already has.
 So no client gets two `GAME_END`s. The ticker also asks whether the game is
 OVER, not only whether this tick ended it. So an ended game whose broadcast did
 not go out is broadcast by the next tick, and then dropped. If that keeps
-failing, the ticker drops the ended game after 10 failed ticks, and never
+failing, the ticker drops the ended game after 10 failed broadcasts (counted
+across any failed checks in between), and never
 sooner than two broadcast read bounds' worth of ticks, so it cannot cut a live
 broadcast short at any tick interval. It first records both seats as having
 missed the ending, so each one's next `AUTHENTICATE` pushes the ended `STATE`
