@@ -14,6 +14,51 @@ import (
 // DynamoDB store cannot drift: atomicity with the events, conflict mapping,
 // contiguity, ordering and TTL filtering.
 
+// reader fails the test on any read error, so a broken query can never look
+// like an empty result.
+type reader struct {
+	t *testing.T
+	s game.IndexedStore
+}
+
+func rd(t *testing.T, s game.IndexedStore) reader { return reader{t, s} }
+
+func (r reader) live(ctx context.Context, shard int) []game.LiveEntry {
+	r.t.Helper()
+	v, err := r.s.LiveGames(ctx, shard)
+	if err != nil {
+		r.t.Fatalf("LiveGames: %v", err)
+	}
+	return v
+}
+
+func (r reader) userLive(ctx context.Context, u string, n int) []game.UserEntry {
+	r.t.Helper()
+	v, err := r.s.UserLiveGames(ctx, u, n)
+	if err != nil {
+		r.t.Fatalf("UserLiveGames: %v", err)
+	}
+	return v
+}
+
+func (r reader) userRecent(ctx context.Context, u string, n int) []game.UserEntry {
+	r.t.Helper()
+	v, err := r.s.UserRecentGames(ctx, u, n)
+	if err != nil {
+		r.t.Fatalf("UserRecentGames: %v", err)
+	}
+	return v
+}
+
+func (r reader) load(ctx context.Context, id string) []game.Event {
+	r.t.Helper()
+	v, err := r.s.Load(ctx, id)
+	if err != nil {
+		r.t.Fatalf("Load: %v", err)
+	}
+	return v
+}
+
 type storeMaker func(t *testing.T) game.IndexedStore
 
 func memMaker(t *testing.T) game.IndexedStore { return game.NewMemStore() }
@@ -57,14 +102,14 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if err := s.AppendIndexed(ctx, "game/g1", 0, []game.Event{gameCreated()}, openingOps("g1", "alice", "bob")); err != nil {
 			t.Fatal(err)
 		}
-		if evs, _ := s.Load(ctx, "game/g1"); len(evs) != 1 {
+		if evs := rd(t, s).load(ctx, "game/g1"); len(evs) != 1 {
 			t.Fatalf("events = %d", len(evs))
 		}
-		live, _ := s.LiveGames(ctx, 3)
+		live := rd(t, s).live(ctx, 3)
 		if len(live) != 1 || live[0].GameID != "g1" || live[0].OwnerNode != "n1" || live[0].OwnerIncarnation != "i1" {
 			t.Fatalf("live = %+v", live)
 		}
-		ug, _ := s.UserLiveGames(ctx, "bob", 8)
+		ug := rd(t, s).userLive(ctx, "bob", 8)
 		if len(ug) != 1 || ug[0].GameID != "g1" || ug[0].Seat != 1 {
 			t.Fatalf("bob = %+v", ug)
 		}
@@ -76,7 +121,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if !errors.Is(err, game.ErrSeqConflict) {
 			t.Fatalf("want ErrSeqConflict, got %v", err)
 		}
-		if ug, _ := s.UserLiveGames(ctx, "carol", 8); len(ug) != 0 {
+		if ug := rd(t, s).userLive(ctx, "carol", 8); len(ug) != 0 {
 			t.Fatalf("a rejected write left index rows: %+v", ug)
 		}
 	})
@@ -89,7 +134,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if err := s.AppendIndexed(ctx, "game/g1", 5, endBatch(), nil); !errors.Is(err, game.ErrSeqConflict) {
 			t.Fatalf("AppendIndexed gap: want ErrSeqConflict, got %v", err)
 		}
-		if evs, _ := s.Load(ctx, "game/g1"); len(evs) != 1 {
+		if evs := rd(t, s).load(ctx, "game/g1"); len(evs) != 1 {
 			t.Fatalf("a gap write committed: %d events", len(evs))
 		}
 	})
@@ -100,13 +145,13 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if err := s.AppendIndexed(ctx, "game/g1", 1, endBatch(), endingOps("g1", "alice", "bob", exp)); err != nil {
 			t.Fatal(err)
 		}
-		if live, _ := s.LiveGames(ctx, 3); len(live) != 0 {
+		if live := rd(t, s).live(ctx, 3); len(live) != 0 {
 			t.Fatalf("live = %+v", live)
 		}
-		if ug, _ := s.UserLiveGames(ctx, "alice", 8); len(ug) != 0 {
+		if ug := rd(t, s).userLive(ctx, "alice", 8); len(ug) != 0 {
 			t.Fatalf("alice live = %+v", ug)
 		}
-		rec, _ := s.UserRecentGames(ctx, "alice", 8)
+		rec := rd(t, s).userRecent(ctx, "alice", 8)
 		if len(rec) != 1 || rec[0].GameID != "g1" || rec[0].EndedAt.IsZero() {
 			t.Fatalf("alice recent = %+v", rec)
 		}
@@ -116,7 +161,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		_ = s.AppendIndexed(ctx, "game/g1", 0, []game.Event{gameCreated()}, openingOps("g1", "alice", "bob"))
 		past := time.Now().Add(-time.Minute)
 		_ = s.AppendIndexed(ctx, "game/g1", 1, endBatch(), endingOps("g1", "alice", "bob", past))
-		if rec, _ := s.UserRecentGames(ctx, "alice", 8); len(rec) != 0 {
+		if rec := rd(t, s).userRecent(ctx, "alice", 8); len(rec) != 0 {
 			t.Fatalf("expired entry returned: %+v", rec)
 		}
 	})
@@ -127,7 +172,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if err := s.AppendIndexed(ctx, "game/g1", 1, []game.Event{moveEv(1, 0, "e2e4")}, []game.IndexOp{up}); err != nil {
 			t.Fatal(err)
 		}
-		live, _ := s.LiveGames(ctx, 3)
+		live := rd(t, s).live(ctx, 3)
 		if live[0].OwnerNode != "n2" || live[0].OwnerIncarnation != "i9" {
 			t.Fatalf("owner not updated: %+v", live)
 		}
@@ -136,7 +181,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if !errors.Is(err, game.ErrIndexMissing) {
 			t.Fatalf("want ErrIndexMissing, got %v", err)
 		}
-		if evs, _ := s.Load(ctx, "game/g1"); len(evs) != 2 {
+		if evs := rd(t, s).load(ctx, "game/g1"); len(evs) != 2 {
 			t.Fatalf("events committed despite a failed update: %d", len(evs))
 		}
 	})
@@ -161,7 +206,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 			if !errors.Is(err, game.ErrBadIndexOp) {
 				t.Errorf("%s: want ErrBadIndexOp, got %v", name, err)
 			}
-			if evs, _ := s.Load(ctx, "game/g1"); len(evs) != 0 {
+			if evs := rd(t, s).load(ctx, "game/g1"); len(evs) != 0 {
 				t.Errorf("%s: events committed", name)
 			}
 		}
@@ -200,7 +245,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		b.Seat = 1
 		_ = s.AppendIndexed(ctx, "game/g1", 1, []game.Event{moveEv(1, 0, "e2e4")}, []game.IndexOp{a})
 		_ = s.AppendIndexed(ctx, "game/g1", 2, []game.Event{moveEv(2, 1, "e7e5")}, []game.IndexOp{b})
-		if ug, _ := s.UserLiveGames(ctx, "alice", 8); len(ug) != 1 || ug[0].Seat != 1 {
+		if ug := rd(t, s).userLive(ctx, "alice", 8); len(ug) != 1 || ug[0].Seat != 1 {
 			t.Fatalf("put did not replace: %+v", ug)
 		}
 	})
@@ -214,7 +259,7 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 		if err := s.AppendIndexed(ctx, "game/g1", 0, []game.Event{gameCreated()}, ops); err != nil {
 			t.Fatal(err)
 		}
-		got, _ := s.UserRecentGames(ctx, "alice", 1)
+		got := rd(t, s).userRecent(ctx, "alice", 1)
 		if len(got) != 1 || got[0].GameID != "g1" {
 			t.Fatalf("expired newer rows hid the valid older one: %+v", got)
 		}
@@ -228,11 +273,11 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 				t.Fatal(err)
 			}
 		}
-		all, _ := s.UserLiveGames(ctx, "alice", 0)
+		all := rd(t, s).userLive(ctx, "alice", 0)
 		if len(all) != 5 || all[0].GameID != "g5" || all[4].GameID != "g1" {
 			t.Fatalf("all = %+v", all)
 		}
-		if two, _ := s.UserLiveGames(ctx, "alice", 2); len(two) != 2 || two[0].GameID != "g5" {
+		if two := rd(t, s).userLive(ctx, "alice", 2); len(two) != 2 || two[0].GameID != "g5" {
 			t.Fatalf("limited = %+v", two)
 		}
 	})

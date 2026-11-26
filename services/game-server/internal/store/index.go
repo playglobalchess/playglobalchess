@@ -173,8 +173,10 @@ func (s *Store) queryIndex(ctx context.Context, t game.IndexTable, key string, n
 	var start map[string]ddbtypes.AttributeValue
 	for {
 		q, err := s.db.Query(ctx, &dynamodb.QueryInput{
-			TableName:                 aws.String(string(t)),
-			KeyConditionExpression:    aws.String(pkName(t) + " = :k"),
+			TableName: aws.String(string(t)),
+			// "shard" is a DynamoDB reserved word, so the key is always aliased.
+			KeyConditionExpression:    aws.String("#pk = :k"),
+			ExpressionAttributeNames:  map[string]string{"#pk": pkName(t)},
 			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{":k": pkValue(t, key)},
 			ScanIndexForward:          aws.Bool(!newestFirst),
 			ExclusiveStartKey:         start,

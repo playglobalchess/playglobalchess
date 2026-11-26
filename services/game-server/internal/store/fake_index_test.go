@@ -1,7 +1,9 @@
 package store
 
 import (
+	"errors"
 	"sort"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -83,6 +85,11 @@ func (f *fakeDynamo) queryIndexLocked(in *dynamodb.QueryInput) (*dynamodb.QueryO
 		f.inconsistentQueries++
 	}
 	t := *in.TableName
+	// Real DynamoDB rejects reserved words used unaliased in an expression, and
+	// SHARD is one of them: the store must alias the partition key.
+	if in.KeyConditionExpression != nil && strings.Contains(strings.ToLower(*in.KeyConditionExpression), "shard") {
+		return nil, errors.New("ValidationException: reserved keyword SHARD in KeyConditionExpression")
+	}
 	pk := attrKey(in.ExpressionAttributeValues[":k"])
 	var ids []string
 	for gid := range f.idxPart(t, pk) {
