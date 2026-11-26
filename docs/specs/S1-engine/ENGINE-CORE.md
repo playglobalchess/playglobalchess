@@ -301,11 +301,13 @@ Run every commit (fast):
 ### 8.7 Differential testing
 During G-A bring-up, run positions/perft against a reference crate (`shakmaty`/`cozy-chess`, MASTER ADR-11) and assert agreement. This is a *development* gate (finds our bugs fast), retained in the nightly tier; it is not a substitute for the published-reference perft counts in §8.1.
 
+**Random-position tier (#202), per commit.** The fixed corpora only cover position classes someone thought of; #119, #120 and #121 each sat outside them. `engine/tests/random_differential.rs` (behind `--features difftest`, so shakmaty stays dev-only per OPEN-A) plays seeded random games from the corpus positions and places random sparse endings, and compares every visited position against shakmaty: the legal-move set, check, checkmate, stalemate, `is_insufficient_material`, `has_mating_material` per colour (against `has_insufficient_material`, which is the Lichess rule), the exported FEN and its round trip, the SAN of every legal move, a sampled perft(2), and Zobrist identity (our keys are equal exactly when shakmaty's are, over the whole run). A second arm mutates FENs and requires the same accept/reject outcome as shakmaty, with shakmaty's material-count and impossible-check rules ignored because §5 deliberately does not check them. Per commit: 6,000 positions and 3,000 mutated FENs with a fixed seed. Nightly: 1,000,000 positions and 200,000 mutated FENs with the CI run id as seed. A failure prints the seed and the FEN; reproduce with `PGC_DIFF_SEED=<seed> cargo test --release --features difftest --test random_differential -- --nocapture`. Mutation check recorded in #202: restoring the pre-fix `position.rs` (#195), `fen.rs` (#197) or `status.rs` (#199) each makes it fail.
+
 ### 8.8 Test tiers / where they run (MASTER §X.2, §X.4)
 | Tier | Contents | Cadence |
 |---|---|---|
-| Fast (per commit) | perft ≤ d5, all edge-case & game-end asserts, all property tests, `is_legal`/`legal_moves` micro-bench threshold | every commit / PR |
-| Slow (nightly + pre-gate) | perft d6–d7, full golden replay, differential vs reference crate | nightly + before G-A sign-off |
+| Fast (per commit) | perft ≤ d5, all edge-case & game-end asserts, all property tests, `is_legal`/`legal_moves` micro-bench threshold, random-position differential vs shakmaty (6,000 positions, §8.7) | every commit / PR |
+| Slow (nightly + pre-gate) | perft d6–d7, full golden replay, differential vs reference crate, random differential at 1,000,000 positions | nightly + before G-A sign-off |
 | Mobile parity (NFR-10) | perft startpos d5 + a golden slice, run in the UniFFI core's iOS/Android test target | nightly |
 
 ---
