@@ -223,11 +223,21 @@ func TestUnconfirmedWriteRebuildsBeforeNextCommand(t *testing.T) {
 type holdCmd struct {
 	release chan struct{}
 	done    chan struct{}
+	started chan struct{} // closed when the actor starts running it (optional)
+	after   func()        // runs on the actor after release (optional)
 }
 
-func (c *holdCmd) apply(context.Context, *Session) { <-c.release }
-func (c *holdCmd) fail(error)                      {}
-func (c *holdCmd) finish()                         { close(c.done) }
+func (c *holdCmd) apply(context.Context, *Session) {
+	if c.started != nil {
+		close(c.started)
+	}
+	<-c.release
+	if c.after != nil {
+		c.after()
+	}
+}
+func (c *holdCmd) fail(error) {}
+func (c *holdCmd) finish()    { close(c.done) }
 
 // #183: a MOVE queued behind a busy actor is charged to its receipt time.
 func TestQueuedMoveNotChargedTheWait(t *testing.T) {
@@ -240,12 +250,17 @@ func TestQueuedMoveNotChargedTheWait(t *testing.T) {
 			t.Fatalf("opening %s: %+v %v", uci, o, err)
 		}
 	}
-	hold := &holdCmd{release: make(chan struct{}), done: make(chan struct{})}
-	go func() { _ = s.dispatch(ctx, hold, hold.done) }()
-	time.Sleep(50 * time.Millisecond) // the actor is now blocked in hold
-
 	fc.add(time.Second)
 	received := uint64(fc.now().UnixMilli())
+	// The actor is busy for 20 s of fake time: hold advances the clock on the
+	// actor itself, so the move (one actor, one command at a time) can only be
+	// decided after the wait, whatever the goroutine scheduling.
+	hold := &holdCmd{
+		release: make(chan struct{}), done: make(chan struct{}), started: make(chan struct{}),
+		after: func() { fc.add(20 * time.Second) },
+	}
+	go func() { _ = s.dispatch(ctx, hold, hold.done) }()
+	<-hold.started
 	type res struct {
 		out game.MoveOutcome
 		err error
@@ -255,8 +270,6 @@ func TestQueuedMoveNotChargedTheWait(t *testing.T) {
 		o, err := s.SubmitMoveReceived(ctx, 0, 3, "g1f3", received)
 		got <- res{o, err}
 	}()
-	time.Sleep(50 * time.Millisecond) // the move is queued behind hold
-	fc.add(20 * time.Second)          // the wait the actor imposes
 	close(hold.release)
 
 	r := <-got

@@ -1184,8 +1184,25 @@ func TestMoveChargedToReceiptTime(t *testing.T) {
 		if got := d.Move.ClockAfterMs; got != 301_000 {
 			t.Fatalf("clock_after = %d, want 301000 (2 s think + 3 s increment)", got)
 		}
-		if ts := m.s.History[2].ServerTS; ts != base+2_000 || m.s.LastChangeTS != base+2_000 {
-			t.Fatalf("server_ts %d last change %d, want the receipt %d", ts, m.s.LastChangeTS, base+2_000)
+		// The opponent's clock starts when the move was processed, not at the
+		// receipt: the 18 s queue is charged to neither seat (#183 review).
+		if ts := m.s.History[2].ServerTS; ts != base+20_000 || m.s.LastChangeTS != base+20_000 {
+			t.Fatalf("server_ts %d last change %d, want the decide time %d", ts, m.s.LastChangeTS, base+20_000)
+		}
+		if got := m.s.ElapsedMs(base + 21_000); got != 1_000 {
+			t.Fatalf("opponent charged %d ms 1 s after the move was processed, want 1000", got)
+		}
+	})
+
+	t.Run("the first move's stamp is never before the clock start", func(t *testing.T) {
+		m := newSim(t, false)
+		start := m.now
+		d := mv(m, start-5_000, 1_000) // a stamp before ClockStarted
+		if !d.Move.Accepted {
+			t.Fatalf("first move rejected: %+v", d.Move)
+		}
+		if ts := m.s.History[0].ServerTS; ts < start {
+			t.Fatalf("first move server_ts %d before the clock start %d", ts, start)
 		}
 	})
 
@@ -1211,8 +1228,8 @@ func TestMoveChargedToReceiptTime(t *testing.T) {
 		if got := d.Move.ClockAfterMs; got != 303_000 {
 			t.Fatalf("clock_after = %d, want 303000 (nothing charged, increment granted)", got)
 		}
-		if ts := m.s.History[3].ServerTS; ts != last {
-			t.Fatalf("server_ts %d, want the clamp %d", ts, last)
+		if ts := m.s.History[3].ServerTS; ts != last+5_000 {
+			t.Fatalf("server_ts %d, want the decide time %d", ts, last+5_000)
 		}
 	})
 
