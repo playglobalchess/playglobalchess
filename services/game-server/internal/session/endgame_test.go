@@ -285,6 +285,12 @@ func TestMutualDrawOfferPairsInStream(t *testing.T) {
 			t.Fatalf("mutual offer appended an extra DrawOffered{1}")
 		}
 	}
+	// And the stream must fold, and a fresh session over it must equal the live
+	// one (#99): the shape assertions above alone passed while #85 was broken.
+	assertRebuildMatches(t, s, store)
+	if _, err := game.Fold(all, reproOpts); err != nil {
+		t.Fatalf("the mutual-draw stream does not fold: %v", err)
+	}
 }
 
 func TestRepeatOfferSameSeatIsNoop(t *testing.T) {

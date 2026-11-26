@@ -159,7 +159,7 @@ func (c *cancelCmd) finish()                         { close(c.done) }
 // right after it (review of #208: done and quit were both ready).
 func TestFinishedCommandNotReportedClosed(t *testing.T) {
 	for i := 0; i < 100; i++ {
-		s, _, cancel := seedLive(t, startFEN, false, time.Now)
+		s, _, cancel := seedLiveRaw(t, startFEN, false, time.Now)
 		c := &cancelCmd{cancel: cancel, done: make(chan struct{})}
 		if err := s.dispatch(context.Background(), c, c.done); err != nil {
 			t.Fatalf("run %d: finished command reported %v", i, err)

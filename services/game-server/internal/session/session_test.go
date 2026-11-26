@@ -36,7 +36,23 @@ func (f *fakeClock) add(d time.Duration) {
 
 // seedLive appends GameCreated + both PlayerJoined to the store so the game is
 // LIVE from startFEN with a 5+3 control, and returns a running Session.
+//
+// The returned cancel func first checks the persistence invariant (#99): the
+// stream the test wrote must fold, and a fresh session over it must equal the
+// live one. Use seedLiveRaw only where cancel runs on the actor itself.
 func seedLive(t *testing.T, startpos string, rated bool, now func() time.Time) (*Session, *game.MemStore, context.CancelFunc) {
+	t.Helper()
+	s, store, raw := seedLiveRaw(t, startpos, rated, now)
+	return s, store, func() {
+		if !t.Failed() {
+			assertRebuildMatches(t, s, store)
+		}
+		raw()
+	}
+}
+
+// seedLiveRaw is seedLive without the invariant check on cancel.
+func seedLiveRaw(t *testing.T, startpos string, rated bool, now func() time.Time) (*Session, *game.MemStore, context.CancelFunc) {
 	t.Helper()
 	store := game.NewMemStore()
 	ctx := context.Background()
@@ -503,7 +519,7 @@ func TestIdempotentReackDoesNotCorrupt(t *testing.T) {
 // numbers; the second takeback must still project the right position.
 func TestDoubleTakeback(t *testing.T) {
 	fc := &fakeClock{t: time.Unix(0, 0)}
-	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	s, store, cancel := seedLive(t, startFEN, false, fc.now)
 	defer cancel()
 	ctx := context.Background()
 
@@ -532,6 +548,13 @@ func TestDoubleTakeback(t *testing.T) {
 	// MovePlayed ply 3, so the stream now has TWO ply-3 moves (the undone Nf3 and
 	// the new Nc3) — the recurring-ply condition the finding is about.
 	play(0, 3, "b1c3")
+	// The replayed ply 3 must really be persisted: a false re-ack of the undone
+	// Nf3 would write nothing and leave the stream's last move as Nf3 (#99).
+	if evs := mustLoad(t, store); evs[len(evs)-1].Type != game.EvMovePlayed ||
+		evs[len(evs)-1].MovePlayed.UCI != "b1c3" || evs[len(evs)-1].MovePlayed.Ply != 3 {
+		t.Fatalf("the replayed ply 3 was not persisted as b1c3: last event %+v", evs[len(evs)-1])
+	}
+	assertRebuildMatches(t, s, store)
 
 	// Second takeback over the same region: undo the new ply-3 move. The cut
 	// must target the FIRST ply-3... actually the re-fold must land on the
@@ -548,6 +571,7 @@ func TestDoubleTakeback(t *testing.T) {
 	if back2.FEN != back1.FEN {
 		t.Errorf("double-takeback desync: back2 FEN %q != back1 %q", back2.FEN, back1.FEN)
 	}
+	assertRebuildMatches(t, s, store)
 }
 
 // TestResyncPreservesIdleThink covers the finding that a reconstructed session
