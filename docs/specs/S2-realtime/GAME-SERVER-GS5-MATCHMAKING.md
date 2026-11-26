@@ -90,7 +90,10 @@ seeker's value is the same as taking either's. Interim catalogue: until the REST
 pools catalogue (`GET /v1/pools`, X-13) exists, the allow-list is
 `transport.DefaultPools`, where each pool id IS its time-control id (bullet-1+0,
 bullet-2+1, blitz-3+0, blitz-3+2, blitz-5+0, blitz-5+3, rapid-10+0, rapid-10+5,
-rapid-15+10, rapid-30+0, daily-1, daily-3, daily-7). Rated and unrated seekers
+rapid-15+10, rapid-30+0). There are no daily pools yet (#178): daily play (a
+per-move clock with no base, many concurrent games per user, a "my games" list,
+offline move delivery) is unspecified, so a daily SEEK is refused as an unknown
+pool until that is specified and built. Rated and unrated seekers
 share a pool id and are separated by the `rated` check.
 
 ### 3.2 Pairing core (pure, Redis-free)
