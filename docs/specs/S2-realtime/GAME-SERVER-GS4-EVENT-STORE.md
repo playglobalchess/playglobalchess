@@ -223,7 +223,7 @@ keeps the stream replayable across codec evolution (NFR-9).
 |---|---|
 | Append at an occupied seq (true duplicate) | conditional-put fails → typed `ErrSeqConflict`; the session reloads the head, finds its event already present, treats it as the committed event (idempotent), does not re-append. |
 | Append at an occupied seq (valid move lost a cross-node race) | same `ErrSeqConflict`; the session reloads the head, re-folds, re-validates, and re-appends at the next free seq — the move is re-sequenced, **never dropped** (NFR-2). |
-| Put fails / aborts (crash/disconnect mid-write) | the conditional `PutItem` is atomic — it either lands the whole item or nothing; on failure Append returns an error and NO item exists; the move did not happen (NFR-7). |
+| Put fails / aborts (crash/disconnect mid-write) | the conditional `PutItem` is atomic — it either lands the whole item or nothing; but an error return does NOT prove nothing landed: a timeout, reset or cancel can be reported after the commit. An `Append` error other than `ErrSeqConflict` is therefore an **unknown outcome**, and the caller must re-read before deciding anything else (GS-3 §3.7). Only the persist-before-ack rule (NFR-7) is unchanged: no ack until the commit is known. |
 | Load an unknown stream | empty slice, nil error (interface contract). |
 | Corrupt/unknown event_type on Load | error (refuse to project a corrupt stream — mirrors FoldWithEngine's corrupt-stream refusal). |
 | Unknown `encoding_version` on Load | error (refuse to project a stream this build cannot faithfully decode — NFR-9 fidelity over best-effort). |

@@ -205,7 +205,7 @@ tweak.
 | Flag while disconnected | clock keeps running; `TickFlagCheck` fires `ClockFlagged`→`GameEnded{FLAG|TIMEOUT_VS_INSUFFICIENT}`. |
 | Reconnect mid-game | `StateSnapshot` == a fresh fold of the stream (asserted); zero game loss. |
 | Node failover | a new `Session` built from the durable stream on another node reproduces the exact projection (NFR-2). |
-| Persist fails mid-move | the GS-1 pipeline returns the error without acking; the session does NOT advance `curFEN`/clocks/history — the move did not happen. |
+| Persist fails mid-move | A store error is **unknown**, not "not committed" (§3.7, #95). The session re-reads the stream and adopts the store's state; if its events are there the command happened and is acked, otherwise it is not acked and the caller gets INTERNAL. |
 | Takeback (unrated) | `RefoldTakeback` rolls projection + `priorKeys` + clocks back to ply-n; rated games reject (F-01.4). |
 | Concurrent mutators | prevented by the single-owner discipline (§3.5); `-race` proves it. |
 
@@ -304,6 +304,27 @@ tweak.
     down it runs anyway, and a seq conflict on its write heals the
     projection), so a stale projection is not served once the store is back. A command that finished is never
     reported as closed, even when Run exits at that moment.
+- **§3.7 — Persist outcomes (#95, DECIDED).** Every `Append` or `AppendBatch`
+  has three outcomes. *Committed* (nil). *Seq conflict* (`ErrSeqConflict`:
+  another writer, or our own earlier ambiguous write, took the seq; reload and
+  re-decide, bounded). *Unknown* (any other error): the write may or may not
+  have landed. No error is ever classified as "definitely not committed",
+  because a store cannot prove it, so the safe default is the only class.
+  On unknown the session (1) re-reads the stream, retrying the read a few
+  times; (2) folds it and adopts it as the projection either way; (3) reports
+  success if exactly its events sit at the seqs it wrote (the command
+  happened, ack it, a resend is a re-ack), otherwise reports failure (INTERNAL
+  to the client, which must RESYNC); (4) if the re-read itself failed, marks
+  the projection stale so the next command rebuilds before deciding. Resend
+  and re-ack decisions come from the durable stream, never from ply
+  arithmetic. Behaviour per command on unknown, all through this one path:
+  move, flag, resign, abort, draw offer/accept/decline and takeback
+  propose/accept/decline each either happened exactly once or are refused
+  without a second write; a second `GameEnded` or takeback batch cannot be
+  appended because the next decide runs against the adopted state and the
+  fold refuses endings outside Live. Tests: `TestCommitThenErrorEveryCommand`
+  (all of the above, re-read working and stale) plus the move cases in
+  `faultstore_test.go`.
 - **Q-GS3B — where the repetition plumbing lands — PROPOSED (a: one coordinated
   interface change here).** Closing Q-GS5 needs the `LegalityOracle` to accept
   the prior Zobrist history and the `LegalityVerdict` to carry the resulting

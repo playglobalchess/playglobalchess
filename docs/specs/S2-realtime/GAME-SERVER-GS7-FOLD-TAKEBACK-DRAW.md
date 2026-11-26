@@ -152,7 +152,7 @@ side-effect-free; that is the property required.
 5. On `ErrSeqConflict`: reload the stream, rebuild state with `FoldWithEngine`,
    then re-run `decide` for the same command (it may now be a re-ack, stale, or
    still valid). Bounded retries, then `INTERNAL`.
-6. On an ambiguous persist error: same reload-and-redecide. Full design is #95.
+6. On any other persist error (an unknown outcome, GS-3 §3.7): re-read the stream; if our events are at `expectedSeq..` the command happened (report success), otherwise adopt the store's state and report failure. The next command first rebuilds if the re-read failed.
 
 ### 3.5 Flag checks and the ticker
 
