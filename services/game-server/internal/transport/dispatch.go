@@ -33,6 +33,8 @@ type Server struct {
 	// tickerExited, if set (tests only), is called when a game's flag ticker
 	// goroutine returns, so a leak test can see the ticker is gone (#88).
 	tickerExited func(gameID string)
+	// tickChecked, if set (tests only), is called before each flag check.
+	tickChecked func(gameID string)
 	// endReadTimeout overrides endBroadcastTimeout (tests only; 0 = default).
 	endReadTimeout time.Duration
 

@@ -205,11 +205,25 @@ stream without a live session (no wire change):
 
 The transport drives the idle/disconnect **forfeit** path, which GS-3 delegates
 to the caller ("the session does not own a ticker", Q-GS3C): a per-game flag
-ticker calls `Session.TickFlagCheck` every `flagInterval` (config, default 1s),
-charging elapsed-since-last-move against the side to move; if that flags, the
-session ends the game (`FLAG` / `TIMEOUT_VS_INSUFFICIENT`) and the transport
-broadcasts `GAME_END` to both seats. The ticker is armed at MATCHED and exits
-when the game is gone (ended by any path), so there is exactly one driver per
+timer (still called "the ticker" below) checks the game when its clock can run
+out, charging elapsed-since-last-move against the side to move; if that flags,
+the session ends the game (`FLAG` / `TIMEOUT_VS_INSUFFICIENT`) and the transport
+broadcasts `GAME_END` to both seats.
+
+**It sleeps until the deadline, it does not poll (#182).** After every command
+the session publishes `NextTick`: the first instant a check can end the game
+(`game.NextTickMs`: `LastChangeTS + remaining + PerMoveMs + 1` for the side to
+move, or `LastChangeTS + firstMoveTimeout + 1` before both seats have moved),
+and signals the timer when it changes. The timer sleeps until that instant and
+re-arms on each signal, so a move that hands the clock to a side with less time
+moves the check earlier. A flag therefore lands at the instant the clock runs
+out (within timer and scheduling latency; the test bound is 50 ms), and a game
+whose clocks are far from zero costs no check, snapshot or wakeup. A game with
+no deadline (clock not running) sleeps until a command changes that. A session whose projection may be behind the store (unconfirmed write, or after a panicked command) publishes a deadline 1 s away instead, so the next check reloads it first.
+`flagInterval` (config, default 1 s) is now only the base for retries and for
+the repair of an ended game below. The ticker is armed at MATCHED and exits
+when the game is gone (ended by any path, or its session stopped and no
+replacement was opened), so there is exactly one driver per
 live game and it stops with the game — this is also what reclaims a game whose
 players both disconnect (the session + goroutines + indices are freed, not
 leaked). Without this driver a disconnected or stalled player's clock would run
@@ -222,12 +236,13 @@ outage, or a flag write that failed) changes nothing in the session: the
 session adopts state only after a successful write, so the next check decides
 the flag again from the unchanged state. A check that fails because the game
 was dropped mid-check is a normal end, not a failure. Failed checks are retried
-with backoff counted in ticks: one failure retries on the next tick; after
-that the backoff doubles per consecutive failure up to `flagBackoffMax`
-(config, default 5 s, rounded down to whole ticks), and each wait is jittered
-over the upper half of the backoff so games that failed together do not retry
-together. A flag therefore lands at most `flagBackoffMax` plus one tick after
-the store comes back, plus any check still in flight, which is bounded by the
+with backoff counted in whole `flagInterval`s: one failure retries one interval
+later; after that the backoff doubles per consecutive failure up to
+`flagBackoffMax` (config, default 5 s, rounded down to whole intervals), and
+each wait is jittered over the upper half of the backoff so games that failed
+together do not retry together. A retry already scheduled is not moved by a
+deadline signal. A flag therefore lands at most `flagBackoffMax` plus one
+interval after the store comes back, plus any check still in flight, which is bounded by the
 5 s read bound. A node logs one "failing" summary line at most every 30 s
 while any game's checks are failing (how many games, the latest error). When
 the failing set drains to zero, because games recovered or their tickers
@@ -254,12 +269,14 @@ read can blank or degrade it. A call that does not broadcast releases the
 claim. A caller that finds the claim held, or the game already dropped, sends
 nothing itself: the holder is broadcasting to every bound seat, or already has.
 So no client gets two `GAME_END`s. The ticker also asks whether the game is
-OVER, not only whether this tick ended it. So an ended game whose broadcast did
-not go out is broadcast by the next tick, and then dropped. If that keeps
+OVER, not only whether this tick ended it. The session's end also republishes `NextTick`
+(as ended), which wakes the timer: one `flagInterval` later it checks, so an
+ended game whose broadcast did not go out is broadcast then, and dropped, and
+it retries every interval after that. If that keeps
 failing, the ticker drops the ended game after 10 failed broadcasts (counted
 across any failed checks in between), and never
-sooner than two broadcast read bounds' worth of ticks, so it cannot cut a live
-broadcast short at any tick interval. It first records both seats as having
+sooner than two broadcast read bounds' worth of intervals, so it cannot cut a
+live broadcast short at any interval. It first records both seats as having
 missed the ending, so each one's next `AUTHENTICATE` pushes the ended `STATE`
 (§3.4). In every case the session, the seat and user indices, the claim, the
 join signal and the ticker goroutine are reclaimed.

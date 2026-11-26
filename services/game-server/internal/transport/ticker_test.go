@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -382,4 +383,60 @@ func TestFirstMoveTimeoutAbortsAndNotifiesBoth(t *testing.T) {
 		}
 	}
 	wantReclaimed(t, h, w, m.Matched.GameID)
+}
+
+// TestFlagLandsAtTheDeadline (#182): with the default 1 s interval, a flag is
+// broadcast within 50 ms of the clock running out, not up to a second late,
+// and never before it.
+func TestFlagLandsAtTheDeadline(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	h.useRealClock() // flagInterval stays at its 1 s default
+	ctx := context.Background()
+	ca, cb := newFakeConn(), newFakeConn()
+	h.handle(ctx, ca)
+	h.handle(ctx, cb)
+	seekTC(t, ca, "alice", "tiny")
+	time.Sleep(20 * time.Millisecond)
+	seekTC(t, cb, "bob", "tiny")
+	m := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
+	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+	openTiny(t, ca, cb, m)
+	sess, ok := h.srv.reg.Get(m.Matched.GameID)
+	if !ok {
+		t.Fatal("no session")
+	}
+	tk := sess.NextTick()
+	if !tk.Due {
+		t.Fatalf("no flag deadline after both first moves: %+v", tk)
+	}
+	deadline := time.UnixMilli(int64(tk.AtMs))
+	ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	got := time.Now()
+	if late := got.Sub(deadline); late > 50*time.Millisecond {
+		t.Fatalf("GAME_END %v after the clock ran out, want within 50 ms", late)
+	}
+	if got.Before(deadline) {
+		t.Fatalf("GAME_END %v before the clock ran out", deadline.Sub(got))
+	}
+}
+
+// TestNoFlagWorkWhileNoClockIsNearZero (#182): a live blitz game whose clock
+// is far from zero gets no flag check at all, however short the interval.
+func TestNoFlagWorkWhileNoClockIsNearZero(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	h.srv.flagInterval = 10 * time.Millisecond // the old ticker: 30 checks below
+	h.useRealClock()
+	var checks atomic.Int32
+	h.srv.tickChecked = func(string) { checks.Add(1) }
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
+	moveAndAwaitBoth(t, white, black, gameID, 3, "g1f3")
+	time.Sleep(300 * time.Millisecond)
+	if n := checks.Load(); n != 0 {
+		t.Fatalf("%d flag checks ran while every clock had minutes left", n)
+	}
 }

@@ -352,6 +352,36 @@ func firstMoveTimedOut(s State, nowMs uint64, opts FoldOptions) bool {
 	return limit > 0 && s.ElapsedMs(nowMs) > limit
 }
 
+// NextTickMs is the earliest instant (epoch ms) at which CmdTickFlag can end
+// the game, if nothing else happens first (#182): the instant the side to move
+// flags, or, before both seats have moved, the first-move timeout. ok is false
+// when no tick can change anything (ended, not started, half-terminal). A tick
+// decided before this instant is a no-op, so the transport needs no work until
+// then; any committed command can move it, so it is recomputed after each one.
+func NextTickMs(s State, opts FoldOptions) (atMs uint64, ok bool) {
+	if s.Phase != PhaseLive || !s.ClockStartedSet || s.HalfTerminal != nil || s.Clock.Flagged() {
+		return 0, false
+	}
+	if s.Ply < firstMovePlies {
+		limit := opts.firstMoveTimeoutMs()
+		if limit <= 0 {
+			return 0, false
+		}
+		// firstMoveTimedOut: elapsed > limit.
+		return s.LastChangeTS + uint64(limit) + 1, true
+	}
+	seat := s.RunningSeat()
+	if seat == NoSeat || seat >= len(s.Clock.RemainingMs) {
+		return 0, false
+	}
+	// clock.Apply flags once elapsed - PerMoveMs > remaining.
+	slack := s.Clock.RemainingMs[seat] + opts.TimeControl.PerMoveMs
+	if slack < 0 {
+		slack = 0
+	}
+	return s.LastChangeTS + uint64(slack) + 1, true
+}
+
 // abortDecision ends the game with no result: Aborted + GameEnded{ABORT} as one
 // batch.
 func abortDecision(by uint8) Decision {

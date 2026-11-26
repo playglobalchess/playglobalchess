@@ -197,7 +197,8 @@ sides without charging time or granting increment while no timer runs):
    <1500 s, <21600 s); none at 6 h or more. When it is exceeded, the next tick
    ends the game with `Aborted{by: SystemActor}` + `GameEnded{ABORT}`: no
    result, no flag, no rating change. A move that arrives before that tick is
-   still accepted (tick granularity is `flagInterval`). Lichess's tournament
+   still accepted: the check is scheduled for the instant the timeout passes
+   (GS-6 §3.5, #182), so only scheduling latency separates the two. Lichess's tournament
    (5 s shorter) and Chess960 (x1.5) variants are not applicable yet.
 3. **A takeback to ply 0 or 1** restarts the first-move timeout from the rewind
    (`TakebackRewound.server_ts`), and no clock runs again until ply 2.
