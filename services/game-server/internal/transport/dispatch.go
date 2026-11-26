@@ -101,8 +101,6 @@ func (s *Server) SetRatedEnabled(on bool) { s.ratedEnabled.Store(on) }
 // conn-local state for one authenticated connection.
 type connState struct {
 	userID string
-	// games this connection is seated in, so teardown can unbind them.
-	seats []gameSeAT
 	// The connection's budget for stream-backed lookups of games not live here
 	// (RESYNC or MOVE of an ended game, ended.go): a window start and a count.
 	// Touched only by this connection's own goroutine.
@@ -285,17 +283,7 @@ func (s *Server) seatOf(c Conn, gameID string) (uint8, bool) {
 // updating both the per-game state and the userID->game index (the latter
 // drives reconnection resync, Option A).
 func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
-	gs := gameSeAT{gameID: gameID, seat: seat}
-	if !s.bindLocked(c, st.userID, gameID, seat, false, true) {
-		return // the game was dropped meanwhile; nothing to bind
-	}
-	// Record on the conn-state only once (a reconnect re-binds the same seat).
-	for _, existing := range st.seats {
-		if existing == gs {
-			return
-		}
-	}
-	st.seats = append(st.seats, gs)
+	s.bindLocked(c, st.userID, gameID, seat, false, true) // false: the game was dropped meanwhile
 }
 
 // bindLocked binds (gameID, seat) to c for uid in both indices, atomically with

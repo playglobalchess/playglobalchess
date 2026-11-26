@@ -1,9 +1,6 @@
 package transport
 
-import (
-	"hash/fnv"
-	"sync"
-)
+import "sync"
 
 // gamestate.go holds the per-game transport state, sharded by game id (#174).
 //
@@ -41,9 +38,11 @@ type gameShard struct {
 type gameTable [gameShardCount]gameShard
 
 func (t *gameTable) shard(gameID string) *gameShard {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(gameID))
-	return &t[h.Sum32()%gameShardCount]
+	h := uint32(2166136261) // FNV-1a, inlined so a lookup does not allocate
+	for i := 0; i < len(gameID); i++ {
+		h = (h ^ uint32(gameID[i])) * 16777619
+	}
+	return &t[h%gameShardCount]
 }
 
 // entryLocked returns the game's entry, creating it. sh.mu held.

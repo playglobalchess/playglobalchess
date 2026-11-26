@@ -15,7 +15,7 @@ func bindMany(s *Server, c Conn, n int) {
 }
 
 // Disconnect visits only the games the user is seated in, and also clears seats
-// bound through bindSeatForUser (MATCHED delivery), which never reach st.seats.
+// bound through bindSeatForUser (MATCHED delivery).
 func TestUnbindAllClearsOnlyThisUsersSeats(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
