@@ -398,6 +398,22 @@ closed by) the §4A v1.1 amendment:
   play a short game to a real GAME_END — all over the transport + the real
   session/store (DynamoDB Local) + matchmaking (Redis), gated like the other
   real-dependency tiers.
+- **Hostile clients (#204, `hostile_test.go`):** against a live game, the black
+  seat or an outsider sends truncated, empty, 1 MiB, unknown-code and
+  garbage-UCI frames, moves out of turn or with a wrong `ply_expected`, commands
+  for games that do not exist or belong to others, a second AUTHENTICATE, SEEK
+  while seated, early draw offers and takebacks, floods of RESYNC and
+  OFFER_DRAW, a cut-off frame then a drop, replays of valid frames, a client
+  that stops reading, and every command after GAME_END. Each case asserts the
+  victim's next move is still accepted, the stream holds exactly the honest
+  moves with no ending event, every frame the victim received decodes, nobody
+  gets GAME_END twice, and no goroutine outlives the game. `FuzzDispatch` feeds
+  arbitrary bytes, or a valid message of any type aimed at the real game with a
+  fuzzed ply and UCI, then requires a RESYNC from the victim to still get a
+  STATE. Committed seeds replay in `make test`; CI fuzzes for 30 s per commit
+  and 10 min nightly. Not covered here: connection caps, rate limits and the
+  auth and idle timeouts (#104; they are not built), and a real socket (the
+  tests use the fake `Conn`).
 - `make test` green; the seam + e2e run in CI with the redis/dynamodb containers.
 
 ## 9. Acceptance criteria (Definition of Done)
