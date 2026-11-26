@@ -39,34 +39,23 @@ type Server struct {
 	// endReadTimeout overrides endBroadcastTimeout (tests only; 0 = default).
 	endReadTimeout time.Duration
 
-	mu    sync.Mutex
-	conns map[gameSeAT]Conn // (gameID, seatIdx) → the connection seated there
+	// gt is the per-game state, sharded by game id (gamestate.go, #174).
+	gt gameTable
+
+	// userMu guards the user-keyed state below. It is never held across a send,
+	// a store call or an engine call.
+	userMu sync.Mutex
 	// userConns maps an authenticated user id to their current connection. Bound
 	// at AUTHENTICATE (before SEEK), so when a LATER seeker pairs with an
 	// already-waiting one, the pairing handler can reach the waiting seeker's
-	// connection by its user id (match.Players) to deliver MATCHED — the waiting
+	// connection by its user id (match.Players) to deliver MATCHED -- the waiting
 	// seeker's own handler already returned (enqueued) and will not run again.
 	userConns map[string]Conn
 	// userGames maps a user id to the live games they are seated in (populated at
 	// MATCHED). On reconnect (a fresh AUTHENTICATE for the same user) the server
-	// consults this to push STATE and rebind the seat — reconnection is
+	// consults this to push STATE and rebind the seat -- reconnection is
 	// server-initiated because §4A has no client resync frame (Option A).
-	userGames map[string]map[string]uint8 // userID → (gameID → seat)
-	// gameUsers is the reverse index: gameID → (seat → userID). Same lifetime as
-	// userGames (set at bind, cleared by dropGame), so a game end finds its two
-	// users without scanning every user under the lock.
-	gameUsers map[string]map[uint8]string
-	// joined is closed the FIRST time any seat binds a connection for a game, so
-	// the join-timeout can distinguish "a seat actually joined" (even if it later
-	// disconnects) from "nobody ever joined" (the true GS-5 ghost-claim case).
-	// Without this the timer wrongly aborts a LIVE game on a transient
-	// double-disconnect (reviewer C1). Removed by dropGame.
-	joined map[string]chan struct{} // gameID → closed-once-joined signal
-	// endBroadcast latches that a game's GAME_END has been claimed, so concurrent
-	// end paths (a terminal move + the flag tick, or two ending commands) do not
-	// each broadcast GAME_END to the clients. Set once by claimGameEnd; cleared by
-	// dropGame.
-	endBroadcast map[string]bool
+	userGames map[string]map[string]uint8 // userID -> (gameID -> seat)
 	// Write pump bounds (#91): frames queued per connection, and one frame's
 	// write deadline. Past either, the connection is closed.
 	outboundQueue int
@@ -95,12 +84,8 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 		mm:            mm,
 		reg:           reg,
 		now:           time.Now,
-		conns:         make(map[gameSeAT]Conn),
 		userConns:     make(map[string]Conn),
 		userGames:     make(map[string]map[string]uint8),
-		gameUsers:     make(map[string]map[uint8]string),
-		joined:        make(map[string]chan struct{}),
-		endBroadcast:  make(map[string]bool),
 		outboundQueue: defaultOutboundQueue,
 		writeDeadline: defaultWriteDeadline,
 		pools:         DefaultPools(),
@@ -189,9 +174,9 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 	st.userID = uid
 	// Register this connection as the user's current one (used by MATCHED
 	// delivery to reach an already-waiting seeker, and by reconnect rebinding).
-	s.mu.Lock()
+	s.userMu.Lock()
 	s.userConns[uid] = c
-	s.mu.Unlock()
+	s.userMu.Unlock()
 	// Reconnection (Option A): §4A has no client resync frame, so on a successful
 	// AUTHENTICATE the server itself restores any live game this user is seated
 	// in — rebind the seat to THIS (new) connection and push STATE folded from the
@@ -203,12 +188,12 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 // resyncUser rebinds and pushes STATE for every live game the authenticated user
 // is seated in (normally one in v1). Called right after AUTHENTICATE.
 func (s *Server) resyncUser(ctx context.Context, c Conn, st *connState) {
-	s.mu.Lock()
+	s.userMu.Lock()
 	games := make(map[string]uint8, len(s.userGames[st.userID]))
 	for gid, seat := range s.userGames[st.userID] {
 		games[gid] = seat
 	}
-	s.mu.Unlock()
+	s.userMu.Unlock()
 	for gid, seat := range games {
 		sess, ok := s.reg.Get(gid)
 		if !ok {
@@ -283,29 +268,25 @@ func (s *Server) route(ctx context.Context, c Conn, st *connState, msg codec.Cli
 // (0,false) if not seated there (routing/authz: a MOVE must come from a seated
 // connection).
 func (s *Server) seatOf(c Conn, gameID string) (uint8, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for gs, cc := range s.conns {
-		if gs.gameID == gameID && cc == c {
-			return gs.seat, true
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := sh.games[gameID]; e != nil {
+		for seat, cc := range e.conns {
+			if cc == c {
+				return seat, true
+			}
 		}
 	}
 	return 0, false
 }
 
 // bindSeat records that connection c occupies (gameID, seat) for user st.userID,
-// updating both the (game,seat)→conn map and the userID→game index (the latter
+// updating both the per-game state and the userID->game index (the latter
 // drives reconnection resync, Option A).
 func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
 	gs := gameSeAT{gameID: gameID, seat: seat}
-	s.mu.Lock()
-	s.conns[gs] = c
-	if s.userGames[st.userID] == nil {
-		s.userGames[st.userID] = make(map[string]uint8)
-	}
-	s.userGames[st.userID][gameID] = seat
-	s.indexGameUserLocked(gameID, seat, st.userID)
-	s.mu.Unlock()
+	s.bindLocked(c, st.userID, gameID, seat, false)
 	// Record on the conn-state only once (a reconnect re-binds the same seat).
 	for _, existing := range st.seats {
 		if existing == gs {
@@ -315,31 +296,65 @@ func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
 	st.seats = append(st.seats, gs)
 }
 
+// bindLocked binds (gameID, seat) to c for uid in both indices, atomically with
+// respect to dropGame's cleanup of them. markJoined also closes the game's join
+// signal. Lock order: userMu, then the game's shard.
+func (s *Server) bindLocked(c Conn, uid, gameID string, seat uint8, markJoined bool) {
+	sh := s.gt.shard(gameID)
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	if s.userGames[uid] == nil {
+		s.userGames[uid] = make(map[string]uint8)
+	}
+	s.userGames[uid][gameID] = seat
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	e := sh.entryLocked(gameID)
+	e.conns[seat] = c
+	e.users[seat] = uid
+	if markJoined {
+		e.markJoinedLocked()
+	}
+}
+
 // connFor returns the connection seated at (gameID, seat), if any.
 func (s *Server) connFor(gameID string, seat uint8) (Conn, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.conns[gameSeAT{gameID: gameID, seat: seat}]
-	return c, ok
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := sh.games[gameID]; e != nil {
+		c, ok := e.conns[seat]
+		return c, ok
+	}
+	return nil, false
 }
 
 // unbindAll removes this connection's bindings on teardown. The game persists in
 // the store and the seat may reconnect, so this only clears entries that still
 // point at THIS connection (a reconnect may have rebound seat/userConn to a new
-// one). It does NOT remove the userID→game index: that is what lets a reconnect
-// find and resync the live game.
+// one). It does NOT remove the userID->game index: that is what lets a reconnect
+// find and resync the live game. It visits only the games this user is seated
+// in, not every connection on the node (#174).
 func (s *Server) unbindAll(st *connState, c Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Drop any (game,seat)->conn entries still pointing at this connection.
-	for gs, cc := range s.conns {
-		if cc == c {
-			delete(s.conns, gs)
+	var games map[string]uint8
+	s.userMu.Lock()
+	if st.userID != "" {
+		if s.userConns[st.userID] == c {
+			delete(s.userConns, st.userID)
+		}
+		games = make(map[string]uint8, len(s.userGames[st.userID]))
+		for gid, seat := range s.userGames[st.userID] {
+			games[gid] = seat
 		}
 	}
-	// Drop the userConns entry only if it is still this connection.
-	if st.userID != "" && s.userConns[st.userID] == c {
-		delete(s.userConns, st.userID)
+	s.userMu.Unlock()
+	for gid, seat := range games {
+		sh := s.gt.shard(gid)
+		sh.mu.Lock()
+		if e := sh.games[gid]; e != nil && e.conns[seat] == c {
+			delete(e.conns, seat)
+		}
+		sh.mu.Unlock()
 	}
 }
 

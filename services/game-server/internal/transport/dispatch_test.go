@@ -244,7 +244,7 @@ func (h *harness) useRealClock() {
 	h.srv.reg.now = time.Now
 }
 
-func newHarness(t *testing.T) *harness {
+func newHarness(t testing.TB) *harness {
 	t.Helper()
 	o, err := engine.New()
 	if err != nil {

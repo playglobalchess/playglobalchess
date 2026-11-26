@@ -185,15 +185,36 @@ type Registry struct {
 	// when > 0. Tests only; production leaves it zero.
 	firstMoveTimeoutMs int64
 
+	// buildTimeout bounds one session build (store read, engine fold, first
+	// appends). 0 means defaultBuildTimeout. Tests only.
+	buildTimeout time.Duration
+
+	// mu guards only the maps below. It is never held across a store or engine
+	// call (#174): a build runs outside it, once per game (singleflight).
 	mu       sync.Mutex
 	sessions map[string]*registered
+	building map[string]*build
+	epoch    uint64 // bumped by CloseAll; a build that straddles it is discarded
 	rootCtx  context.Context
 }
+
+// defaultBuildTimeout bounds a session build's store and engine work (#174).
+const defaultBuildTimeout = 10 * time.Second
 
 type registered struct {
 	s      *session.Session
 	cancel context.CancelFunc
 }
+
+// build is one in-flight session build; waiters block on done.
+type build struct {
+	done    chan struct{}
+	s       *session.Session
+	err     error
+	dropped bool // Drop or CloseAll ran while it was building
+}
+
+var errBuildDiscarded = errors.New("transport: game dropped while its session was being built")
 
 // NewRegistry builds a Registry. rootCtx bounds every session actor's lifetime
 // (cancel it to stop them all on server shutdown).
@@ -203,6 +224,7 @@ func NewRegistry(rootCtx context.Context, store game.EventStore, oracle game.Leg
 		oracle:   oracle,
 		resolver: resolver,
 		sessions: make(map[string]*registered),
+		building: make(map[string]*build),
 		rootCtx:  rootCtx,
 	}
 }
@@ -210,16 +232,51 @@ func NewRegistry(rootCtx context.Context, store game.EventStore, oracle game.Leg
 // GetOrCreate returns the live Session for gameID, building and starting it from
 // the durable stream on first touch. The timeControlID expands the clock via the
 // resolver (the stream itself carries only the id, §3.3). Concurrent callers for
-// the same game get the same Session (mu-guarded).
+// the same game share ONE build and get the same Session. The build (a store
+// read, an engine fold and possible appends) runs outside the registry lock, so
+// Get, Drop and other games' builds never queue behind it (#174), and it is
+// bounded by buildTimeout.
 func (r *Registry) GetOrCreate(gameID, timeControlID string) (*session.Session, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if reg, ok := r.sessions[gameID]; ok {
+		r.mu.Unlock()
 		return reg.s, nil
 	}
+	if b, ok := r.building[gameID]; ok {
+		r.mu.Unlock()
+		<-b.done
+		return b.s, b.err
+	}
+	b := &build{done: make(chan struct{})}
+	r.building[gameID] = b
+	epoch := r.epoch
+	r.mu.Unlock()
+
+	s, cancel, err := r.buildSession(gameID, timeControlID)
+
+	r.mu.Lock()
+	delete(r.building, gameID)
+	switch {
+	case err != nil:
+		b.err = err
+	case b.dropped || r.epoch != epoch:
+		cancel()
+		b.err = errBuildDiscarded
+	default:
+		r.sessions[gameID] = &registered{s: s, cancel: cancel}
+		b.s = s
+	}
+	r.mu.Unlock()
+	close(b.done)
+	return b.s, b.err
+}
+
+// buildSession folds the game's session and starts its actor. No registry lock
+// is held. On success the caller owns cancel.
+func (r *Registry) buildSession(gameID, timeControlID string) (*session.Session, context.CancelFunc, error) {
 	tc, err := r.resolver.Resolve(timeControlID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cfg := session.Config{
 		GameID: gameID,
@@ -230,14 +287,19 @@ func (r *Registry) GetOrCreate(gameID, timeControlID string) (*session.Session, 
 	if r.now != nil {
 		cfg.Now = r.now
 	}
-	s, err := session.NewSession(r.rootCtx, cfg)
+	timeout := r.buildTimeout
+	if timeout <= 0 {
+		timeout = defaultBuildTimeout
+	}
+	bctx, bcancel := context.WithTimeout(r.rootCtx, timeout)
+	defer bcancel()
+	s, err := session.NewSession(bctx, cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sctx, cancel := context.WithCancel(r.rootCtx)
 	go s.Run(sctx)
-	r.sessions[gameID] = &registered{s: s, cancel: cancel}
-	return s, nil
+	return s, cancel, nil
 }
 
 // Get returns the live Session for gameID if this node has it, else (nil,false).
@@ -253,7 +315,8 @@ func (r *Registry) Get(gameID string) (*session.Session, bool) {
 }
 
 // Drop stops and removes a game's session from this node (e.g. after it ends and
-// both connections leave). Idempotent.
+// both connections leave). A build still in flight for the game is discarded.
+// Idempotent.
 func (r *Registry) Drop(gameID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -261,12 +324,17 @@ func (r *Registry) Drop(gameID string) {
 		reg.cancel()
 		delete(r.sessions, gameID)
 	}
+	if b, ok := r.building[gameID]; ok {
+		b.dropped = true
+	}
 }
 
-// CloseAll stops every live session (server shutdown).
+// CloseAll stops every live session (server shutdown) and discards every build
+// in flight.
 func (r *Registry) CloseAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.epoch++
 	for id, reg := range r.sessions {
 		reg.cancel()
 		delete(r.sessions, id)

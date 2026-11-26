@@ -392,17 +392,18 @@ func (s *Server) armFlagTicker(gameID string) {
 // registerJoin creates the game's joined signal channel if absent (open =
 // not-yet-joined). Idempotent.
 func (s *Server) registerJoin(gameID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.joined[gameID]; !ok {
-		s.joined[gameID] = make(chan struct{})
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := sh.entryLocked(gameID); e.joined == nil {
+		e.joined = make(chan struct{})
 	}
 }
 
 // userConn returns the user's current connection, if any.
 func (s *Server) userConn(uid string) (Conn, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
 	c, ok := s.userConns[uid]
 	return c, ok
 }
@@ -410,31 +411,22 @@ func (s *Server) userConn(uid string) (Conn, bool) {
 // bindSeatForUser records (gameID,seat)->conn and the userID->game index for a
 // seat, independent of a specific connState (used by MATCHED delivery, which may
 // bind the OTHER player's connection whose handler is elsewhere). The owning
-// connection's own teardown reconciles s.conns by identity.
+// connection's own teardown reconciles the per-game state by identity.
 func (s *Server) bindSeatForUser(c Conn, uid, gameID string, seat uint8) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.conns[gameSeAT{gameID: gameID, seat: seat}] = c
-	if s.userGames[uid] == nil {
-		s.userGames[uid] = make(map[string]uint8)
-	}
-	s.userGames[uid][gameID] = seat
-	s.indexGameUserLocked(gameID, seat, uid)
-	s.markJoinedLocked(gameID)
+	s.bindLocked(c, uid, gameID, seat, true)
 }
 
 // markJoinedLocked closes the game's joined signal the first time any seat binds.
-// Caller MUST hold s.mu. Safe to call repeatedly (closes once).
-func (s *Server) markJoinedLocked(gameID string) {
-	ch, ok := s.joined[gameID]
-	if !ok {
-		// No timer armed for this game (e.g. a direct test bind) — nothing to signal.
+// The shard lock MUST be held. Safe to call repeatedly (closes once). With no
+// timer armed for the game (e.g. a direct test bind) there is nothing to signal.
+func (e *gameEntry) markJoinedLocked() {
+	if e.joined == nil {
 		return
 	}
 	select {
-	case <-ch: // already closed
+	case <-e.joined: // already closed
 	default:
-		close(ch)
+		close(e.joined)
 	}
 }
 
@@ -452,9 +444,13 @@ func (s *Server) armJoinTimeout(gameID string) {
 	if ttl == 0 {
 		ttl = defaultJoinTTL
 	}
-	s.mu.Lock()
-	joined := s.joined[gameID]
-	s.mu.Unlock()
+	var joined chan struct{}
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	if e := sh.games[gameID]; e != nil {
+		joined = e.joined
+	}
+	sh.mu.Unlock()
 	if joined == nil {
 		return // no signal registered (shouldn't happen; deliverMatched registers first).
 	}
@@ -487,9 +483,12 @@ func (s *Server) armJoinTimeout(gameID string) {
 // clearJoin removes a game's join signal (cleanup when the timer exits without
 // dropping the game). Idempotent.
 func (s *Server) clearJoin(gameID string) {
-	s.mu.Lock()
-	delete(s.joined, gameID)
-	s.mu.Unlock()
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	if e := sh.games[gameID]; e != nil {
+		e.joined = nil
+	}
+	sh.mu.Unlock()
 }
 
 // --- MOVE -> session -> MOVE_ACCEPTED / MOVE_REJECTED / GAME_END ------------
@@ -822,73 +821,81 @@ func (s *Server) endTimeout() time.Duration {
 	return endBroadcastTimeout
 }
 
-// seatUsers maps each seat of gameID to its user (a copy of gameUsers, bound
-// at MATCHED, kept until dropGame). O(seats), not O(connected users).
+// seatUsers maps each seat of gameID to its user (a copy of the game's user
+// index, bound at MATCHED, kept until dropGame). O(seats).
 func (s *Server) seatUsers(gameID string) map[uint8]string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	out := make(map[uint8]string, 2)
-	for seat, uid := range s.gameUsers[gameID] {
-		out[seat] = uid
+	if e := sh.games[gameID]; e != nil {
+		for seat, uid := range e.users {
+			out[seat] = uid
+		}
 	}
 	return out
 }
 
-// indexGameUserLocked records uid at seat in the per-game index. s.mu held.
-func (s *Server) indexGameUserLocked(gameID string, seat uint8, uid string) {
-	if s.gameUsers[gameID] == nil {
-		s.gameUsers[gameID] = make(map[uint8]string, 2)
-	}
-	s.gameUsers[gameID][seat] = uid
-}
-
 // releaseGameEnd gives back a claim whose holder did not broadcast (#88).
 func (s *Server) releaseGameEnd(gameID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.endBroadcast, gameID)
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := sh.games[gameID]; e != nil {
+		e.endClaimed = false
+		// A claim on a game this node never tracked created the entry; do not
+		// leave it behind.
+		if len(e.conns) == 0 && len(e.users) == 0 && e.joined == nil {
+			delete(sh.games, gameID)
+		}
+	}
 }
 
-// claimGameEnd returns true to exactly ONE caller per game — the one that should
+// claimGameEnd returns true to exactly ONE caller per game -- the one that should
 // broadcast GAME_END and drop. Subsequent callers (the racing end path) get
-// false and no-op. Guarded by s.mu.
+// false and no-op.
 func (s *Server) claimGameEnd(gameID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.endBroadcast[gameID] {
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	e := sh.entryLocked(gameID)
+	if e.endClaimed {
 		return false
 	}
-	s.endBroadcast[gameID] = true
+	e.endClaimed = true
 	return true
 }
 
 // dropGame removes a finished game's live session and ALL its transport state:
-// the seat→conn bindings and the userID→game reconnection index (so a later
-// AUTHENTICATE does not try to resync an ended game). Idempotent.
+// the seat->conn bindings and the userID->game reconnection index (so a later
+// AUTHENTICATE does not try to resync an ended game). Idempotent. Work is
+// O(seats): the game's own entry names its users, so no map sized by the node's
+// users or connections is scanned (#174).
 func (s *Server) dropGame(gameID string) {
 	// Unregister the session FIRST, then clear the indices and the end claim. In
 	// the other order, a late end path (the ticker's retry, #88) could re-claim
 	// the cleared claim while the ended session is still registered, find no seat
 	// bindings, and record both players as having missed an ending they saw.
 	s.reg.Drop(gameID)
-	s.mu.Lock()
-	for gs := range s.conns {
-		if gs.gameID == gameID {
-			delete(s.conns, gs)
-		}
+	sh := s.gt.shard(gameID)
+	sh.mu.Lock()
+	e := sh.games[gameID]
+	delete(sh.games, gameID)
+	sh.mu.Unlock()
+	if e == nil {
+		return
 	}
-	for uid, games := range s.userGames {
-		if _, ok := games[gameID]; ok {
+	// The shard lock is released before userMu is taken (lock order, gamestate.go).
+	s.userMu.Lock()
+	for _, uid := range e.users {
+		if games := s.userGames[uid]; games != nil {
 			delete(games, gameID)
 			if len(games) == 0 {
 				delete(s.userGames, uid)
 			}
 		}
 	}
-	delete(s.gameUsers, gameID)
-	delete(s.joined, gameID)
-	delete(s.endBroadcast, gameID)
-	s.mu.Unlock()
+	s.userMu.Unlock()
 }
 
 // --- small helpers on Match -------------------------------------------------

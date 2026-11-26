@@ -252,9 +252,9 @@ func TestMissedEnd_RecordIsBounded(t *testing.T) {
 	s.recordMissedEnd("u4", "g4", 0) // prunes u3
 	h.clk.add(missedEndTTL)
 	s.takeMissedEnds("nobody") // prunes u4
-	s.mu.Lock()
+	s.userMu.Lock()
 	n, q := len(s.missedEnds), len(s.missedOrder)
-	s.mu.Unlock()
+	s.userMu.Unlock()
 	if n != 0 || q != 0 {
 		t.Fatalf("after expiry: %d users, %d queued, want 0 and 0", n, q)
 	}
