@@ -684,6 +684,15 @@ portable, but heavier ops than serverless DynamoDB for a greenfield team.
 
 **Unblocks.** SPEC-S2-GAME-SERVER-GS4 (Q-GS4A resolved) and the GS-4 build.
 
+**Amendment 2026-11-27 (owner-approved, SPEC-S2-GAME-SERVER-GS8 D1).** The same
+DynamoDB account may also hold three small tables of **live-game index hints**:
+`user_live_games`, `live_games` and `user_recent_games` (GS-8 §4.3). They are
+written in the same `TransactWriteItems` as a game's opening and ending events,
+and they are hints only: the event stream stays the single source of truth, and
+every reader folds the stream before acting. This amendment is limited to those
+index hints. It does not widen ADR-16's scope to any other data, and it does not
+ratify AWS as the platform for anything else.
+
 ## ADR-17 (new) · §4A protocol v1.1 — additive `RESYNC` + `DRAW_OFFERED` messages · **DECIDED (owner-approved 2026-10-16)**
 
 > Amends the frozen SPEC-S2-PROTOCOL §4A wire contract (G-D) with two ADDITIVE

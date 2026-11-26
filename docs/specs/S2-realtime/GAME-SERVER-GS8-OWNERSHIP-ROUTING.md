@@ -5,6 +5,7 @@
 | Spec ID | SPEC-S2-GAME-SERVER-GS8 (closes Q-GS2; amends GS-3 §3.5/§6, GS-6 §3.2/§3.4/§5/§6.3, GS-7 §3.5) |
 | Owner | S2 Real-time |
 | Status | DRAFT |
+| Approvals | Stage 1 approved by the owner 2026-11-27 (D1 and Q1 as recommended). Stage 2 is not approved. |
 | Version | 0.3 (two stages; v0.1 and v0.2 each had one independent review) |
 | Last updated | 2026-11-27 |
 | Fixes (issues) | #98 (stage 1 restart half, stage 2 failover half), #173 (stage 2); #203 is their acceptance test |
@@ -28,8 +29,10 @@ now (§8).
 **Review status.** v0.1 had one context-free design review (verdict "needs
 another draft", five blockers, answered in §9). v0.2 had a second (verdict
 "needs a short v0.3", three blockers and eight should-fix points, answered in
-§12). Review is capped at two rounds; the owner decides D1 and Q1 before any
-stage 1 code.
+§12). Review is capped at two rounds. The owner approved D1 and Q1 as
+recommended on 2026-11-27: ADR-16 is amended for the index tables, and stage 1
+ships only while rated play is off until #207's credit lands. Stage 2 (§6) and
+its decisions D2 to D5 stay open.
 
 ## 1. Scope
 
