@@ -57,12 +57,19 @@ func (f *fakeDynamo) stageIndex(ti ddbtypes.TransactWriteItem, apply *[]func()) 
 		u := ti.Update
 		t := *u.TableName
 		pk, gid := attrKey(u.Key[partName(t)]), attrKey(u.Key["game_id"])
-		if _, ok := f.idxPart(t, pk)[gid]; !ok {
+		_, exists := f.idxPart(t, pk)[gid]
+		// Real DynamoDB Update UPSERTS a missing item unless a condition forbids
+		// it, so the fake only fails when the store sent the condition.
+		if !exists && u.ConditionExpression != nil && *u.ConditionExpression == "attribute_exists(game_id)" {
 			return false
 		}
 		n, i := u.ExpressionAttributeValues[":n"], u.ExpressionAttributeValues[":i"]
 		*apply = append(*apply, func() {
 			row := f.idxPart(t, pk)[gid]
+			if row == nil {
+				row = map[string]ddbtypes.AttributeValue{partName(t): u.Key[partName(t)], "game_id": u.Key["game_id"]}
+				f.idxPart(t, pk)[gid] = row
+			}
 			row["owner_node"], row["owner_incarnation"] = n, i
 		})
 	}
@@ -108,4 +115,28 @@ func (f *fakeDynamo) queryIndexLocked(in *dynamodb.QueryInput) (*dynamodb.QueryO
 		out = append(out, f.idxPart(t, pk)[id])
 	}
 	return &dynamodb.QueryOutput{Items: out, LastEvaluatedKey: last}, nil
+}
+
+// badIndexKey reports an index write whose key attribute has the wrong type,
+// which real DynamoDB rejects with a ValidationException (live_games.shard is N).
+func badIndexKey(ti ddbtypes.TransactWriteItem) bool {
+	var t string
+	var key map[string]ddbtypes.AttributeValue
+	switch {
+	case ti.Put != nil:
+		t, key = *ti.Put.TableName, ti.Put.Item
+	case ti.Delete != nil:
+		t, key = *ti.Delete.TableName, ti.Delete.Key
+	case ti.Update != nil:
+		t, key = *ti.Update.TableName, ti.Update.Key
+	default:
+		return false
+	}
+	switch v := key[partName(t)].(type) {
+	case *ddbtypes.AttributeValueMemberN:
+		return t != "live_games"
+	case *ddbtypes.AttributeValueMemberS:
+		return t == "live_games" || v.Value == ""
+	}
+	return true
 }

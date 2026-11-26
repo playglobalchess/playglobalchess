@@ -46,6 +46,9 @@ func (m *MemStore) AppendIndexed(ctx context.Context, streamID string, expectedS
 	if len(evs) == 0 {
 		return fmt.Errorf("memstore: AppendIndexed needs at least one event")
 	}
+	if err := ValidateIndexedWrite(expectedSeq, len(evs), ops); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failAppend != nil {
@@ -104,7 +107,7 @@ func (m *MemStore) LiveGames(ctx context.Context, shard int) ([]LiveEntry, error
 func (m *MemStore) userRows(t IndexTable, userID string, limit int) []UserEntry {
 	var out []UserEntry
 	for _, r := range m.idx().part(t, userID) {
-		if !r.exp.IsZero() && !r.exp.After(time.Now()) {
+		if t == IdxUserRecent && !r.exp.After(time.Now()) {
 			continue
 		}
 		out = append(out, r.entry)

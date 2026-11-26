@@ -140,6 +140,85 @@ func runIndexContract(t *testing.T, mk storeMaker) {
 			t.Fatalf("events committed despite a failed update: %d", len(evs))
 		}
 	})
+	t.Run("invalid writes are refused and commit nothing", func(t *testing.T) {
+		exp := time.Now().Add(time.Hour)
+		put := func(tb game.IndexTable, key string) game.IndexOp {
+			return game.IndexOp{Table: tb, Kind: game.IndexPut, Key: key, GameID: "g1", ExpiresAt: exp}
+		}
+		cases := map[string][]game.IndexOp{
+			"two ops on one item (a user paired with themselves)": {put(game.IdxUserLive, "alice"), put(game.IdxUserLive, "alice")},
+			"put then delete of one item":                         {put(game.IdxLive, "3"), {Table: game.IdxLive, Kind: game.IndexDelete, Key: "3", GameID: "g1"}},
+			"non-numeric shard":                                   {put(game.IdxLive, "three")},
+			"update outside live_games":                           {{Table: game.IdxUserLive, Kind: game.IndexUpdate, Key: "alice", GameID: "g1"}},
+			"recent put without expiry":                           {{Table: game.IdxUserRecent, Kind: game.IndexPut, Key: "alice", GameID: "g1"}},
+			"empty key":                                           {put(game.IdxUserLive, "")},
+			"unknown table":                                       {put("nope", "alice")},
+			"unknown kind":                                        {{Table: game.IdxUserLive, Kind: 99, Key: "alice", GameID: "g1"}},
+		}
+		for name, ops := range cases {
+			s := mk(t)
+			err := s.AppendIndexed(ctx, "game/g1", 0, []game.Event{gameCreated()}, ops)
+			if !errors.Is(err, game.ErrBadIndexOp) {
+				t.Errorf("%s: want ErrBadIndexOp, got %v", name, err)
+			}
+			if evs, _ := s.Load(ctx, "game/g1"); len(evs) != 0 {
+				t.Errorf("%s: events committed", name)
+			}
+		}
+	})
+	t.Run("the transaction item cap is exact", func(t *testing.T) {
+		ops := func(n int) []game.IndexOp {
+			out := make([]game.IndexOp, n)
+			for i := range out {
+				out[i] = game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexPut, Key: "alice", GameID: fmt.Sprintf("g%03d", i)}
+			}
+			return out
+		}
+		s := mk(t)
+		if err := s.AppendIndexed(ctx, "game/a", 0, []game.Event{gameCreated()}, ops(99)); err != nil {
+			t.Fatalf("1 event + 99 ops at seq 0 is 100 items: %v", err)
+		}
+		if err := s.AppendIndexed(ctx, "game/b", 0, []game.Event{gameCreated()}, ops(100)); !errors.Is(err, game.ErrBadIndexOp) {
+			t.Fatalf("101 items: want ErrBadIndexOp, got %v", err)
+		}
+		// Above seq 0 the head guard takes one item.
+		if err := s.AppendIndexed(ctx, "game/a", 1, []game.Event{moveEv(1, 0, "e2e4")}, ops(98)); err != nil {
+			t.Fatalf("guard + 1 event + 98 ops is 100 items: %v", err)
+		}
+		if err := s.AppendIndexed(ctx, "game/a", 2, []game.Event{moveEv(2, 1, "e7e5")}, ops(99)); !errors.Is(err, game.ErrBadIndexOp) {
+			t.Fatalf("guard + 1 + 99 is 101 items: want ErrBadIndexOp, got %v", err)
+		}
+	})
+	t.Run("delete of a missing entry is fine and a put replaces", func(t *testing.T) {
+		s := mk(t)
+		del := game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexDelete, Key: "alice", GameID: "nope"}
+		if err := s.AppendIndexed(ctx, "game/g1", 0, []game.Event{gameCreated()}, []game.IndexOp{del}); err != nil {
+			t.Fatal(err)
+		}
+		a := game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexPut, Key: "alice", GameID: "g1", Seat: 0}
+		b := a
+		b.Seat = 1
+		_ = s.AppendIndexed(ctx, "game/g1", 1, []game.Event{moveEv(1, 0, "e2e4")}, []game.IndexOp{a})
+		_ = s.AppendIndexed(ctx, "game/g1", 2, []game.Event{moveEv(2, 1, "e7e5")}, []game.IndexOp{b})
+		if ug, _ := s.UserLiveGames(ctx, "alice", 8); len(ug) != 1 || ug[0].Seat != 1 {
+			t.Fatalf("put did not replace: %+v", ug)
+		}
+	})
+	t.Run("the limit applies after expired rows are dropped", func(t *testing.T) {
+		s := mk(t)
+		now := time.Now()
+		rec := func(gid string, exp time.Time) game.IndexOp {
+			return game.IndexOp{Table: game.IdxUserRecent, Kind: game.IndexPut, Key: "alice", GameID: gid, EndedAt: now, ExpiresAt: exp}
+		}
+		ops := []game.IndexOp{rec("g1", now.Add(time.Hour)), rec("g2", now.Add(-time.Hour)), rec("g3", now.Add(-time.Hour))}
+		if err := s.AppendIndexed(ctx, "game/g1", 0, []game.Event{gameCreated()}, ops); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := s.UserRecentGames(ctx, "alice", 1)
+		if len(got) != 1 || got[0].GameID != "g1" {
+			t.Fatalf("expired newer rows hid the valid older one: %+v", got)
+		}
+	})
 	t.Run("user lists are newest first and limited, all pages read", func(t *testing.T) {
 		s := mk(t)
 		for i := 1; i <= 5; i++ {

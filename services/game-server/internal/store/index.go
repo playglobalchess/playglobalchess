@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -15,15 +16,13 @@ import (
 )
 
 // The live-game index tables (SPEC-S2-GAME-SERVER-GS8 §4.3, ADR-16 amendment).
-// Hints only; the event stream stays the truth. Created via IaC like game_events.
+// Hints only; the event stream stays the truth. Tables are created out of band
+// (there is no IaC in this repo yet); store.New refuses to start without them.
 //
 //	user_live_games   user_id S (partition) / game_id S (sort)   seat N
 //	live_games        shard N   (partition) / game_id S (sort)   owner_node S, owner_incarnation S
 //	user_recent_games user_id S (partition) / game_id S (sort)   seat N, ended_at S, expires_at N (TTL)
 var indexTables = []game.IndexTable{game.IdxUserLive, game.IdxLive, game.IdxUserRecent}
-
-// maxTransactItems is the DynamoDB TransactWriteItems cap.
-const maxTransactItems = 100
 
 var _ game.IndexedStore = (*Store)(nil)
 
@@ -70,7 +69,8 @@ func indexWrite(op game.IndexOp) (ddbtypes.TransactWriteItem, error) {
 		case game.IdxUserRecent:
 			it["seat"] = num(int64(op.Seat))
 			it["ended_at"] = str(op.EndedAt.UTC().Format(time.RFC3339Nano))
-			it["expires_at"] = num(op.ExpiresAt.Unix())
+			// Round up: a sub-second expiry must not expire early.
+			it["expires_at"] = num((op.ExpiresAt.UnixMilli() + 999) / 1000)
 		default:
 			return ddbtypes.TransactWriteItem{}, fmt.Errorf("store: unknown index table %q", op.Table)
 		}
@@ -99,12 +99,12 @@ func indexWrite(op game.IndexOp) (ddbtypes.TransactWriteItem, error) {
 // behind the head (contiguity, SPEC-S2-PROTOCOL §4A.8): a caller that is ahead
 // of the stream gets ErrSeqConflict, like one that is behind it.
 func (s *Store) appendTx(ctx context.Context, streamID string, expectedSeq uint32, evs []game.Event, ops []game.IndexOp) error {
+	if err := game.ValidateIndexedWrite(expectedSeq, len(evs), ops); err != nil {
+		return err
+	}
 	guard := 0
 	if expectedSeq > 0 {
 		guard = 1
-	}
-	if guard+len(evs)+len(ops) > maxTransactItems {
-		return fmt.Errorf("store: write of %d items exceeds the %d-item transaction limit", guard+len(evs)+len(ops), maxTransactItems)
 	}
 	writes := make([]ddbtypes.TransactWriteItem, 0, guard+len(evs)+len(ops))
 	if guard == 1 {
@@ -191,22 +191,25 @@ func (s *Store) queryIndex(ctx context.Context, t game.IndexTable, key string, n
 	}
 }
 
-func strAttr(it map[string]ddbtypes.AttributeValue, name string) string {
-	if v, ok := it[name].(*ddbtypes.AttributeValueMemberS); ok {
-		return v.Value
+func strAttr(it map[string]ddbtypes.AttributeValue, name string) (string, bool) {
+	v, ok := it[name].(*ddbtypes.AttributeValueMemberS)
+	if !ok || v.Value == "" {
+		return "", false
 	}
-	return ""
+	return v.Value, true
 }
 
-func numAttr(it map[string]ddbtypes.AttributeValue, name string) int64 {
-	if v, ok := it[name].(*ddbtypes.AttributeValueMemberN); ok {
-		n, _ := strconv.ParseInt(v.Value, 10, 64)
-		return n
+func numAttr(it map[string]ddbtypes.AttributeValue, name string) (int64, bool) {
+	v, ok := it[name].(*ddbtypes.AttributeValueMemberN)
+	if !ok {
+		return 0, false
 	}
-	return 0
+	n, err := strconv.ParseInt(v.Value, 10, 64)
+	return n, err == nil
 }
 
-// LiveGames returns every live_games entry of one shard.
+// LiveGames returns every live_games entry of one shard. A malformed row is a
+// hint nobody can trust, so it is skipped and logged rather than guessed at.
 func (s *Store) LiveGames(ctx context.Context, shard int) ([]game.LiveEntry, error) {
 	items, err := s.queryIndex(ctx, game.IdxLive, game.ShardKey(shard), false)
 	if err != nil {
@@ -214,11 +217,14 @@ func (s *Store) LiveGames(ctx context.Context, shard int) ([]game.LiveEntry, err
 	}
 	out := make([]game.LiveEntry, 0, len(items))
 	for _, it := range items {
-		out = append(out, game.LiveEntry{
-			GameID:           strAttr(it, "game_id"),
-			OwnerNode:        strAttr(it, "owner_node"),
-			OwnerIncarnation: strAttr(it, "owner_incarnation"),
-		})
+		gid, ok1 := strAttr(it, "game_id")
+		node, ok2 := strAttr(it, "owner_node")
+		inc, ok3 := strAttr(it, "owner_incarnation")
+		if !ok1 || !ok2 || !ok3 {
+			log.Printf("store: skipping malformed live_games row in shard %d: %v", shard, it)
+			continue
+		}
+		out = append(out, game.LiveEntry{GameID: gid, OwnerNode: node, OwnerIncarnation: inc})
 	}
 	return out, nil
 }
@@ -231,13 +237,26 @@ func (s *Store) userEntries(ctx context.Context, t game.IndexTable, userID strin
 	now := s.now()
 	var out []game.UserEntry
 	for _, it := range items {
-		// DynamoDB TTL deletion lags by up to 48 hours, so readers filter.
-		if exp := numAttr(it, "expires_at"); exp != 0 && exp <= now.Unix() {
+		gid, ok1 := strAttr(it, "game_id")
+		seat, ok2 := numAttr(it, "seat")
+		if !ok1 || !ok2 || seat < 0 || seat > 255 {
+			log.Printf("store: skipping malformed %s row for user %s: %v", t, userID, it)
 			continue
 		}
-		e := game.UserEntry{GameID: strAttr(it, "game_id"), Seat: uint8(numAttr(it, "seat"))}
-		if at := strAttr(it, "ended_at"); at != "" {
-			e.EndedAt, _ = time.Parse(time.RFC3339Nano, at)
+		e := game.UserEntry{GameID: gid, Seat: uint8(seat)}
+		if t == game.IdxUserRecent {
+			exp, ok3 := numAttr(it, "expires_at")
+			at, ok4 := strAttr(it, "ended_at")
+			ended, perr := time.Parse(time.RFC3339Nano, at)
+			if !ok3 || !ok4 || perr != nil {
+				log.Printf("store: skipping malformed %s row for user %s: %v", t, userID, it)
+				continue
+			}
+			// DynamoDB TTL deletion lags by up to 48 hours, so readers filter.
+			if exp <= now.Unix() {
+				continue
+			}
+			e.EndedAt = ended
 		}
 		out = append(out, e)
 		if limit > 0 && len(out) == limit {

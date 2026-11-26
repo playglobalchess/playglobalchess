@@ -111,6 +111,9 @@ func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.Transa
 			}
 			staged[k] = p.Item
 		default:
+			if badIndexKey(ti) {
+				return nil, errors.New("ValidationException: bad key attribute type")
+			}
 			if !f.stageIndex(ti, &applyIdx) {
 				fail(i)
 			}

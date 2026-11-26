@@ -3,6 +3,7 @@ package game
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"strconv"
 	"time"
@@ -108,3 +109,68 @@ func IndexShard(gameID string, shards int) int {
 
 // ShardKey is the live_games partition key for a shard number.
 func ShardKey(shard int) string { return strconv.Itoa(shard) }
+
+// MaxTransactItems is DynamoDB's TransactWriteItems cap. A write is its events,
+// its index operations, and one head-guard check when the write is not at seq 0.
+const MaxTransactItems = 100
+
+// ErrBadIndexOp is returned for an index operation both stores must refuse the
+// way DynamoDB would, so MemStore cannot accept a write production rejects.
+var ErrBadIndexOp = errors.New("event store: invalid index operation")
+
+// WriteItems counts the transaction items of a write.
+func WriteItems(expectedSeq uint32, nEvents, nOps int) int {
+	n := nEvents + nOps
+	if expectedSeq > 0 {
+		n++
+	}
+	return n
+}
+
+// ValidateIndexedWrite checks everything DynamoDB would reject before it
+// commits anything: the item cap, unknown tables or kinds, empty keys, a
+// non-numeric shard, an Update outside live_games, a user_recent_games Put with
+// no expiry, and two operations on one item (real TransactWriteItems refuses
+// that, which a self-paired user would trigger).
+func ValidateIndexedWrite(expectedSeq uint32, nEvents int, ops []IndexOp) error {
+	if n := WriteItems(expectedSeq, nEvents, len(ops)); n > MaxTransactItems {
+		return fmt.Errorf("%w: %d items exceeds the %d-item transaction limit", ErrBadIndexOp, n, MaxTransactItems)
+	}
+	type item struct {
+		t        IndexTable
+		key, gid string
+	}
+	seen := map[item]bool{}
+	for _, op := range ops {
+		switch op.Table {
+		case IdxUserLive, IdxLive, IdxUserRecent:
+		default:
+			return fmt.Errorf("%w: unknown table %q", ErrBadIndexOp, op.Table)
+		}
+		switch op.Kind {
+		case IndexPut, IndexDelete, IndexUpdate:
+		default:
+			return fmt.Errorf("%w: unknown kind %d", ErrBadIndexOp, op.Kind)
+		}
+		if op.Key == "" || op.GameID == "" {
+			return fmt.Errorf("%w: empty key or game id on %s", ErrBadIndexOp, op.Table)
+		}
+		if op.Table == IdxLive {
+			if _, err := strconv.Atoi(op.Key); err != nil {
+				return fmt.Errorf("%w: live_games shard %q is not a number", ErrBadIndexOp, op.Key)
+			}
+		}
+		if op.Kind == IndexUpdate && op.Table != IdxLive {
+			return fmt.Errorf("%w: Update only applies to %s", ErrBadIndexOp, IdxLive)
+		}
+		if op.Kind == IndexPut && op.Table == IdxUserRecent && op.ExpiresAt.IsZero() {
+			return fmt.Errorf("%w: user_recent_games Put needs ExpiresAt", ErrBadIndexOp)
+		}
+		it := item{op.Table, op.Key, op.GameID}
+		if seen[it] {
+			return fmt.Errorf("%w: two operations on %s/%s/%s in one write", ErrBadIndexOp, op.Table, op.Key, op.GameID)
+		}
+		seen[it] = true
+	}
+	return nil
+}

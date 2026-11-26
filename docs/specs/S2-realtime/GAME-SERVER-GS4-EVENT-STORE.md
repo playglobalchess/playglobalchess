@@ -223,6 +223,12 @@ operations commit in **one** `TransactWriteItems` (SPEC-S2-GAME-SERVER-GS8
   `ErrIndexMissing`. Neither commits anything, events included.
 - **Reads** are strongly consistent. `user_recent_games` readers filter
   `expires_at` themselves, because DynamoDB TTL deletion lags by up to 48 hours.
+- **Validation (both stores).** A write is refused with `ErrBadIndexOp`, and
+  commits nothing, when it has more than 100 items (events, operations and the
+  guard), two operations on one item (DynamoDB refuses that), an unknown table
+  or kind, an empty key, a non-numeric `live_games` shard, an `IndexUpdate`
+  outside `live_games`, or a `user_recent_games` Put with no expiry.
+- Readers skip and log a malformed index row instead of guessing its fields.
 - `store.New` checks that all four tables exist, so a missing table fails at
   start and not on the first game's opening write.
 
