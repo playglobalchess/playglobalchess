@@ -91,7 +91,16 @@ func (c *snapCmd) finish()                             { close(c.done) }
 // argument is ignored: the session's own clock times every move (never trust
 // a client clock, T-1/T-2); it is kept for the transport's call shape.
 func (s *Session) SubmitMove(ctx context.Context, seat uint8, plyExpected uint32, uci string, _ uint64) (game.MoveOutcome, error) {
-	d, _, err := s.run(ctx, game.CmdMove{Seat: seat, PlyExpected: plyExpected, UCI: uci})
+	return s.SubmitMoveReceived(ctx, seat, plyExpected, uci, 0)
+}
+
+// SubmitMoveReceived is SubmitMove for a frame the transport stamped when the
+// socket read returned (epoch ms, from the server's own clock). The mover is
+// charged up to that instant and MovePlayed.ServerTS records it, so time the
+// command spent queued behind a tick or a store call is not think time (#183).
+// Zero means unknown: the decide time is used.
+func (s *Session) SubmitMoveReceived(ctx context.Context, seat uint8, plyExpected uint32, uci string, receivedMs uint64) (game.MoveOutcome, error) {
+	d, _, err := s.run(ctx, game.CmdMove{Seat: seat, PlyExpected: plyExpected, UCI: uci, ReceivedMs: receivedMs})
 	return d.Move, err
 }
 

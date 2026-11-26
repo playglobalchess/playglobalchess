@@ -221,6 +221,26 @@ could lose time before a first move.
 If `ClockStartedSet == false` (only possible before the first build has appended
 it), no idle time is charged and no first-move timeout runs.
 
+**Move receipt time (#183).** The mover is charged up to the instant its MOVE
+frame finished reading from the socket (`CmdMove.ReceivedMs`, stamped by the
+transport on the server's own clock, never taken from the client), not the
+instant the actor dequeued it. `MovePlayed.ServerTS`, the opponent's clock
+baseline, records the decide time, when the move was processed. Time a MOVE
+waits behind a flag tick, a snapshot or a store re-read is therefore charged to
+neither seat: the mover did not cause it, and the opponent could not yet see
+the move. (Recording the receipt as `ServerTS` would move the wait onto the
+opponent, unbounded, and could flag them on a move they never saw.) The charge
+instant is clamped into `[LastChangeTS, now]`: a stamp before the last change
+(the frame was sent against an older state) charges nothing, and a stamp after
+`now` is ignored. `ServerTS` stays monotonic because it is always the decide
+time. A move received before the clock expired is never flagged because it was
+dequeued after; a move received after expiry flags. `ReceivedMs == 0` (callers
+without a receipt) charges to the decide time. Other commands (ticks, takeback
+accept) use the decide time. A tick that is dequeued before a move received just
+before expiry can still flag first (serialization order wins); lag compensation
+is #82. The opponent still pays the store write latency between decide and the
+ack they receive, as before this change.
+
 Clock baselines are cross-node wall-clock instants (already true for
 `ServerTS`). Operational requirement: game-server nodes keep clock skew under
 100 ms (NTP); elapsed time after failover includes that skew.

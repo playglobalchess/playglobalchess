@@ -1160,3 +1160,96 @@ func TestFirstMoveRule(t *testing.T) {
 		assertAborted(t, m.do(CmdTickFlag{}, 101))
 	})
 }
+
+// (h) A move is charged to the instant its frame arrived, not to the instant
+// the actor got to it (#183).
+func TestMoveChargedToReceiptTime(t *testing.T) {
+	// sim with two clockless plies played; returns the baseline instant.
+	open := func(t *testing.T) (*sim, uint64) {
+		m := newSim(t, false)
+		m.move(1_000)
+		m.move(1_000)
+		return m, m.now
+	}
+	mv := func(m *sim, recvMs, advMs uint64) Decision {
+		m.n++
+		uci := fmt.Sprintf("m%d", m.n)
+		m.o.allow(uci, "fen-"+uci, nil)
+		return m.do(CmdMove{Seat: m.s.TurnIdx, PlyExpected: m.s.Ply + 1, UCI: uci, ReceivedMs: recvMs}, advMs)
+	}
+
+	t.Run("queue time is not think time", func(t *testing.T) {
+		m, base := open(t)
+		d := mv(m, base+2_000, 20_000) // arrived 2 s in, decided 20 s in
+		if got := d.Move.ClockAfterMs; got != 301_000 {
+			t.Fatalf("clock_after = %d, want 301000 (2 s think + 3 s increment)", got)
+		}
+		// The opponent's clock starts when the move was processed, not at the
+		// receipt: the 18 s queue is charged to neither seat (#183 review).
+		if ts := m.s.History[2].ServerTS; ts != base+20_000 || m.s.LastChangeTS != base+20_000 {
+			t.Fatalf("server_ts %d last change %d, want the decide time %d", ts, m.s.LastChangeTS, base+20_000)
+		}
+		if got := m.s.ElapsedMs(base + 21_000); got != 1_000 {
+			t.Fatalf("opponent charged %d ms 1 s after the move was processed, want 1000", got)
+		}
+	})
+
+	t.Run("the first move's stamp is never before the clock start", func(t *testing.T) {
+		m := newSim(t, false)
+		start := m.now
+		d := mv(m, start-5_000, 1_000) // a stamp before ClockStarted
+		if !d.Move.Accepted {
+			t.Fatalf("first move rejected: %+v", d.Move)
+		}
+		if ts := m.s.History[0].ServerTS; ts < start {
+			t.Fatalf("first move server_ts %d before the clock start %d", ts, start)
+		}
+	})
+
+	t.Run("without a receipt the decide time is charged, as before", func(t *testing.T) {
+		m, _ := open(t)
+		if got := mv(m, 0, 20_000).Move.ClockAfterMs; got != 283_000 {
+			t.Fatalf("clock_after = %d, want 283000", got)
+		}
+	})
+
+	t.Run("a receipt in the future is ignored", func(t *testing.T) {
+		m, base := open(t)
+		if got := mv(m, base+90_000, 20_000).Move.ClockAfterMs; got != 283_000 {
+			t.Fatalf("clock_after = %d, want 283000 (decide time)", got)
+		}
+	})
+
+	t.Run("a receipt before the last change is clamped to it", func(t *testing.T) {
+		m, base := open(t)
+		mv(m, base+2_000, 5_000)
+		last := m.s.LastChangeTS
+		d := mv(m, base-5_000, 5_000) // black's frame stamped before white's move
+		if got := d.Move.ClockAfterMs; got != 303_000 {
+			t.Fatalf("clock_after = %d, want 303000 (nothing charged, increment granted)", got)
+		}
+		if ts := m.s.History[3].ServerTS; ts != last+5_000 {
+			t.Fatalf("server_ts %d, want the decide time %d", ts, last+5_000)
+		}
+	})
+
+	t.Run("a move received in time is not flagged by a late dequeue", func(t *testing.T) {
+		m, base := open(t)
+		d := mv(m, base+10_000, 400_000) // received at 10 s, dequeued after the 300 s clock ran out
+		if !d.Move.Accepted || d.Move.Flagged {
+			t.Fatalf("a move that arrived in time was flagged: %+v", d.Move)
+		}
+	})
+
+	t.Run("a move received after the clock ran out still flags", func(t *testing.T) {
+		m, base := open(t)
+		m.n++
+		uci := fmt.Sprintf("m%d", m.n)
+		m.o.allow(uci, "fen-"+uci, nil)
+		m.o.material[m.s.CurFEN+"#0"] = true
+		d := m.do(CmdMove{Seat: m.s.TurnIdx, PlyExpected: m.s.Ply + 1, UCI: uci, ReceivedMs: base + 350_000}, 400_000)
+		if !d.Move.Flagged {
+			t.Fatalf("a move received after expiry must flag: %+v", d.Move)
+		}
+	})
+}

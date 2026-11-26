@@ -101,6 +101,10 @@ type (
 		Seat        uint8
 		PlyExpected uint32
 		UCI         string
+		// ReceivedMs is when the transport finished reading the frame (epoch
+		// ms; 0 = unknown, use the decide time). The mover is charged up to
+		// it, never for time the frame spent queued (#183).
+		ReceivedMs uint64
 	}
 	CmdTickFlag   struct{}
 	CmdStartClock struct{}
@@ -254,6 +258,12 @@ func decideMove(ctx context.Context, s State, c CmdMove, nowMs uint64, opts Fold
 	if c.Seat != s.TurnIdx {
 		return rejectMove(RejectNotYourTurn, s.Ply), nil
 	}
+	// The mover is charged up to the moment the frame arrived, not the moment
+	// the actor got to it (#183): never later than now, never before the last
+	// change. The opponent's clock starts at nowMs, when the move is processed
+	// (MovePlayed.ServerTS), so time the frame spent queued in the server is
+	// charged to neither seat.
+	chargeMs := moveTimeMs(s, c, nowMs)
 	// The flag check: a move that arrives after the mover's time ran out ends
 	// the game by flag (no refund, no MovePlayed).
 	// Each side's first move is clockless (#124): nothing is charged and no
@@ -261,7 +271,7 @@ func decideMove(ctx context.Context, s State, c CmdMove, nowMs uint64, opts Fold
 	cl := s.Clock
 	if s.Ply >= firstMovePlies {
 		var clkErr error
-		cl, clkErr = s.Clock.Apply(opts.TimeControl, int(c.Seat), s.ElapsedMs(nowMs))
+		cl, clkErr = s.Clock.Apply(opts.TimeControl, int(c.Seat), s.ElapsedMs(chargeMs))
 		if clkErr != nil {
 			if errors.Is(clkErr, clock.ErrFlagged) {
 				d, err := flagDecision(ctx, s, c.Seat, oracle)
@@ -299,6 +309,20 @@ func decideMove(ctx context.Context, s State, c CmdMove, nowMs uint64, opts Fold
 		NewFEN: lv.NewFEN, NewZobrist: lv.NewZobrist, Terminal: lv.Terminal, EndedGame: lv.Terminal != nil,
 	}
 	return d, nil
+}
+
+// moveTimeMs is the instant the mover is charged up to: its receipt time, clamped into [LastChangeTS, now] so a frame stamped before the last
+// state change (it was sent against an older state) or after now (a bad
+// stamp) can neither run the baseline backwards nor charge the future.
+func moveTimeMs(s State, c CmdMove, nowMs uint64) uint64 {
+	at := c.ReceivedMs
+	if at == 0 || at > nowMs {
+		return nowMs
+	}
+	if s.ClockStartedSet && at < s.LastChangeTS {
+		at = s.LastChangeTS
+	}
+	return at
 }
 
 // decideTick is the idle flag check (§3.5): charge the side to move up to now
