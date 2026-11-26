@@ -1,328 +1,386 @@
-# Game-server GS-8 — game ownership, routing and rebuild across nodes (design spec)
+# Game-server GS-8 — game recovery and ownership across nodes (design spec)
 
 | Field | Value |
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS8 (closes Q-GS2; amends GS-3 §3.5/§6, GS-6 §3.2/§3.4/§5/§6.3, GS-7 §3.5) |
 | Owner | S2 Real-time |
 | Status | DRAFT |
-| Version | 0.1 |
+| Version | 0.2 (two stages; v0.1 was rejected by its first independent review) |
 | Last updated | 2026-11-27 |
-| Fixes (issues) | #173, #98 (together); #203 is their acceptance test |
+| Fixes (issues) | #98 (stage 1 restart half, stage 2 failover half), #173 (stage 2); #203 is their acceptance test |
 | Depends on | GS-3 (session), GS-4 (event store, seq-conditional append), GS-5 (Redis pool), GS-6 (transport), GS-7 (fold) |
 | Gates it feeds | G-E (scale proven). XII.2 launch bar: chaos test with zero in-progress-game loss. |
 
 > **Why this exists.** Today a live game exists only in the process that paired
-> it. A second healthy node already breaks play (#173), and a restart or node
-> loss orphans every in-flight game (#98): clients get nothing, no clock is
-> enforced, and the stream is frozen. MASTER-PLAN Part XIII already decides the
-> outcome ("a game is sharded to one node ... node death, the game rehydrates on
-> another node from the stream; clients resync via STATE"). It does not decide
-> the mechanism. This spec does, and closes Q-GS2.
+> it. A restart orphans every in-flight game (#98): clients get nothing, no
+> clock is enforced, and the stream is frozen. A second healthy node already
+> breaks play (#173). MASTER-PLAN Part XIII decides the outcome ("a game is
+> sharded to one node ... node death, the game rehydrates on another node from
+> the stream; clients resync via STATE"). It does not decide the mechanism. This
+> spec does, and closes Q-GS2.
 
-**Review status.** v0.1 is a proposal. Section 9 lists the decisions the owner
-must make before any code. Nothing here is built yet.
+**Two stages.** Stage 1 makes a game survive a restart of the one serving node.
+It adds no new event, no claim and no peer traffic. Stage 2 adds more than one
+serving node: ownership, fencing, routing and takeover. Stage 1 is designed so
+stage 2 adds to it and rewrites none of it. Only stage 1 needs owner decisions
+now (§8).
+
+**Review status.** v0.1 had one context-free design review: verdict "needs
+another draft", five blockers. §9 maps each finding to the section that answers
+it. v0.2 needs a second independent review before any code.
 
 ## 1. Scope
 
-**In scope**
-- Who owns a live game, and how a second node learns it is not the owner.
-- How a user's connection on one node reaches a game owned by another.
-- Rebuilding a game on another node (after restart, drain or node loss),
-  including its flag timer, join timer and half-terminal repair.
-- Finding a user's live and just-ended games after a restart (AUTHENTICATE).
-- Finding games whose owner died while no client is connected (clocks must
-  still run out).
-- Cross-node MATCHED delivery and durable missed endings.
+**Stage 1 (restart recovery, #98 restart half)**
+- One constructor for every session, with the flag timer always armed.
+- A durable index of live games, written in the same transaction as the
+  game's first and last events.
+- Adopting every live game at process start, and finding a user's live games on
+  AUTHENTICATE.
+
+**Stage 2 (more than one node, #173 and #98 failover half)**
+- Who owns a game, how a stale owner is stopped, who takes over.
+- Routing a connection on one node to a game owned by another.
+- Draining a node for a deploy.
 
 **Out of scope**
-- The load balancer, TLS and the choice of cloud products for Redis and the
-  inter-node transport (ADR-16 scoped DynamoDB to the game-event store only; this
-  spec does not widen it, see D2).
-- Clock credit or abort after a store outage (#207).
-- Matchmaking pool sharding (GS-5 keeps its own Redis claim protocol).
-- Spectators and broadcast fan-out (X-10).
+- The load balancer, TLS and the cloud product behind Redis and the peer link.
+- Clock credit or abort after a store outage (#207). Stage 1 and stage 2 both
+  depend on its decision for how downtime is charged (Q1).
+- Matchmaking pool sharding (GS-5), spectators (X-10).
 
 ## 2. Requirements traced
 
 | Req | How this spec meets it |
 |---|---|
-| NFR-2 zero in-progress-game loss on single-node failure | The stream is the truth. A surviving node rebuilds from it and claims the game (§4.3). Acknowledged events are never lost because they were persisted before the ack (NFR-7). |
-| NFR-3 linear horizontal scale | Per-move cost is O(1) lookups (§4.2). No central routing service on the hot path. Membership traffic is per node, not per game. |
-| NFR-1 move latency | Edge and owner on the same node keep today's path. A remote owner adds one in-region hop, budgeted at p99 under 5 ms (§5.3). |
-| Part XIII, ADR-10 | Redis holds only ephemeral hints (membership, presence, routing cache). It is never the source of truth and is never the fence. |
-| XII.2 chaos gate | §8 maps each failure to a test in the #203 harness. |
+| NFR-2 zero in-progress-game loss | The stream is the truth, and every event is persisted before it is acknowledged (NFR-7). A rebuilt session folds the stream (stage 1: same node after restart; stage 2: any node). |
+| NFR-3 linear horizontal scale | Per-move cost stays O(1) lookups (#174). Stage 2 adds no central router on the move path. |
+| NFR-1 move latency | Stage 1 changes nothing on the move path. Stage 2 adds one in-region hop for a remote seat, budgeted in §6.5 and measured in G-E, not assumed. |
+| Part XIII, ADR-10 | Redis holds only ephemeral hints. It is never the source of truth and never the fence. |
+| ADR-19 (a) | A client never retransmits MOVE. Recovery never depends on a resend (§4.5). |
+| XII.2 chaos gate | §4.6 and §6.7 map each failure to a #203 test. |
 
-## 3. Model
+## 3. How Lichess handles it, and what we do differently
 
-- **Owner** of a game: the one node running that game's `Session` actor, flag
-  timer and join timer. Exactly one owner is live at a time.
-- **Edge** of a user: the node holding that user's WebSocket. Any node can be an
-  edge. When the edge is also the owner, today's in-process path is unchanged.
-- **Safety and liveness are separate.** Safety (no divergent history, no lost
-  acknowledged event, no stale owner writing after takeover) comes only from the
-  store: the seq-conditional append (GS-4) and the claim event (§4.1). Liveness
-  (who should take over, when) comes from membership in Redis and timing. A wrong
-  liveness view can cost a retry or a brief double attempt. It cannot corrupt a
-  stream, because the store, not Redis, is the fence.
+Lichess runs one round process that holds every live game in memory. Its
+WebSocket servers only relay frames (lila-ws: `lila <-> redis <-> lila-ws <->
+client`). Moves reach MongoDB in batches, so a crash can lose recent moves; a
+planned stop saves every game and gives the player to move +20 s and the other
++10 s, and a WebSocket restart gives both players +20 s. Lichess does not refund
+rating after a server-caused disconnect. It has no ownership transfer or
+fencing, because it has one owner.
 
-## 4. Ownership
+We keep two things from that: relays attach to the game's owner (stage 2 §6.5)
+and a restart compensates the clock (Q1). We differ on durability: NFR-2 and
+NFR-7 require each move to be saved before it is confirmed, and a game must
+survive the loss of its node. That is why this spec has an index and, in stage
+2, fencing. Chess.com is closed source; its published restart policy aborts
+live games, and nothing public describes a crash.
 
-### 4.1 The claim event
+## 4. Stage 1 — restart recovery on one node
 
-A new additive event, `OwnerClaimed{node_id, epoch}`, is appended by a node that
-becomes owner. `epoch` is one more than the last claim in the stream. The fold
-records `OwnerNode` and `OwnerEpoch` and changes nothing else (no clock effect,
-no phase effect).
+### 4.1 Facts this relies on
 
-- The pairing node writes the first claim (epoch 1) inside the opening
-  `AppendBatch` (GS-5 §3.2), so a new game costs no extra write.
-- A node taking over appends `OwnerClaimed{self, epoch+1}` at the head it just
-  folded. If another claim landed first the append conflicts, the node reloads,
-  sees a newer claim, and defers to it.
-- Because every owner appends only at the head it folded, a claim commits a
-  fence: any append by an older owner at an earlier expected seq now conflicts.
+- One process serves at a time. A deploy stops the old process serving before
+  the new one starts adopting (drain, then start). The seq-conditional append
+  (GS-4) prevents a forked history if two overlap, but two processes would each
+  run timers and send frames, so overlap is an operational error to prevent.
+- Every writer takes `NextSeq` from a folded, contiguous state. The Dynamo
+  store checks only `attribute_not_exists(seq)` and MemStore rejects gaps, so a
+  test must run the same contiguity cases against both stores.
 
-**Invariant I9 (stale owner).** After a claim with epoch `e` commits at seq `k`,
-no event written by an owner with epoch below `e` commits at a seq above `k`.
-Events committed before `k` are legitimate and were acknowledged before takeover.
+### 4.2 One constructor
 
-A deposed owner learns it on its next conflicting append or tick reload (the
-reload shows a claim with a higher epoch). It then stops: its flag timer exits,
-its session is dropped, and commands from its local connections are forwarded to
-the new owner (§5). A command in flight at the moment of takeover is not
-acknowledged; the client resends it and it is idempotent by ply (GS-6 §3.3).
+`startGame(gameID, role)` is the only way a session comes into being. `role` is
+`pair`, `resync` or `adopt`. It reads the stream, takes the time control from
+`GameCreated`, folds, repairs a half-terminal stream (`CmdFinishHalfTerminal`)
+and **always** arms the deadline timer (#182), which is what a rebuilt game
+lacks today (#98, finding from #212).
 
-This needs one new event type in the codec (Rust) and the Go seam, and it relies
-on #187 (the fold rejects unknown event types, which breaks rolling deploys). See
-D1 and §10.
+The join timer is armed only for `pair`. Its "joined" signal is process-local,
+so re-arming it on a rebuild would abort a live game whose players are briefly
+disconnected. A rebuilt game below two plies is bounded by the first-move
+timeout (GS-7 §3.5), which is measured from the stored `ClockStarted`.
 
-### 4.2 Who owns, and who should take over
+### 4.3 The live-game index
 
-- **Current owner** is the node in the last claim. It is a fact in the stream,
-  not a hash of the membership, so a node joining or leaving never moves a live
-  game between healthy nodes.
-- **Membership.** Each node holds `node/{id}` in Redis with a 6 s TTL, refreshed
-  every 2 s, carrying its peer address. One key per node, not per game.
-- **Takeover** happens only when the current owner is not in membership (it died,
-  or it drained and released). The successor is the live node with the highest
-  rendezvous hash of `(game_id, node_id)`, so in a stable view exactly one node
-  tries. In an unstable view several may try; the claim append picks one.
-- **Self-fencing.** A node that cannot refresh its membership key for 4 s stops
-  serving: it closes its game sessions and its client connections. The 2 s gap
-  between its stop and key expiry is the safety margin for timing; the claim
-  fence (§4.1) is the guarantee if timing is wrong.
-- **Drain (deploy).** A draining node asks the successor, per game, to claim
-  (an explicit hand-off) and then stops serving that game. Clients resync (STATE)
-  on the new node. This keeps deploys from looking like node loss.
+Two new DynamoDB tables, separate from `game_events` (whose sort key is the
+number `seq`). Both hold **live games only**.
 
-### 4.3 Rebuild entry point
+- `user_live_games`: partition `user_id`, sort `started_at#game_id`
+  (time-ordered, because game ids are random v4). Attributes: `game_id`, `seat`.
+- `live_games`: partition `shard` (hash of `game_id` mod a configured count,
+  starting at 16), sort `started_at#game_id`. Attributes: `game_id`.
 
-One function, `startGame(gameID, role)`, is the only way a session comes into
-being. It reads the stream, takes the time control from `GameCreated`, folds,
-repairs a half-terminal stream (`CmdFinishHalfTerminal`), appends the claim when
-taking over, and then **always** arms the flag timer and the join timer. Today
-only `deliverMatched` arms them, which is why a rebuilt game has no clock driver
-(#98, #173, finding from #212). Pairing, resync, a forwarded command and orphan
-adoption all call `startGame`.
+Writes happen in the same `TransactWriteItems` as the stream write, so the index
+cannot disagree with the stream on the normal path:
 
-## 5. Routing between nodes (#173)
+- Opening batch (about 3 event items) plus 2 `user_live_games` and 1
+  `live_games` item: about 6 items, within the transaction limits.
+- The `GameEnded` batch plus the 3 deletes.
 
-### 5.1 Attach, not presence
+`EventStore.AppendBatch` therefore gains an index-operations parameter, which
+MemStore, the matchmaker and the session must pass through. Transactional writes
+cost twice the write units; the real cost at launch load is measured in G-E.
 
-The owner never looks a user up. An edge that holds a seated connection sends the
-owner `Attach{game, seat, user, conn}` over the node-to-node stream, and
-`Detach` when the connection ends. The owner keeps the attached edges for its
-game in memory and pushes every server frame (MOVE_ACCEPTED to both seats,
-GAME_END, STATE, DRAW_OFFERED and the rest) to the edge of each seat. When the
-owner changes, each edge re-attaches to the new owner, because the edge is the
-one that holds the connection and knows which games it is seated in. If an
-edge's stream to the owner breaks, the owner treats those seats as disconnected,
-which is what the clock-aware forfeit path already does (GS-6 §3.4).
+Anything that still disagrees (a bug, a manual repair) is corrected by the
+reader: every consumer folds the stream before acting, and adoption deletes the
+index entry of any game whose stream is ended.
 
-This means no per-user presence key in Redis and no per-connection Redis
-traffic at 1M connections.
+Ended games get no index entry. A client reconnecting after its game ended
+sends RESYNC for the game id it holds, and `resyncEnded` serves the result from
+the stream on any node. This replaces the in-memory `missedEnds` (#169, #172),
+which survives neither a restart nor a second node. A client that no longer
+holds the game id finds no live game, as on Lichess.
 
-### 5.2 Finding the owner
+**Scope.** This writes outside the event stream, so it touches ADR-16
+("DynamoDB, game-event store only"). See D1.
 
-An edge resolves `game -> owner` from its in-memory cache, then from the Redis
-hint `game/{id}/owner` (written by the owner at claim, TTL 1 h), then from the
-stream's last claim. The hint is only a cache: a node that receives a command
-for a game it does not own replies `NOT_OWNER{hint}` and the edge re-resolves. An
-owner that is not in membership triggers takeover (§4.2) by the successor.
+### 4.4 Adoption at start and on AUTHENTICATE
 
-### 5.3 The move path and latency
+- **At start.** The node queries every `live_games` shard and calls
+  `startGame(adopt)` for each game, oldest first, with bounded concurrency
+  (configured, starting at 32) so folding tens of thousands of games does not
+  starve connection handling. The node accepts connections immediately.
+- **On AUTHENTICATE.** The edge queries `user_live_games` for the user (newest
+  first, limit 8) and calls `startGame(resync)` for each game not yet adopted.
+  The registry shares one build per game (#174), so this is safe alongside the
+  start-up adoption. A reconnect storm costs one Query per user.
+- A game found ended is not started; its index entries are deleted.
 
-`MOVE` on an edge: stamp `recv` when the socket read returns (#183), look up the
-seat locally (O(1), #174), then either call the local session or send the frame
-to the owner with `age_ms = now - recv`. The owner computes
-`recv_owner = now_owner - age_ms`, so no node's wall clock is compared with
-another's. The owner persists, then pushes MOVE_ACCEPTED to both seats' edges.
+### 4.5 Clients and the frozen rules
 
-A remote owner adds one in-region round trip on the move path (edge to owner for
-the command, owner to edge for the ack). The budget is p99 under 5 ms for the
-hop, so NFR-1's p99 150 ms still holds with the store append dominating. This is
-measured in the G-E load test (#138), not assumed.
+ADR-19 (a): a client never retransmits MOVE. A MOVE in flight when the node dies
+gets no reply, and the closed connection is the signal. On reconnect the
+client receives STATE from AUTHENTICATE or RESYNC and reconciles from it
+(WEB-F01). If the move landed, STATE shows it; if not, the player moves again.
+Recovery never depends on a resend.
 
-### 5.4 Ordering and delivery
+**Clocks across a restart (Q1).** Nothing changes from today: a game's clocks
+run from stored timestamps, so restart downtime is charged to the player on
+move, and a rebuilt game below two plies can abort on its first-move timeout.
+This is the #207 problem at restart scale. Lichess gives +20 s on a restart.
+Stage 1 can ship before #207 only if the owner accepts this explicitly (Q1).
 
-One ordered stream per (edge, owner) pair carries all frames for all games
-between the two nodes. Frames for one connection stay in order. The owner's actor
-serialises commands per game, as today. A frame lost to a broken stream is
-recovered by the existing client RESYNC, never by replay.
-
-### 5.5 Cross-node MATCHED
-
-The node that wins the pairing creates the game (opening batch including the
-first claim, §4.1), becomes its owner, and sends MATCHED to each seat through
-that seat's edge. The waiting seeker's edge is recorded in the seek record in the
-Redis pool (`edge_node`, `conn`), so the winner reads it from the claimed seek
-and needs no presence lookup. If the delivery fails (that edge is gone) nothing
-is lost: the user finds the game through the durable index on reconnect (§6).
-
-### 5.6 Connection-local state that must move out of memory
-
-| Today (process-local) | After |
-|---|---|
-| `userGames` (resync index) | durable user index (§6) |
-| `missedEnds`, `missedOrder` (#169, #172) | durable user index (§6) |
-| `gameUsers`, per-game `conns` | edge keeps `conns` for its own users; owner keeps the attached-edge list |
-| `joined`, `endBroadcast` latches | owner only (they belong to the owner's session) |
-| per-connection lookup budget (#170) | stays per connection on the edge |
-
-## 6. Finding a user's games after a restart (#98, #173)
-
-A restart empties every in-memory index, and Redis is not durable (ADR-10), so
-the lookup "which games is this user in" needs a durable home.
-
-**Index items (hints, not truth).** Two small mutable item kinds in the
-game-event table's account, written in the same `TransactWriteItems` as the
-opening `AppendBatch`:
-
-- `user_games`: partition `user/{uid}`, sort `game_id`. Attributes: `seat`,
-  `state` (`live`, `ended`), `ended_at`, and a DynamoDB TTL.
-- `live_games`: partition `live/{shard}` (shard = hash(game_id) mod 256), sort
-  `game_id`. Attributes: `owner_node` (updated at each claim) and `started_at`.
-
-The owner updates them after `GameEnded` commits: `user_games.state = ended`
-for both users, and a delete of the `live_games` item. A crash between the
-commit and the update leaves a stale hint. That is harmless: every consumer
-re-reads the game's stream before acting, so a hint can cost an extra read but
-cannot change a result. The stream stays the only truth.
-
-**AUTHENTICATE.** The edge queries `user/{uid}` (newest first, limit 8). For each
-candidate it resolves the owner (§5.2) and attaches, or triggers `startGame` when
-the owner is not live. A live game gets its STATE pushed. An ended game within
-the missed-ending TTL gets its ended STATE once; the edge then deletes the
-`user_games` item (replacing `missedEnds`, which survives neither a restart nor a
-second node). A reconnect storm after a node loss is one Query per user, with
-client backoff and server-side jitter.
-
-**Scope.** This writes outside the event stream, so it touches ADR-16's scope
-("DynamoDB, game-event store only"). See D2.
-
-## 7. Games whose owner died with nobody connected
-
-If both players are gone, no client triggers a rebuild, and the clock must still
-run out (GS-7 §3.5). Two mechanisms, both ending in `startGame(adopt)`:
-
-- **Fast path (Redis, ephemeral).** Each owner keeps the set
-  `node/{id}/games` (add at claim, remove at end). When a node's membership key
-  expires, each live node takes the games in that set for which it is the
-  rendezvous successor. Adoption is spread with jitter and a per-node
-  concurrency cap so a node loss does not become a thundering herd.
-- **Slow path (durable audit).** Redis can be lost too. Each shard of
-  `live_games` is audited every 60 s (jittered) by the node with the highest
-  rendezvous hash for that shard. The audit Queries the shard and adopts any game
-  whose `owner_node` is not in membership and for which the auditor is the
-  successor. A game is then never stranded for longer than one audit period plus
-  rebuild time, whatever happened to Redis.
-
-Targets, measured in the G-E chaos test and not assumed: a game whose owner dies
-is serving again within 10 s of membership expiry at p99 for the fast path, and
-within 90 s for the slow path.
-
-## 8. Failure modes and how #203 covers them
+### 4.6 Failure modes and how #203 covers them (stage 1)
 
 | Failure | Behaviour | Test (invariant harness, #203) |
 |---|---|---|
-| Owner crashes between two writes of one command | Another node rebuilds from the stream; the half-terminal repair finishes the ending; the resent command is idempotent (I7) | kill at write k, rebuild, resume the same seeded command stream; I1 to I8 hold |
-| Owner crashes after persist, before ack | The client resends; the rebuilt session re-acks from the stream, with no duplicate event (I6, I7) | kill after write, before ack |
-| Owner partitioned from Redis but alive | It self-fences after 4 s. If it does not, its next append conflicts with the new claim (I9) | two sessions on one store, old one keeps writing |
-| Two nodes both believe they are the successor | One claim wins by the seq condition; the other defers | two simultaneous `startGame(adopt)` |
-| Redis lost | Membership is rebuilt by the next heartbeats (2 s); the owner hint is a cache; adoption uses the durable audit | multi-node variant, Redis wiped mid-run |
-| Store outage | Unchanged: GS-6 §3.5 retry, #207 for clock credit | existing #97 tests |
-| Edge dies | The owner sees the stream drop and treats the seats as disconnected; the client reconnects to any node and resyncs | multi-node variant, kill an edge |
-| Owner dies, nobody connected, clock runs out | The successor adopts, repairs, arms the ticker, and the flag ends the game | multi-node variant: kill a node, let the clock run out, expect GAME_END (finding from #212) |
-| Stale owner after takeover | I9: it cannot commit; it drops the game | the I9 assertion, no longer pending |
+| Process killed between two writes of one command | Restart adopts the game; the half-terminal repair finishes the ending; I1 to I8 hold | kill at write k, rebuild, resume the same seeded command stream |
+| Killed after persist, before ack | No retransmit. The reconnect STATE shows the move; the rebuilt session adds no duplicate event (I6, I7) | kill after write, before ack |
+| Killed with both players disconnected | Adoption arms the deadline timer; the clock runs out and the game ends | kill, adopt, advance time, expect GAME_END |
+| Killed at ply 0 or 1 | No join timer on adopt; the first-move timeout bounds it | kill, adopt, advance past the timeout, expect abort |
+| Index entry for an ended game | Adoption deletes it | seed a stale entry, start |
+| Index write fails with the opening batch | The transaction fails as a whole, so no game exists | fault store |
+| Store down at start | Adoption retries with backoff; connections are still served (#97 behaviour) | outage at start |
 
-The harness gains a per-event author record `(node, epoch, seq)` so I9 is a
-direct assertion over the committed log, not an inference.
+The harness gains a crash phase on one node (kill at random write points), and
+an author record `(node, epoch, seq)` per event so stage 2's I9 is a direct
+assertion over the committed log.
 
-## 9. Decisions for the owner (nothing is built before these are answered)
+## 5. Stage 1 acceptance
 
-**D1. Fencing by a claim event (recommended) or by timing and CAS alone.**
-Recommended: the `OwnerClaimed` event (§4.1). It makes takeover a point in the
-log, so I9 is checkable and a stale owner is guaranteed to learn it is stale.
-Alternative: no new event; rely on self-fencing plus seq conflicts. Safety
-(no divergent history) still holds, but a takeover is not a point in the log, a
-quiet game can keep two owners trying, and I9 cannot be asserted. Cost of the
-recommendation: one additive event type in the codec, and #187 first.
+Stage 1 is done when the §4.6 tests pass, the transactional index passes the
+contiguity cases against MemStore and DynamoDB Local, and a restart of the game
+server in the e2e environment leaves every live game playable. It closes the
+restart half of #98 only; #98 and #173 close when stage 2's #203 phase passes.
 
-**D2. Where the durable user and live-game indexes live (§6).** Recommended:
-mutable hint items in DynamoDB written in the opening transaction. Alternatives:
-(a) Redis only: not durable, so a Redis loss strands players and games, which
-fails the zero-loss gate; (b) a per-user event stream: grows forever and needs
-compaction. This is the one place the design touches ADR-16's scope; if you want
-it recorded, it is an ADR-16 amendment limited to "game index hints", and it
-ratifies nothing else about the platform.
+## 6. Stage 2 — more than one node (designed now, decided later)
 
-**D3. Orphan adoption with a fast Redis path and a slow durable audit (§7).**
-Recommended. Alternative: durable audit only (simpler, but a dead node's games
-wait up to 90 s for their clocks). Or Redis only (simplest, not safe against a
-Redis loss).
+This stage is not built until stage 1 ships and the owner answers D2 to D5.
+It is written here so stage 1 does not close any door.
 
-**D4. Node-to-node transport.** Recommended: direct gRPC bidirectional streams,
-one per (edge, owner) pair, no broker on the move path (ADR-12 already names
-gRPC). Alternative: a pub/sub bus (Redis or NATS): simpler fan-out, but a shared
-hop and a shared failure domain on the hot path. This is a product choice for
-the transport only.
+### 6.1 Ownership and the claim event
 
-**D5. What counts as a drain.** Recommended: explicit hand-off per game on
-deploy (§4.2), so deploys are not node losses. Alternative: treat a deploy as a
-node loss and rely on adoption: simpler, but every deploy interrupts every game
-for the adoption time.
+- **Owner** of a game: the one node running its session and timers. **Edge** of
+  a user: the node holding the user's WebSocket. Any node can be an edge.
+- **Safety and liveness are separate.** Safety (no divergent history, no write
+  by a stale owner) comes only from the store. Liveness (who takes over, when)
+  comes from membership and timing, and a wrong liveness view costs a retry, not
+  a corrupt stream.
+- **The claim is written only at takeover.** A game has no claim until a node
+  other than its pairing node takes it over. No claim means epoch 0, owned by
+  the pairing node, so games that never fail over stay on the stage 1 schema.
+  `OwnerClaimed{node_id, epoch, server_ts, gap_ms}` is appended at the head the
+  taker folded. If another claim landed first, the append conflicts and the
+  taker defers.
+- **Rollout.** The claim is safety-relevant, so a node must never skip it as an
+  unknown event. #187 lands first with a fail-closed rule for safety-relevant
+  types, no node writes a claim until every node reads it, and rollback below
+  that point is a one-way door. It needs a new event code, a PROTOCOL §4A row
+  under ADR-19, golden vectors and the TS, Swift and Kotlin decoders. Other
+  stream readers (rating, archive, replay) get the same tolerance.
 
-## 10. Plan, in order, one PR each
+### 6.2 The ownership guard (invariant I9)
 
-Nothing here is built until D1 to D5 are answered.
+**I9.** After a claim with epoch `e` commits at seq `k`, no event written by an
+owner with an epoch below `e` commits above `k`.
 
-1. **#187:** the fold stops rejecting unknown event types (needed before any new
-   event type ships).
-2. **Single-node restart (closes most of #98):** the claim event and `startGame`
-   as the only session constructor; the durable indexes (§6); AUTHENTICATE
-   recovery; the ticker and join timer always armed; half-terminal repair on
-   rebuild. #203 crash phase on one node: kill at random write points, rebuild,
-   I1 to I8.
-3. **Fencing and takeover:** membership, successor selection, self-fencing,
-   deposed-owner handling. #203 I9 enabled.
-4. **Routing (closes #173):** the peer streams, attach/detach, `NOT_OWNER`,
-   cross-node MATCHED, durable missed endings. #203 multi-node variant.
-5. **Orphan adoption and drain:** §7 fast and slow paths, drain hand-off. The
-   chaos test of the XII.2 gate.
+The seq condition alone does not give I9, because the session's write path
+retries across a conflict: it reloads, re-decides the same command, and appends
+at the new head (`exec`, `session.go`). A deposed owner would then append above
+the claim. The guard: before every append, and after every reload, compare the
+folded `OwnerEpoch` and `OwnerNode` with this session's own. If they differ,
+return `ErrNotOwner`, close the session, and never re-decide. It covers
+`committedAnyway`, the stale and `needReload` reloads, the flag timer and
+session construction.
 
-#173 and #98 are done only when step 5's harness phase passes (their stated
-acceptance).
+A per-stream owner item with a conditional check on every move would also fence,
+but it costs a second conditional item in every move's write and serialises on
+one hot item. The claim gives the same fence through the seq condition for free.
 
-## 11. Specs that change when this is accepted
+### 6.3 Liveness, partitions and Redis loss
 
-GS-3 §3.5 and §6 (one owner is a node-level fact, not only a goroutine rule);
-GS-6 §3.2, §3.4, §5 ("reconnect to a different node: works"), §6.3; GS-7 §3.5
-(failover abort is no longer loose: the successor adopts and arms the timer);
-GAME-SERVER Q-GS2 (closed by this spec); PROTOCOL §4A event table (the new event
-type, additive).
+- Each node holds `node/{id}` in Redis (6 s TTL, refreshed every 2 s) from a
+  dedicated goroutine that adoption load cannot starve. It is refreshed only
+  while the node's own store writes recently succeeded, so a store-only
+  partition makes the node leave membership and be adopted.
+- **Redis unavailable never stops play.** Safety comes from the store, so a
+  Redis outage does not fence anything. A node self-fences only on evidence: a
+  conflict showing a newer claim, or loss of the store.
+- **No claim storms.** An observer may take a game only if its own refreshes
+  succeeded for at least one TTL and the owner has been absent for at least one
+  TTL. A game has a minimum dwell between claims (from the claim's `server_ts`).
+  When Redis is wiped, every node sees only itself, so the observer rule holds
+  takeover until heartbeats converge.
+- **Peers-only partition.** The owner is alive but unreachable from an edge.
+  The edge closes the connection so the client reconnects elsewhere, and the
+  seat is treated as disconnected by the owner.
 
-## 12. Not decided here
+### 6.4 Takeover and adoption
+
+- **Detection** polls membership every 2 s. Keyspace events are not used.
+- **Who adopts.** The successor is the live node with the highest rendezvous
+  hash of `(game_id, node_id)`. The index gains a GSI on `owner_node` (set at
+  each claim, absent before one). On a membership change each node sweeps the
+  GSI for the departed node, every 5 to 10 s while any remain. This replaces
+  v0.1's Redis set and the 60 s audit: one durable source, no cleanup of a
+  50k-member set. The auditor of each shard has a standby (the second hash).
+- **The index hint is verified.** A game is skipped only if its owner node is
+  in membership **and** that node confirms it runs the game, so a hint that
+  names a live node that failed to start the game (or a lost hint update) does
+  not strand it.
+- **Clocks.** Failover time is not silently charged to the player on move: the
+  claim carries `gap_ms`, designed together with #207's credit event, so the
+  rule is one rule. Elapsed time uses each node's wall clock, so GS-7 §3.5's
+  100 ms node-skew bound applies and is tested.
+- **Deploy drain (D5).** The owner stops accepting commands (`NOT_OWNER`),
+  flushes, the successor claims at the quiesced head, and the draining node
+  leaves membership so it is never "alive but not running". If the successor
+  dies mid hand-off, ordinary takeover applies after membership expiry.
+
+### 6.5 Routing between nodes (#173)
+
+- **Attach, not presence.** An edge sends the owner `Attach{game, seat, user}`
+  and `Detach`; the owner pushes frames to each seat's edge. No per-user key in
+  Redis. When the owner changes, each edge re-attaches, and the new owner pushes
+  STATE to both seats on attach. This is what lets a client with an unacked MOVE
+  recover with no resend (ADR-19 (a)).
+- **The edge never retries a command.** On a stream break or an owner change it
+  answers every pending command with `ERROR{INTERNAL}`.
+- **Finding the owner.** In-memory cache, then the Redis hint `game/{id}/owner`
+  (TTL longer than the longest game), then the stream's last claim; a node that
+  is not the owner replies `NOT_OWNER{hint}`.
+- **Move path.** The edge stamps receipt (#183) and sends `age_ms`; the owner
+  computes receipt time from its own clock minus `age_ms` minus an estimated
+  edge to owner transit, so remote seats are not charged the hop (NFR-1's 50 ms
+  clock drift). One in-region hop is budgeted at p99 under 5 ms and measured in
+  G-E.
+- **Peer streams.** (N-1)/N of seats are remote at N nodes, so this path is the
+  normal one. Streams are mutually authenticated, keepalive-checked, and carry a
+  bounded queue per stream (as `pump.go`), so a slow peer never blocks a session
+  actor.
+- **Cross-node MATCHED.** The seek record gains `edge_node` and `conn`
+  (`Seeker` and `Enqueue` change). The edge installs its route before it
+  forwards MATCHED, so an early MOVE does not hit `NOT_OWNER`. A waiting seeker
+  polls the index while its seek is pending, so a pairing node that dies after
+  the opening batch does not leave the seeker waiting forever.
+
+### 6.6 Q-GS2 alternatives considered
+
+Consistent hashing by `game_id` (MASTER-PLAN IX.2 "sharded by game_id") moves
+live games whenever membership changes. Claim-based ownership moves a game only
+when its owner is gone, so a node joining never disturbs a live game. That is
+why this spec uses claims.
+
+### 6.7 Failure modes and tests (stage 2)
+
+| Failure | Behaviour | Test (#203) |
+|---|---|---|
+| Stale owner after takeover | I9: `ErrNotOwner`, the session closes | two sessions on one store, the old one keeps writing, including across a conflict retry |
+| Two nodes both try | One claim wins by seq; the other defers | two simultaneous adopts |
+| Redis lost or wiped | Play continues; takeover waits for stable membership | Redis wiped mid-run |
+| Store-only or peers-only partition | See §6.3 | partition injection (new harness piece) |
+| Owner dies, nobody connected | The successor adopts, arms the timer, the flag ends the game (finding from #212) | kill a node, let the clock run out, expect GAME_END |
+| Edge dies | The owner treats the seats as disconnected; the client reconnects anywhere | kill an edge |
+| Adoption slower than a first-move timeout | The claim's `gap_ms` credit, per #207's rule | slow adoption test |
+
+The harness needs fake membership and partition injection first (plan step 3).
+
+## 7. Plan, in order, one PR each, each with an independent review
+
+**Stage 1**
+1. **Store API.** `AppendBatch` takes index operations. The two index tables,
+   MemStore support, and the contiguity tests against both stores.
+2. **Recovery.** `startGame` as the only constructor, the always-armed deadline
+   timer, adoption at start, AUTHENTICATE lookup, half-terminal repair, removal
+   of `missedEnds`. The #203 single-node crash phase. Uses `relates to` for #98.
+
+**Stage 2 (after stage 1 ships and D2 to D5 are answered)**
+3. **#187, the claim event and the harness pieces.** Fail-closed unknown-event
+   rule, the codec event, fake membership and partition injection.
+4. **Ownership guard, membership and takeover.** I9 enabled.
+5. **Routing (#173).** Peer streams, attach, `NOT_OWNER`, cross-node MATCHED.
+6. **Adoption sweep, drain and the chaos test** of the XII.2 gate.
+
+#98 and #173 close only when step 6's harness phase passes.
+
+## 8. Decisions for the owner
+
+**Needed before stage 1 code**
+- **D1. Index tables and ADR-16.** Recommended: two small DynamoDB tables for
+  live-game hints, written in the opening and ending transactions, recorded as an
+  ADR-16 amendment limited to "live-game index hints" that ratifies nothing else
+  about the platform. Alternatives: Redis only (not durable, so a Redis loss
+  strands players and games, failing the zero-loss gate); a scan of
+  `game_events` (cost grows with history).
+- **Q1. Restart downtime on the clock.** Recommended: accept today's rule
+  (downtime charged to the player on move) for stage 1, and design the credit
+  with #207 before stage 2. Alternative: land #207's credit first, so a restart
+  never costs a player a game. Stage 1 ships earlier under the recommendation.
+
+**Needed before stage 2 code (not now)**
+- **D2.** Claim only at takeover (recommended) or in every opening batch (every
+  game then needs the claim event on a rollback, a one-way door at launch).
+- **D3.** Redis loss never stops play (recommended) or self-fence after a
+  refresh gap.
+- **D4.** Peer link: direct gRPC streams between nodes (recommended) or a broker.
+  ADR-12 names gRPC for the engine boundary only, and ADR-15 rejects a network
+  hop on the move path, so this needs its own recorded decision limited to
+  remote seats.
+- **D5.** Deploy as an explicit hand-off (recommended) or as a node loss.
+
+## 9. Review of v0.1: what changed
+
+| v0.1 finding | Answer in v0.2 |
+|---|---|
+| B1 I9 false because `exec` retries across the claim | §6.2 guard before every append and reload |
+| B2 Redis loss fences the fleet; claim storms | §6.3 no fencing on Redis loss, hysteresis, dwell, isolated heartbeat |
+| B3 join timer aborts live games; slow adoption exceeds first-move timeout | §4.2 join timer only for `pair`; §6.4 `gap_ms` credit |
+| B4 index key schema, API and stranding holes | §4.3 separate tables, time-ordered key, one transaction, live only; §6.4 verified hint |
+| B5 failover story contradicts ADR-19 | §4.5, §6.5 no resend, STATE on attach |
+| Rolling deploy and rollback | §6.1 takeover-only claim, fail-closed rule, one-way door |
+| Clocks, partitions, drain, peer streams, plan order | §6.3 to §6.5, §7 |
+
+## 10. Specs that change when this is accepted
+
+GS-3 §3.5 and §6 (the ownership guard, stage 2); GS-6 §3.2, §3.4, §5, §6.3
+(AUTHENTICATE lookup in stage 1; reconnect to another node in stage 2); GS-7
+§3.5 (the rebuilt game's timers); GAME-SERVER Q-GS2 (closed by this spec);
+PROTOCOL §4A (the claim event, stage 2); ADR-16 (D1).
+
+## 11. Not decided here
 
 The load balancer and TLS termination; the cloud product behind Redis; the
-number of shards beyond the 256 used as a sizing example; clock credit after a
-store outage (#207).
+final shard count and adoption concurrency (configured and measured in G-E);
+clock credit after a store outage (#207).
