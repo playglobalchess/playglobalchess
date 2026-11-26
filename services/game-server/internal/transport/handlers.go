@@ -455,7 +455,11 @@ func (s *Server) handleMove(ctx context.Context, c Conn, st *connState, p *codec
 	}
 	// The session does the durable append BEFORE returning (persist-before-ack,
 	// NFR-7); we send the authoritative outcome only after it returns.
-	out, err := sess.SubmitMove(ctx, seat, p.PlyExpected, p.UCI, uint64(s.now().UnixMilli()))
+	recv := st.recvAt
+	if recv.IsZero() {
+		recv = s.now()
+	}
+	out, err := sess.SubmitMoveReceived(ctx, seat, p.PlyExpected, p.UCI, uint64(recv.UnixMilli()))
 	if err != nil {
 		// No ack (NFR-7). The session already re-read the stream to confirm an
 		// ambiguous commit (#89), so this means the move is not known to have

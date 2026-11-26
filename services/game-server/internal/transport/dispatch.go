@@ -111,6 +111,11 @@ type connState struct {
 	// Touched only by this connection's own goroutine.
 	lookupWindow time.Time
 	lookups      int
+	// recvAt is when the frame being routed finished reading from the socket
+	// (#183): the instant a MOVE is charged to, so queue time behind a tick or
+	// a store call is not think time. Set and read by this connection's own
+	// goroutine only.
+	recvAt time.Time
 }
 
 // Handle runs the per-connection loop for the lifetime of c (ADR-12: one
@@ -138,6 +143,7 @@ func (s *Server) Handle(ctx context.Context, c Conn) {
 		if err != nil {
 			return // closed / failed; teardown via defers.
 		}
+		st.recvAt = s.now()
 		msg, err := codec.DecodeClient(frame)
 		if err != nil {
 			// A malformed / wrong-direction frame → PROTOCOL_VIOLATION, keep the

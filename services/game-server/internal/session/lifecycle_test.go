@@ -219,3 +219,51 @@ func TestUnconfirmedWriteRebuildsBeforeNextCommand(t *testing.T) {
 		t.Fatalf("snapshot after the unconfirmed write: ply=%d err=%v, want ply 1", snap.Ply, err)
 	}
 }
+
+type holdCmd struct {
+	release chan struct{}
+	done    chan struct{}
+}
+
+func (c *holdCmd) apply(context.Context, *Session) { <-c.release }
+func (c *holdCmd) fail(error)                      {}
+func (c *holdCmd) finish()                         { close(c.done) }
+
+// #183: a MOVE queued behind a busy actor is charged to its receipt time.
+func TestQueuedMoveNotChargedTheWait(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+	for i, uci := range []string{"e2e4", "e7e5"} {
+		if o, err := s.SubmitMove(ctx, uint8(i), uint32(i+1), uci, 0); err != nil || !o.Accepted {
+			t.Fatalf("opening %s: %+v %v", uci, o, err)
+		}
+	}
+	hold := &holdCmd{release: make(chan struct{}), done: make(chan struct{})}
+	go func() { _ = s.dispatch(ctx, hold, hold.done) }()
+	time.Sleep(50 * time.Millisecond) // the actor is now blocked in hold
+
+	fc.add(time.Second)
+	received := uint64(fc.now().UnixMilli())
+	type res struct {
+		out game.MoveOutcome
+		err error
+	}
+	got := make(chan res, 1)
+	go func() {
+		o, err := s.SubmitMoveReceived(ctx, 0, 3, "g1f3", received)
+		got <- res{o, err}
+	}()
+	time.Sleep(50 * time.Millisecond) // the move is queued behind hold
+	fc.add(20 * time.Second)          // the wait the actor imposes
+	close(hold.release)
+
+	r := <-got
+	if r.err != nil || !r.out.Accepted {
+		t.Fatalf("move: %+v %v", r.out, r.err)
+	}
+	if r.out.ClockAfterMs != 302_000 { // 300000 - 1000 think + 3000 increment
+		t.Fatalf("clock_after = %d, want 302000: the 20 s queue wait was charged", r.out.ClockAfterMs)
+	}
+}

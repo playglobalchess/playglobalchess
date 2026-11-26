@@ -841,3 +841,33 @@ func openTiny(t *testing.T, ca, cb *fakeConn, ma codec.ServerMsg) {
 	white, black := whiteBlack(ca, cb, ma.Matched.SeatIdx, 1-ma.Matched.SeatIdx)
 	playTwoPlies(t, white, black, ma.Matched.GameID)
 }
+
+// #183: the transport charges a MOVE to the instant its frame finished
+// reading (connState.recvAt), not to the instant the handler ran. The frame is
+// stamped 19 s before the handler runs, 1 s after the opponent's move.
+func TestMoveChargedToFrameReceiptTime(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, seatB := pair(t, h, ctx, "alice", "bob")
+	white, black := whiteBlack(ca, cb, seatA, seatB)
+	playTwoPlies(t, white, black, gameID)
+
+	h.clk.add(20 * time.Second) // the wait between the socket read and the handler
+	// Seats are bound to the server's wrapper of the connection, so look it up.
+	user := "alice"
+	if white != ca {
+		user = "bob"
+	}
+	h.srv.mu.Lock()
+	bound := h.srv.userConns[user]
+	h.srv.mu.Unlock()
+	st := &connState{userID: user, recvAt: h.clk.now().Add(-19 * time.Second)}
+	if !h.srv.handleMove(ctx, bound, st, &codec.MovePayload{GameID: gameID, PlyExpected: 3, UCI: "g1f3"}) {
+		t.Fatal("handleMove closed the connection")
+	}
+	acc := white.waitForServer(t, codec.SMMoveAccepted, 2*time.Second)
+	if got := acc.MoveAccepted.ClockAfterMs; got != 302_000 {
+		t.Fatalf("clock_after = %d, want 302000: the 19 s before the handler ran was charged", got)
+	}
+}
