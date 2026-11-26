@@ -12,13 +12,14 @@ type PoolCatalog map[string]string
 
 // DefaultPools is the interim allow-list. Each pool id IS its time-control id,
 // so the pair is unambiguous for clients: a common chess.com-style set of
-// bullet, blitz, rapid and daily controls.
+// bullet, blitz and rapid controls. Daily pools are deliberately absent (#178):
+// daily play (a per-move clock, many games per user, offline move delivery) is
+// unspecified and untested, so a daily SEEK is refused as an unknown pool.
 func DefaultPools() PoolCatalog {
 	ids := []string{
 		"bullet-1+0", "bullet-2+1",
 		"blitz-3+0", "blitz-3+2", "blitz-5+0", "blitz-5+3",
 		"rapid-10+0", "rapid-10+5", "rapid-15+10", "rapid-30+0",
-		"daily-1", "daily-3", "daily-7",
 	}
 	c := make(PoolCatalog, len(ids))
 	for _, id := range ids {

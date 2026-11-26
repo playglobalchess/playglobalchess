@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +127,37 @@ func TestSeekIntoMisconfiguredPoolIsInternal(t *testing.T) {
 	}
 	if n := h.pool.waitingCount(); n != 0 {
 		t.Fatalf("%d seekers enqueued, want 0", n)
+	}
+}
+
+// #178: the catalogue has no daily pool, and a SEEK for one is refused with
+// nothing enqueued. The resolver still parses daily ids for when daily play is
+// built (TestResolverRejectsOutOfRange covers its bounds).
+func TestDefaultPoolsHaveNoDaily(t *testing.T) {
+	for pool, tc := range DefaultPools() {
+		if strings.Contains(pool, "daily") || strings.Contains(tc, "daily") {
+			t.Errorf("DefaultPools has a daily entry: %q -> %q", pool, tc)
+		}
+	}
+}
+
+func TestSeekDailyPoolRefusedWithDefaultCatalogue(t *testing.T) {
+	for _, id := range []string{"daily-1", "daily-3", "daily-7"} {
+		t.Run(id, func(t *testing.T) {
+			h := newHarness(t)
+			defer h.cancel()
+			h.srv.pools = DefaultPools()
+			c := newFakeConn()
+			h.handle(context.Background(), c)
+			c.feedClient(t, codec.ClientMsg{Type: codec.CMAuthenticate, Authenticate: &codec.AuthenticatePayload{Token: "mallory"}})
+			c.feedClient(t, codec.ClientMsg{Type: codec.CMSeek, Seek: &codec.SeekPayload{PoolID: id, TimeControl: id}})
+			e := c.waitForServer(t, codec.SMError, 2*time.Second)
+			if e.Error.Code != codec.ECProtocolViolation {
+				t.Fatalf("error code = 0x%02x, want PROTOCOL_VIOLATION", e.Error.Code)
+			}
+			if n := h.pool.waitingCount(); n != 0 {
+				t.Fatalf("%d seekers enqueued, want 0", n)
+			}
+		})
 	}
 }
