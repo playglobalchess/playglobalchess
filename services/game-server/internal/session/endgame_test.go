@@ -336,6 +336,40 @@ func TestResignPersistFailureDoesNotEnd(t *testing.T) {
 	}
 }
 
+// TestFlagPersistFailureRetries (#97): a flag whose write fails leaves the
+// session exactly as it was (no flagged clock kept, not ended), so the next
+// tick decides the flag again and ends the game.
+func TestFlagPersistFailureRetries(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	sess, mem, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	ctx := context.Background()
+	before, err := readState(ctx, sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc.add(301 * time.Second) // White's 5-minute clock has run out
+	mem.FailNextAppend(errFakePersist)
+	if ended, err := sess.TickFlagCheck(ctx); err == nil || ended {
+		t.Fatalf("failed flag write: ended=%v err=%v, want an error and not ended", ended, err)
+	}
+	after, err := readState(ctx, sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := fieldDiff(before, after); d != "" {
+		t.Fatalf("a failed flag write changed the session state: %s", d)
+	}
+	ended, err := sess.TickFlagCheck(ctx)
+	if err != nil || !ended {
+		t.Fatalf("retry: ended=%v err=%v, want the flag to end the game", ended, err)
+	}
+	snap, _ := sess.StateSnapshot(ctx)
+	if !snap.Ended {
+		t.Fatal("snapshot not ended after the retried flag")
+	}
+}
+
 // --- CRITICAL regression (reviewer C1): endgame commands must reject a
 // non-LIVE (MATCHED) game, else they persist a Live-only event that makes the
 // stream permanently unfoldable. Abort is the one exception (valid from MATCHED).
