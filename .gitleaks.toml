@@ -1,0 +1,11 @@
+# gitleaks policy (#192). Default rules plus the single allowance below.
+# Add an allowance only for a value that is provably fake, matching the exact
+# value (never a whole path or rule), and say where it is used.
+title = "playglobalchess gitleaks"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fake JWT-shaped token in the codec test corpus (protocol/codec/tests/corpus/mod.rs)"
+regexes = ['''eyJhbGciOiJIUzI1Ni9\.header\.sig''']

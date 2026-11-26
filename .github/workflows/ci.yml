@@ -460,3 +460,114 @@ jobs:
         run: python3 -c "import py_compile,glob,sys; [py_compile.compile(f,doraise=True) for f in glob.glob('platform/ci/*.py')]; print('platform/ci python compiles clean')"
       - name: Unit-test CI tooling
         run: python3 -m unittest discover -s platform/ci -p 'test_*.py' -v
+
+  # Supply-chain and secret gates (#192, MASTER-PLAN X.4). Each runs on EVERY
+  # change: no `if:`, no `needs:`. A dependency advisory or a committed secret
+  # must fail the PR whatever paths it touches, and a new advisory can land
+  # between two commits, so these also run in the nightly.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: govulncheck (every Go module)
+        run: |
+          # Source mode: fails only on a vulnerability the code can reach, in a
+          # dependency or in the Go standard library of the pinned toolchain.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          for mod in services/game-server services/accounts; do
+            echo "::group::govulncheck $mod"
+            (cd "$mod" && "$(go env GOPATH)/bin/govulncheck" ./...)
+            echo "::endgroup::"
+          done
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+      - name: npm audit (runtime dependencies of the web client)
+        run: npm audit --omit=dev --prefix clients/web
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny 0.22.1 (release tarball, sha256-verified)
+        run: |
+          f=cargo-deny-0.22.1-x86_64-unknown-linux-musl
+          curl -fsSL -o "$f.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.1/$f.tar.gz"
+          echo "13f7e825e9cb811c2f8de63f29b0f45851dfb53004029f0f2501af524728364d  $f.tar.gz" | sha256sum -c -
+          tar -xzf "$f.tar.gz"
+          install -m 0755 "$f/cargo-deny" /usr/local/bin/cargo-deny
+      - name: cargo deny check advisories sources (every Cargo.lock; policy in deny.toml)
+        run: |
+          rc=0
+          for lock in $(git ls-files '*Cargo.lock'); do
+            dir=$(dirname "$lock")
+            echo "::group::cargo-deny $dir"
+            cargo-deny --config deny.toml --manifest-path "$dir/Cargo.toml" --log-level warn check advisories sources || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks 8.30.1 (release tarball, sha256-verified)
+        run: |
+          f=gitleaks_8.30.1_linux_x64.tar.gz
+          curl -fsSL -o "$f" "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$f"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $f" | sha256sum -c -
+          tar -xzf "$f" gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+      - name: gitleaks over the full git history (policy in .gitleaks.toml)
+        run: gitleaks git --redact --no-banner --log-level warn --config .gitleaks.toml .
+
+  # The ONE required check for ci (#117). It needs every other job, runs even
+  # when they fail or are skipped (`if: always()`), and fails on any failure or
+  # cancellation. A job skipped by its path gate counts as passed only if the
+  # gate really was false for this event; any other skip (an upstream failure,
+  # an unconditional job that did not run) fails it. The rule lives in
+  # platform/ci/ci_ok.py and the audit in check_ci_filters.py (P9) fails if a
+  # job is added to this workflow without being listed here.
+  ci-ok:
+    needs:
+      - changes
+      - ci-filter-audit
+      - rest-contract
+      - govulncheck
+      - npm-audit
+      - cargo-deny
+      - secret-scan
+      - engine
+      - engine-nightly-perft
+      - engine-perf-bench
+      - protocol
+      - protocol-parity
+      - services
+      - web
+      - web-e2e
+      - mobile
+      - platform
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned PyYAML (hash-verified)
+        run: python3 -m pip install --require-hashes -r platform/ci/requirements-ci.txt
+      - name: Every ci job passed or was legitimately skipped
+        run: python3 platform/ci/ci_ok.py

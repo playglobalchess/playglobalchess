@@ -1,0 +1,21 @@
+# cargo-deny policy (#192, MASTER-PLAN X.4). Run per crate by the CI
+# `supply-chain` job: cargo deny --manifest-path <crate>/Cargo.toml check
+#
+# Only two checks are enforced:
+#   advisories  a RustSec advisory against any locked dependency fails CI.
+#   sources     dependencies come only from crates.io (no git or path-less
+#               registries), so a lockfile cannot pull unreviewed code.
+# Licence and ban checks are deliberately not enabled: they need an owner
+# decision on the project licence (the repo has no LICENSE yet).
+
+[advisories]
+version = 2
+yanked = "deny"
+# Add an entry here only with the advisory id, why it does not apply, and an
+# issue to revisit it:
+# ignore = [ { id = "RUSTSEC-0000-0000", reason = "..." } ]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
