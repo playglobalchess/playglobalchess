@@ -313,7 +313,7 @@ tweak.
   On unknown the session (1) re-reads the stream, retrying the read a few
   times; (2) folds it and adopts it as the projection either way; (3) reports
   success if exactly its events sit at the seqs it wrote (the command
-  happened, ack it, a resend is a re-ack), otherwise reports failure (INTERNAL
+  happened, ack it, a resend is a re-ack; the match is by value, so the store round trip must be lossless for every event the session writes, which `TestAmbiguousCommitConfirmedThroughTheRealStore` pins through the real store and, in CI, DynamoDB Local, #176), otherwise reports failure (INTERNAL
   to the client, which must RESYNC); (4) if the re-read itself failed, marks
   the projection stale so the next command rebuilds before deciding. Resend
   and re-ack decisions come from the durable stream, never from ply
