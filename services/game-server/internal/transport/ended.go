@@ -51,8 +51,8 @@ type missedKey struct {
 // recordMissedEnd notes that user uid (at seat) did not get gameID's GAME_END.
 func (s *Server) recordMissedEnd(uid, gameID string, seat uint8) {
 	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
 	s.pruneMissedLocked(now)
 	games := s.missedEnds[uid]
 	if games == nil {
@@ -70,8 +70,8 @@ func (s *Server) recordMissedEnd(uid, gameID string, seat uint8) {
 // (game id -> seat).
 func (s *Server) takeMissedEnds(uid string) map[string]uint8 {
 	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
 	s.pruneMissedLocked(now)
 	games := s.missedEnds[uid]
 	if len(games) == 0 {
@@ -87,8 +87,8 @@ func (s *Server) takeMissedEnds(uid string) map[string]uint8 {
 
 // clearMissedEnd forgets one missed ending (the user has now seen it).
 func (s *Server) clearMissedEnd(uid, gameID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
 	if games := s.missedEnds[uid]; games != nil {
 		delete(games, gameID)
 		if len(games) == 0 {
@@ -97,7 +97,7 @@ func (s *Server) clearMissedEnd(uid, gameID string) {
 	}
 }
 
-// pruneMissedLocked drops expired entries from the front of the FIFO. s.mu held.
+// pruneMissedLocked drops expired entries from the front of the FIFO. s.userMu held.
 func (s *Server) pruneMissedLocked(now time.Time) {
 	for len(s.missedOrder) > 0 && !now.Before(s.missedOrder[0].at.Add(missedEndTTL)) {
 		s.dropOldestMissedLocked()
@@ -105,7 +105,7 @@ func (s *Server) pruneMissedLocked(now time.Time) {
 }
 
 // dropOldestMissedLocked pops the FIFO head and deletes its map entry, unless
-// that entry was since taken, cleared or re-recorded (a newer `at`). s.mu held.
+// that entry was since taken, cleared or re-recorded (a newer `at`). s.userMu held.
 func (s *Server) dropOldestMissedLocked() {
 	k := s.missedOrder[0]
 	s.missedOrder[0] = missedKey{} // release the strings

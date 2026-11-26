@@ -862,9 +862,9 @@ func TestMoveChargedToFrameReceiptTime(t *testing.T) {
 	if white != ca {
 		user = "bob"
 	}
-	h.srv.mu.Lock()
+	h.srv.userMu.Lock()
 	bound := h.srv.userConns[user]
-	h.srv.mu.Unlock()
+	h.srv.userMu.Unlock()
 	st := &connState{userID: user, recvAt: h.clk.now().Add(-19 * time.Second)}
 	if !h.srv.handleMove(ctx, bound, st, &codec.MovePayload{GameID: gameID, PlyExpected: 3, UCI: "g1f3"}) {
 		t.Fatal("handleMove closed the connection")

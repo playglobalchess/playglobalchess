@@ -45,22 +45,17 @@ func wantReclaimed(t *testing.T, h *harness, w *tickerWatch, gameID string) {
 			return false
 		}
 		s := h.srv
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		for gs := range s.conns {
-			if gs.gameID == gameID {
-				return false
-			}
+		if s.gt.tracked(gameID) {
+			return false
 		}
+		s.userMu.Lock()
+		defer s.userMu.Unlock()
 		for _, games := range s.userGames {
 			if _, ok := games[gameID]; ok {
 				return false
 			}
 		}
-		_, claimed := s.endBroadcast[gameID]
-		_, joined := s.joined[gameID]
-		_, indexed := s.gameUsers[gameID]
-		return !claimed && !joined && !indexed
+		return true
 	})
 	waitUntil(t, 2*time.Second, "the flag ticker to exit", func() bool { return w.gone(gameID) })
 }
@@ -158,10 +153,11 @@ func TestBroadcastThatDoesNotGoOutReleasesTheClaim(t *testing.T) {
 	ctx := context.Background()
 	_, _, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
 	claimed := func(id string) bool {
-		h.srv.mu.Lock()
-		defer h.srv.mu.Unlock()
-		_, ok := h.srv.endBroadcast[id]
-		return ok
+		sh := h.srv.gt.shard(id)
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+		e := sh.games[id]
+		return e != nil && e.endClaimed
 	}
 	// A live game (not ended), and a game this node does not have (or has
 	// already broadcast and dropped): "not sent" and "gone" are distinct, so a

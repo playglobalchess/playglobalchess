@@ -157,6 +157,31 @@ persist-before-ack and seq-conflict recovery (GS-4); the transport must not ack 
 MOVE until `SubmitMove` returns, and must send the EXACT authoritative fields the
 session returns (never a client-asserted clock/result).
 
+**Transport state and locking (#174).** No per-move or per-ending path may take a
+node-wide lock or iterate a map sized by the node's games or connections.
+- *Per-game state* (the seat-to-connection bindings, the seat-to-user index, the
+  join signal and the GAME_END claim) lives in one entry per game in a table
+  sharded by game id. MOVE, a game ending and `dropGame` each take one shard's
+  lock and do O(seats) work. `seatOf` checks the two seats of the one game.
+- *User-keyed state* (the user's current connection, the games they are seated
+  in, missed endings) is under one separate lock. It is touched at AUTHENTICATE,
+  MATCHED, disconnect and game end, never by MOVE. A disconnect visits only the
+  games its user is seated in, and `dropGame` finds a game's users from the
+  game's own entry.
+- *Lock order* is the user lock, then a shard lock. No path holds a shard lock
+  while taking the user lock, and no lock is held across a send, a store call or
+  an engine call.
+- *The `Registry`* lock guards only its maps. A session build (store read,
+  engine fold, first appends) runs outside it, once per game (concurrent callers
+  share the build), and is bounded by a 10 s deadline. A `Drop` or `CloseAll`
+  during a build discards the result, so a dropped game never reappears live.
+  A panic in a build fails its waiters with an error and leaves the game
+  buildable again. A reconnect resync binds a seat only while the game's session
+  is still registered, so a bind that loses the race with `dropGame` leaves no
+  entry behind.
+- `BenchmarkMoveLookup` and `BenchmarkEndAndDisconnect` show the per-operation
+  cost is flat from 100 to 200,000 unrelated games.
+
 ### 3.4 Reconnection & clock-aware forfeit (§3.5) — server-push, Option A
 
 §4A has NO client resync/state-request message (`STATE` is server→client only),
