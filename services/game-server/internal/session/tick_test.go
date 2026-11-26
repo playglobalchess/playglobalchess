@@ -54,3 +54,26 @@ func TestNextTickPublishedAfterEveryCommand(t *testing.T) {
 		t.Fatalf("after resign: %+v, want Ended, no deadline, and a signal", tk)
 	}
 }
+
+// TestStaleSessionPublishesDueNow (#182 review): while the projection is behind
+// the store (here: after a panicked command) a deadline derived from it could
+// be minutes late, so the session publishes a 1 s recheck and the timer's next check
+// reloads, as the old poll did.
+func TestStaleSessionPublishesDueNow(t *testing.T) {
+	fc := &fakeClock{t: time.Unix(0, 0)}
+	s, _, cancel := seedLive(t, startFEN, false, fc.now)
+	defer cancel()
+	c := &panicCmd{done: make(chan struct{})}
+	if err := s.dispatch(context.Background(), c, c.done); err != nil {
+		t.Fatal(err)
+	}
+	if tk := s.NextTick(); !tk.Due || tk.AtMs != uint64(fc.now().Add(staleRecheck).UnixMilli()) {
+		t.Fatalf("after a panic the tick must be staleRecheck away, got %+v", tk)
+	}
+	if _, err := s.TickFlagCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if tk := s.NextTick(); tk.AtMs <= uint64(fc.now().UnixMilli())+1000 {
+		t.Fatalf("the check must reload and republish a real deadline, got %+v", tk)
+	}
+}

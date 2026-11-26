@@ -90,9 +90,18 @@ func (s *Session) TickChanged() <-chan struct{} { return s.tickWake }
 // Closed is closed when the session's actor has stopped.
 func (s *Session) Closed() <-chan struct{} { return s.quit }
 
+// staleRecheck is how soon a stale or reloading session is checked again.
+const staleRecheck = time.Second
+
 // publishTick recomputes the flag deadline from s.st. Actor goroutine only.
 func (s *Session) publishTick() {
 	at, due := game.NextTickMs(s.st, s.opts)
+	if s.stale || s.needReload {
+		// s.st is behind the store: a deadline derived from it can be minutes
+		// late. Re-check after staleRecheck (the old 1 s poll's healing, kept);
+		// the check reloads first, then republishes a real deadline.
+		at, due = uint64(s.now().Add(staleRecheck).UnixMilli()), true
+	}
 	next := Tick{AtMs: at, Due: due, Ended: s.st.Phase == game.PhaseEnded}
 	if old := s.tick.Load(); old != nil && *old == next {
 		return

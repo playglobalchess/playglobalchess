@@ -219,7 +219,7 @@ re-arms on each signal, so a move that hands the clock to a side with less time
 moves the check earlier. A flag therefore lands at the instant the clock runs
 out (within timer and scheduling latency; the test bound is 50 ms), and a game
 whose clocks are far from zero costs no check, snapshot or wakeup. A game with
-no deadline (clock not running) sleeps until a command changes that.
+no deadline (clock not running) sleeps until a command changes that. A session whose projection may be behind the store (unconfirmed write, or after a panicked command) publishes a deadline 1 s away instead, so the next check reloads it first.
 `flagInterval` (config, default 1 s) is now only the base for retries and for
 the repair of an ended game below. The ticker is armed at MATCHED and exits
 when the game is gone (ended by any path, or its session stopped and no
