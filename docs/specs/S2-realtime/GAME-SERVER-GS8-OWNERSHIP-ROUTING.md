@@ -5,7 +5,7 @@
 | Spec ID | SPEC-S2-GAME-SERVER-GS8 (closes Q-GS2; amends GS-3 §3.5/§6, GS-6 §3.2/§3.4/§5/§6.3, GS-7 §3.5) |
 | Owner | S2 Real-time |
 | Status | DRAFT |
-| Version | 0.2 (two stages; v0.1 was rejected by its first independent review) |
+| Version | 0.3 (two stages; v0.1 and v0.2 each had one independent review) |
 | Last updated | 2026-11-27 |
 | Fixes (issues) | #98 (stage 1 restart half, stage 2 failover half), #173 (stage 2); #203 is their acceptance test |
 | Depends on | GS-3 (session), GS-4 (event store, seq-conditional append), GS-5 (Redis pool), GS-6 (transport), GS-7 (fold) |
@@ -25,9 +25,11 @@ serving node: ownership, fencing, routing and takeover. Stage 1 is designed so
 stage 2 adds to it and rewrites none of it. Only stage 1 needs owner decisions
 now (§8).
 
-**Review status.** v0.1 had one context-free design review: verdict "needs
-another draft", five blockers. §9 maps each finding to the section that answers
-it. v0.2 needs a second independent review before any code.
+**Review status.** v0.1 had one context-free design review (verdict "needs
+another draft", five blockers, answered in §9). v0.2 had a second (verdict
+"needs a short v0.3", three blockers and eight should-fix points, answered in
+§12). Review is capped at two rounds; the owner decides D1 and Q1 before any
+stage 1 code.
 
 ## 1. Scope
 
@@ -88,6 +90,10 @@ live games, and nothing public describes a crash.
 - Every writer takes `NextSeq` from a folded, contiguous state. The Dynamo
   store checks only `attribute_not_exists(seq)` and MemStore rejects gaps, so a
   test must run the same contiguity cases against both stores.
+- Each process has a stable `node_id` and a random `incarnation` generated at
+  start. Both are written into `live_games` at the opening and used in the
+  harness's author record `(node, incarnation, seq)`. Stage 2 relies on them to
+  tell a restarted node from its zombie predecessor (§6.1).
 
 ### 4.2 One constructor
 
@@ -104,34 +110,56 @@ timeout (GS-7 §3.5), which is measured from the stored `ClockStarted`.
 
 ### 4.3 The live-game index
 
-Two new DynamoDB tables, separate from `game_events` (whose sort key is the
-number `seq`). Both hold **live games only**.
+Three new DynamoDB tables, separate from `game_events` (whose sort key is the
+number `seq`). Game ids become time-ordered UUIDv7 (today `uuid.NewString()` is
+v4), so `game_id` alone sorts newest first and every key is derivable without
+`started_at`, which the session cannot recover (the store stamps `committed_at`
+at write time and `Load` drops it). Anything that parses a game id as v4 is
+checked when this is built.
 
-- `user_live_games`: partition `user_id`, sort `started_at#game_id`
-  (time-ordered, because game ids are random v4). Attributes: `game_id`, `seat`.
-- `live_games`: partition `shard` (hash of `game_id` mod a configured count,
-  starting at 16), sort `started_at#game_id`. Attributes: `game_id`.
+- `user_live_games`: partition `user_id`, sort `game_id`. Attribute: `seat`.
+- `live_games`: partition `shard` (hash of `game_id` mod a configured count),
+  sort `game_id`. Attributes: `owner_node` (the pairing node id, written at the
+  opening, so stage 2's sweep also finds games that never failed over) and
+  `owner_incarnation`.
+- `user_recent_games`: partition `user_id`, sort `game_id`, attribute `ended_at`
+  and a DynamoDB TTL at the retention of today's `missedEnds`.
 
-Writes happen in the same `TransactWriteItems` as the stream write, so the index
-cannot disagree with the stream on the normal path:
+`State` gains `Players []string` (the user ids from `PlayerJoined`, which the
+fold drops today), so the session can name the keys at the ending. This is a
+GS-7 amendment (§10).
 
-- Opening batch (about 3 event items) plus 2 `user_live_games` and 1
-  `live_games` item: about 6 items, within the transaction limits.
-- The `GameEnded` batch plus the 3 deletes.
+**Index operations.** `AppendBatch` and `Append` take a list of index
+operations (`Put`, `Delete`, `Update`; stage 2's claim needs `Update` of
+`owner_node`). The rule is: any write that contains `GameEnded` carries the
+ending operations, including the lone `GameEnded` that `decideFinishHalfTerminal`
+emits through `Append`. All run in one `TransactWriteItems`.
 
-`EventStore.AppendBatch` therefore gains an index-operations parameter, which
-MemStore, the matchmaker and the session must pass through. Transactional writes
-cost twice the write units; the real cost at launch load is measured in G-E.
+- Opening (exactly 3 events, then `ClockStarted` is a separate write by
+  `NewSession`; if the node dies between them, adoption stamps `ClockStarted`
+  at adoption time, which is harmless): 3 events, 2 `user_live_games` puts and
+  1 `live_games` put.
+- Ending: the events, 2 `user_live_games` deletes, 1 `live_games` delete and
+  2 `user_recent_games` puts. About 8 items, well under the 100-item and 4 MB
+  limits.
 
-Anything that still disagrees (a bug, a manual repair) is corrected by the
-reader: every consumer folds the stream before acting, and adoption deletes the
-index entry of any game whose stream is ended.
+`store.New` checks that all four tables exist (it checks `game_events` only
+today), so a missing table fails at start, not on the first game. Index reads
+use `ConsistentRead`. MemStore implements the same operations. Transactional
+writes cost twice the write units; the real cost at launch load is measured in
+G-E, and the shard count is chosen with headroom because it is hard to change.
 
-Ended games get no index entry. A client reconnecting after its game ended
-sends RESYNC for the game id it holds, and `resyncEnded` serves the result from
-the stream on any node. This replaces the in-memory `missedEnds` (#169, #172),
-which survives neither a restart nor a second node. A client that no longer
-holds the game id finds no live game, as on Lichess.
+**Recently ended.** A user who closes the tab mid-game, loses on time and
+reopens it holds no game id (the web client keeps `liveGameId` in memory only).
+Today `missedEnds` pushes the ended STATE on AUTHENTICATE. Stage 1 keeps that
+behaviour: AUTHENTICATE reads `user_recent_games`, pushes each ended STATE from
+the stream (`resyncEnded`), and deletes the entry, as today. This restores
+`missedEnds` durably instead of removing it.
+
+Stale entries. Every consumer folds the stream before acting. Adoption deletes
+the entries of any game whose stream is ended, and AUTHENTICATE does the same
+for the user's own rows. A periodic reconciliation of the whole index is not
+part of stage 1.
 
 **Scope.** This writes outside the event stream, so it touches ADR-16
 ("DynamoDB, game-event store only"). See D1.
@@ -139,14 +167,29 @@ holds the game id finds no live game, as on Lichess.
 ### 4.4 Adoption at start and on AUTHENTICATE
 
 - **At start.** The node queries every `live_games` shard and calls
-  `startGame(adopt)` for each game, oldest first, with bounded concurrency
-  (configured, starting at 32) so folding tens of thousands of games does not
-  starve connection handling. The node accepts connections immediately.
-- **On AUTHENTICATE.** The edge queries `user_live_games` for the user (newest
-  first, limit 8) and calls `startGame(resync)` for each game not yet adopted.
-  The registry shares one build per game (#174), so this is safe alongside the
-  start-up adoption. A reconnect storm costs one Query per user.
-- A game found ended is not started; its index entries are deleted.
+  `startGame(adopt)` for each game, with bounded concurrency (configured,
+  starting at 32) and a startup time budget, because folding goes through the
+  engine once per ply. Deadline-first order is not available without folding, so
+  the order is by id (oldest first); a fold that finds a due clock ends the game
+  at its first tick. The node accepts connections immediately.
+- **Transport state for an adopted game.** `startGame` lives in `Server`, not
+  `Registry`, because it arms the ticker (`armFlagTicker` calls
+  `broadcastGameEnd` and `dropGame`). It first reads the stream for the time
+  control, then builds the session. It fills the per-game user map and
+  `userGames` from the index entry's `seat`, so AUTHENTICATE binds the seat and
+  MOVE does not answer NOT_YOUR_SEAT.
+- **On AUTHENTICATE.** The edge queries `user_live_games` (newest first, limit
+  8) and `user_recent_games`, and calls `startGame(resync)` for each live game
+  not yet adopted. The registry shares one build per game (#174). A reconnect
+  storm costs two Queries per user.
+- **A failed lookup is defined.** If either Query fails, AUTHENTICATE fails
+  with a retryable `ERROR{INTERNAL}`; the connection is not marked
+  authenticated, so a SEEK cannot pair the user into a second game while the
+  first is live.
+- **An ambiguous opening.** If `createGame` times out, the matchmaker re-reads
+  the stream as `committedAnyway` does and treats a committed opening as paired,
+  so the index never shows a game the client was never told about.
+- A game found ended is not started; its live entries are deleted.
 
 ### 4.5 Clients and the frozen rules
 
@@ -158,16 +201,21 @@ Recovery never depends on a resend.
 
 **Clocks across a restart (Q1).** Nothing changes from today: a game's clocks
 run from stored timestamps, so restart downtime is charged to the player on
-move, and a rebuilt game below two plies can abort on its first-move timeout.
-This is the #207 problem at restart scale. Lichess gives +20 s on a restart.
-Stage 1 can ship before #207 only if the owner accepts this explicitly (Q1).
+move, and adoption flags any game whose mover ran out during the downtime. A
+rebuilt game below two plies can abort on its first-move timeout. This is the
+#207 problem at restart scale, and Lichess gives +20 s on a restart. So stage 1
+ships only while rated play is disabled (`SetRatedEnabled`, off by default since
+#179) until #207's credit lands, and only if the owner accepts this (Q1).
 
 ### 4.6 Failure modes and how #203 covers them (stage 1)
 
 | Failure | Behaviour | Test (invariant harness, #203) |
 |---|---|---|
 | Process killed between two writes of one command | Restart adopts the game; the half-terminal repair finishes the ending; I1 to I8 hold | kill at write k, rebuild, resume the same seeded command stream |
-| Killed after persist, before ack | No retransmit. The reconnect STATE shows the move; the rebuilt session adds no duplicate event (I6, I7) | kill after write, before ack |
+| Killed after persist, before ack | No retransmit. The reconnect STATE shows the move; the rebuilt session adds no duplicate event | kill after write, before ack |
+| Closed tab, lost on time, reopened | AUTHENTICATE pushes the ended STATE from `user_recent_games`, once | end a game with no client, reconnect |
+| Ending written through the lone-`GameEnded` repair path | The index deletes and recent-game puts are written too | half-terminal fault store |
+| AUTHENTICATE lookup fails | Retryable error, no SEEK allowed | fault store on the index |
 | Killed with both players disconnected | Adoption arms the deadline timer; the clock runs out and the game ends | kill, adopt, advance time, expect GAME_END |
 | Killed at ply 0 or 1 | No join timer on adopt; the first-move timeout bounds it | kill, adopt, advance past the timeout, expect abort |
 | Index entry for an ended game | Adoption deletes it | seed a stale entry, start |
@@ -198,9 +246,11 @@ It is written here so stage 1 does not close any door.
   by a stale owner) comes only from the store. Liveness (who takes over, when)
   comes from membership and timing, and a wrong liveness view costs a retry, not
   a corrupt stream.
-- **The claim is written only at takeover.** A game has no claim until a node
-  other than its pairing node takes it over. No claim means epoch 0, owned by
-  the pairing node, so games that never fail over stay on the stage 1 schema.
+- **The claim is written at every adoption, never at the opening.** A game has
+  no claim until some process adopts it, whether that is another node or a new
+  incarnation of the same node after a restart (a zombie old incarnation cannot
+  otherwise be told apart). No claim means epoch 0, owned by the pairing
+  incarnation, so games that are never adopted stay on the stage 1 schema.
   `OwnerClaimed{node_id, epoch, server_ts, gap_ms}` is appended at the head the
   taker folded. If another claim landed first, the append conflicts and the
   taker defers.
@@ -235,8 +285,11 @@ one hot item. The claim gives the same fence through the seq condition for free.
   dedicated goroutine that adoption load cannot starve. It is refreshed only
   while the node's own store writes recently succeeded, so a store-only
   partition makes the node leave membership and be adopted.
-- **Redis unavailable never stops play.** Safety comes from the store, so a
-  Redis outage does not fence anything. A node self-fences only on evidence: a
+- **A Redis outage does not fence anything.** Safety comes from the store, so
+  games keep playing. Liveness is weaker: a node that dies during a Redis outage
+  has its games frozen until membership returns. A whole-fleet store outage
+  expires every membership at once, so takeover also waits for the store, and
+  an idle node proves store health with a canary write. A node self-fences only on evidence: a
   conflict showing a newer claim, or loss of the store.
 - **No claim storms.** An observer may take a game only if its own refreshes
   succeeded for at least one TTL and the owner has been absent for at least one
@@ -251,8 +304,10 @@ one hot item. The claim gives the same fence through the seq condition for free.
 
 - **Detection** polls membership every 2 s. Keyspace events are not used.
 - **Who adopts.** The successor is the live node with the highest rendezvous
-  hash of `(game_id, node_id)`. The index gains a GSI on `owner_node` (set at
-  each claim, absent before one). On a membership change each node sweeps the
+  hash of `(game_id, node_id)`. `live_games` has a GSI on `owner_node`, which
+  stage 1 writes at the opening and each claim updates; the sweep tolerates its
+  eventual consistency by repeating until the departed node has no entries. On a
+  membership change each node sweeps the
   GSI for the departed node, every 5 to 10 s while any remain. This replaces
   v0.1's Redis set and the 60 s audit: one durable source, no cleanup of a
   50k-member set. The auditor of each shard has a standby (the second hash).
@@ -320,11 +375,13 @@ The harness needs fake membership and partition injection first (plan step 3).
 ## 7. Plan, in order, one PR each, each with an independent review
 
 **Stage 1**
-1. **Store API.** `AppendBatch` takes index operations. The two index tables,
-   MemStore support, and the contiguity tests against both stores.
-2. **Recovery.** `startGame` as the only constructor, the always-armed deadline
-   timer, adoption at start, AUTHENTICATE lookup, half-terminal repair, removal
-   of `missedEnds`. The #203 single-node crash phase. Uses `relates to` for #98.
+1. **Store API.** `Append` and `AppendBatch` take index operations; three
+   index tables; UUIDv7 game ids; `State.Players`; table checks in `store.New`;
+   MemStore support; the contiguity tests against both stores.
+2. **Recovery.** `startGame` (in `Server`) as the only constructor, the
+   always-armed deadline timer, adoption at start, AUTHENTICATE lookup with
+   `user_recent_games` replacing the in-memory `missedEnds`, half-terminal
+   repair. The #203 single-node crash phase. Uses `relates to` for #98.
 
 **Stage 2 (after stage 1 ships and D2 to D5 are answered)**
 3. **#187, the claim event and the harness pieces.** Fail-closed unknown-event
@@ -338,20 +395,22 @@ The harness needs fake membership and partition injection first (plan step 3).
 ## 8. Decisions for the owner
 
 **Needed before stage 1 code**
-- **D1. Index tables and ADR-16.** Recommended: two small DynamoDB tables for
-  live-game hints, written in the opening and ending transactions, recorded as an
+- **D1. Index tables and ADR-16.** Recommended: three small DynamoDB tables
+  (live games per user, live games per shard, recently ended per user), written
+  in the opening and ending transactions, recorded as an
   ADR-16 amendment limited to "live-game index hints" that ratifies nothing else
   about the platform. Alternatives: Redis only (not durable, so a Redis loss
   strands players and games, failing the zero-loss gate); a scan of
   `game_events` (cost grows with history).
 - **Q1. Restart downtime on the clock.** Recommended: accept today's rule
-  (downtime charged to the player on move) for stage 1, and design the credit
-  with #207 before stage 2. Alternative: land #207's credit first, so a restart
+  (downtime charged to the player on move) for stage 1, shipping only while
+  rated play is off, and design the credit with #207 before stage 2. Alternative: land #207's credit first, so a restart
   never costs a player a game. Stage 1 ships earlier under the recommendation.
 
 **Needed before stage 2 code (not now)**
-- **D2.** Claim only at takeover (recommended) or in every opening batch (every
-  game then needs the claim event on a rollback, a one-way door at launch).
+- **D2.** Claim at every adoption, never at the opening (recommended), or in
+  every opening batch (every game then needs the claim event on a rollback, a
+  one-way door at launch).
 - **D3.** Redis loss never stops play (recommended) or self-fence after a
   refresh gap.
 - **D4.** Peer link: direct gRPC streams between nodes (recommended) or a broker.
@@ -374,7 +433,8 @@ The harness needs fake membership and partition injection first (plan step 3).
 
 ## 10. Specs that change when this is accepted
 
-GS-3 §3.5 and §6 (the ownership guard, stage 2); GS-6 §3.2, §3.4, §5, §6.3
+GS-3 §3.5 and §6 (the ownership guard, stage 2); GS-7 `State.Players` and
+UUIDv7 game ids (stage 1); GS-6 §3.2, §3.4, §5, §6.3
 (AUTHENTICATE lookup in stage 1; reconnect to another node in stage 2); GS-7
 §3.5 (the rebuilt game's timers); GAME-SERVER Q-GS2 (closed by this spec);
 PROTOCOL §4A (the claim event, stage 2); ADR-16 (D1).
@@ -384,3 +444,21 @@ PROTOCOL §4A (the claim event, stage 2); ADR-16 (D1).
 The load balancer and TLS termination; the cloud product behind Redis; the
 final shard count and adoption concurrency (configured and measured in G-E);
 clock credit after a store outage (#207).
+
+## 12. Review of v0.2: what changed in v0.3
+
+| v0.2 finding | Answer in v0.3 |
+|---|---|
+| The ending transaction could not name its index keys | §4.3 UUIDv7 game ids, `game_id` as the sort key, `State.Players` |
+| Removing `missedEnds` regressed result delivery | §4.3 `user_recent_games`, same retention and consume-once behaviour as today |
+| The `owner_node` GSI missed games that never failed over | §4.3 `owner_node` written at the opening; §6.4 eventual consistency |
+| Other ending write paths, table checks, consistent reads | §4.3 rule for any write containing `GameEnded`, `store.New` checks, `ConsistentRead` |
+| Transport state of adopted games, where `startGame` lives | §4.4 |
+| A failed AUTHENTICATE lookup, an ambiguous opening | §4.4 |
+| Restart downtime flags games on every deploy | §4.5 stage 1 ships only with rated play off, until #207 |
+| Zombie old incarnation versus D2 | §4.1 incarnation id; §6.1 claim at every adoption |
+| Stage 2 liveness gaps | §6.3 |
+| Adoption order | §4.4 budget and bounded concurrency; deadline-first needs a fold, so not specified |
+
+The periodic reconciliation of stale index rows and the shard count are left to
+G-E (§11).
