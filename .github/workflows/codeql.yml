@@ -1,0 +1,55 @@
+name: codeql
+
+# CodeQL code scanning (#192). Findings appear under Security > Code scanning.
+# Not part of the `ci-ok` aggregate: the analysis runs for minutes and uploads
+# to GitHub rather than gating on a job result. To block merges on alerts, add
+# a code_scanning rule to the branch ruleset (docs/ops/BRANCH-PROTECTION.md).
+# Go does not support build-mode none, so it builds manually (the game server
+# links Rust staticlibs, built by `make lib`); the other languages need no build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 1"   # weekly, so a new query pack scans old code
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { language: go, build-mode: manual }
+          - { language: javascript-typescript, build-mode: none }
+          - { language: rust, build-mode: none }
+          - { language: python, build-mode: none }
+          - { language: actions, build-mode: none }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        if: matrix.language == 'go'
+        with:
+          go-version: "1.26"
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - name: Build Go (game-server needs the Rust staticlibs first)
+        if: matrix.language == 'go'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          make -C services/game-server lib
+          (cd services/game-server && go build ./...)
+          (cd services/accounts && go build ./...)
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

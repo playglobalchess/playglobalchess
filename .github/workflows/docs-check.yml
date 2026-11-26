@@ -1,11 +1,19 @@
 name: docs-check
 
+# Runs on EVERY pull request and every push to main (#117). It used to be
+# path-filtered, which would leave its required status `validate-docs` pending
+# forever on a code-only PR once branch protection is on. The check is a few
+# seconds of Python, so the filter saved nothing worth that risk. Do not add
+# `paths:` back: platform/ci/check_ci_filters.py is the audit for ci.yml only,
+# and this workflow has its own test (platform/ci/test_docs_check_workflow.py).
+
 on:
   push:
     branches: [main]
-    paths: ["docs/**", "protocol/codec/src/**", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
   pull_request:
-    paths: ["docs/**", "protocol/codec/src/**", "platform/ci/check_docs.py", ".github/workflows/docs-check.yml"]
+
+permissions:
+  contents: read
 
 jobs:
   validate-docs:

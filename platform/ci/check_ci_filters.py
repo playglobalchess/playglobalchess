@@ -48,6 +48,14 @@ The policy:
       install, and the one command; steps use only name/uses/with/run.
   P7  Triggers: on.pull_request has no restrictions (no branches, types or
       paths), on.push is exactly {branches: [main]}, no workflow-level paths.
+  P9  `ci-ok` (#117) is the one required check: `if: always()`, no
+      continue-on-error, `needs` is exactly every other job, and its steps feed
+      toJSON(needs) and the event name to platform/ci/ci_ok.py. A job added to
+      ci.yml and left out of `needs` fails here, so it cannot be skipped by the
+      aggregate. The verdict rules (what a skip may mean) are in ci_ok.py.
+  P10 SECURITY_JOBS (govulncheck, npm-audit, cargo-deny, secret-scan; #192) run
+      on every change: no `if`, `needs` or `continue-on-error`, so a skipped or
+      path-filtered security gate cannot be hollow.
   P8  Every expected gated job exists; a gate is exactly
       `needs.changes.outputs.X == 'true'` terms joined by `||`, plus
       `|| github.event_name == 'schedule'`, so the nightly runs every job no
@@ -97,6 +105,9 @@ LEAF_REQUIRED_PATTERNS = {"engine": ["engine/**", *ROOT_RUST_CONFIG],
                           "platform": ["platform/**", ".github/workflows/**"]}
 LEAF_CRATE_ROOTS = ["engine", "protocol"]
 INSTALL_CMD = "python3 -m pip install --require-hashes -r platform/ci/requirements-ci.txt"
+SECURITY_JOBS = ("govulncheck", "npm-audit", "cargo-deny", "secret-scan")
+CI_OK = "ci-ok"
+CI_OK_RUN = "python3 platform/ci/ci_ok.py"
 UNCONDITIONAL = {
     "ci-filter-audit": [INSTALL_CMD, "python3 platform/ci/check_ci_filters.py"],
     "rest-contract": ["python3 platform/ci/check_rest_contract.py"],
@@ -228,7 +239,7 @@ def jobs_that_run(text: str, changed: list[str], event: str = "pull_request") ->
         if job == "changes":
             continue
         expr = spec.get("if")
-        if expr is None:
+        if expr is None or str(expr).strip() == "always()":
             result.add(job)
             continue
         outs, _ = gate_outputs(expr)
@@ -413,6 +424,49 @@ def check_triggers(wf: dict, errors: list[str]) -> None:
             errors.append(f"{CI_YML_REL}: trigger {trig!r} has paths/paths-ignore, which would skip every job")
 
 
+def check_ci_ok(jobs: dict, errors: list[str]) -> None:
+    """P9: the aggregate job lists every other job and runs the verdict."""
+    where = f"{CI_YML_REL}: job {CI_OK!r}"
+    spec = jobs.get(CI_OK)
+    if not isinstance(spec, dict):
+        errors.append(f"{CI_YML_REL}: job {CI_OK!r} not found (the single required check, #117)")
+        return
+    if str(spec.get("if")).strip() != "always()":
+        errors.append(f"{where} must have `if: always()`, found {spec.get('if')!r}")
+    if "continue-on-error" in spec:
+        errors.append(f"{where} must not have continue-on-error")
+    needs = spec.get("needs")
+    want = sorted(set(jobs) - {CI_OK})
+    if not isinstance(needs, list) or sorted(map(str, needs)) != want:
+        missing = sorted(set(want) - set(needs if isinstance(needs, list) else []))
+        extra = sorted(set(needs if isinstance(needs, list) else []) - set(want))
+        errors.append(f"{where} must need every other job; missing {missing}, unknown {extra}")
+    env = spec.get("env") or {}
+    if env.get("NEEDS_JSON") != "${{ toJSON(needs) }}" or env.get("EVENT_NAME") != "${{ github.event_name }}":
+        errors.append(f"{where} env must pass NEEDS_JSON=toJSON(needs) and EVENT_NAME=github.event_name")
+    steps = spec.get("steps") or []
+    last = steps[-1] if steps and isinstance(steps[-1], dict) else {}
+    if str(last.get("run", "")).strip() != CI_OK_RUN or "if" in last or "continue-on-error" in last:
+        errors.append(f"{where} last step must run exactly {CI_OK_RUN!r} with no if/continue-on-error")
+    if any(isinstance(st, dict) and ("if" in st or "continue-on-error" in st) for st in steps):
+        errors.append(f"{where} steps must not have if/continue-on-error")
+
+
+def check_security_jobs(jobs: dict, errors: list[str]) -> None:
+    """P10: security gates run on every change."""
+    for name in SECURITY_JOBS:
+        spec = jobs.get(name)
+        if not isinstance(spec, dict):
+            errors.append(f"{CI_YML_REL}: security job {name!r} not found (#192)")
+            continue
+        for key in ("if", "needs", "continue-on-error"):
+            if key in spec:
+                errors.append(f"{CI_YML_REL}: security job {name!r} must run on every change: no {key!r}")
+        for st in spec.get("steps") or []:
+            if isinstance(st, dict) and ("if" in st or "continue-on-error" in st):
+                errors.append(f"{CI_YML_REL}: security job {name!r} steps must not have if/continue-on-error")
+
+
 def check(repo: Path, text: str) -> list[str]:
     errors: list[str] = []
     try:
@@ -500,6 +554,9 @@ def check(repo: Path, text: str) -> list[str]:
         check_cargo_leaf(repo, root, errors)
         check_rust_sources_leaf(repo, root, errors)
     check_gradle_leaf(repo, filters.get("mobile", []), errors)
+
+    check_ci_ok(jobs, errors)                                                # P9
+    check_security_jobs(jobs, errors)                                        # P10
 
     for job, commands in UNCONDITIONAL.items():                              # P6
         check_unconditional(job, jobs.get(job), commands, errors)

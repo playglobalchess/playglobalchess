@@ -23,7 +23,7 @@ import check_ci_filters as c  # noqa: E402
 REAL = (c.REPO / c.CI_YML_REL).read_text(encoding="utf-8")
 GATED = set(c.LEAF_GATES) | set(c.CONSUMER_GATES)
 NIGHTLY_ONLY = {"engine-nightly-perft", "engine-perf-bench"}
-AUDITS = {"ci-filter-audit", "rest-contract"}
+AUDITS = {"ci-filter-audit", "rest-contract", "ci-ok", *c.SECURITY_JOBS}
 
 ENGINE_GATE = "if: ${{ needs.changes.outputs.engine == 'true' || github.event_name == 'schedule' }}"
 E2E_GATE = "if: ${{ needs.changes.outputs.e2e == 'true' || github.event_name == 'schedule' }}"
@@ -437,6 +437,50 @@ class LeafTest(unittest.TestCase):
                 (self.root / f).unlink()
         (self.root / "gradle").mkdir()
         self.assertIn("'gradle/**'", self.gradle_errors())
+
+
+class CiOkAuditTest(unittest.TestCase):
+    """P9 and P10 (#117, #192): the aggregate lists every job, security gates always run."""
+
+    def test_real_workflow_is_clean(self) -> None:
+        self.assertEqual(errors_for(REAL), "")
+
+    def test_a_job_missing_from_ci_ok_needs_fails(self) -> None:
+        bad = mutate("      - engine-perf-bench\n", "")
+        self.assertIn("missing ['engine-perf-bench']", errors_for(bad))
+
+    def test_a_new_job_not_added_to_ci_ok_fails(self) -> None:
+        bad = REAL.rstrip("\n") + "\n\n  brand-new:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        self.assertIn("missing ['brand-new']", errors_for(bad))
+
+    def test_ci_ok_must_run_always(self) -> None:
+        bad = mutate("    if: always()\n", "")
+        self.assertIn("must have `if: always()`", errors_for(bad))
+
+    def test_ci_ok_must_run_the_verdict_last(self) -> None:
+        bad = mutate("run: python3 platform/ci/ci_ok.py", "run: echo ok")
+        self.assertIn("last step must run exactly", errors_for(bad))
+
+    def test_ci_ok_must_pass_needs_json(self) -> None:
+        bad = mutate("NEEDS_JSON: ${{ toJSON(needs) }}", "NEEDS_JSON: '{}'")
+        self.assertIn("env must pass NEEDS_JSON", errors_for(bad))
+
+    def test_ci_ok_cannot_continue_on_error(self) -> None:
+        bad = mutate("    if: always()\n", "    if: always()\n    continue-on-error: true\n")
+        self.assertIn("must not have continue-on-error", errors_for(bad))
+
+    def test_security_job_cannot_be_gated(self) -> None:
+        bad = mutate("  govulncheck:\n    runs-on: ubuntu-latest\n",
+                     "  govulncheck:\n    needs: changes\n    if: ${{ needs.changes.outputs.services == 'true' || github.event_name == 'schedule' }}\n    runs-on: ubuntu-latest\n")
+        self.assertIn("security job 'govulncheck' must run on every change", errors_for(bad))
+
+    def test_security_job_step_cannot_be_skipped(self) -> None:
+        bad = mutate("      - name: gitleaks over the full git history", "      - if: false\n        name: gitleaks over the full git history")
+        self.assertIn("security job 'secret-scan' steps must not have if/continue-on-error", errors_for(bad))
+
+    def test_security_job_cannot_be_removed(self) -> None:
+        bad = mutate("  npm-audit:\n", "  npm-audit-renamed:\n")
+        self.assertIn("security job 'npm-audit' not found", errors_for(bad))
 
 
 if __name__ == "__main__":

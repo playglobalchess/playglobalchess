@@ -28,7 +28,7 @@ A change to a **shared contract** (`protocol/`, the event schema, the entity mod
 
 ## 3. Branching & commits
 
-> **`main` is protected by CONVENTION, not yet by enforcement.** GitHub branch protection and rulesets require the GitHub **Team** plan on a private repo; this org is on Free, so the guard is not yet mechanically enforced. **Rule until then: never push directly to `main`, never force-push it — always open a PR and merge through the UI.** (Agents are already blocked from pushing to `main` by the Kiro Crew safety policy.) When the org upgrades to Team, real protection — required PR, required CI, required CODEOWNERS review, no force-push/deletion — gets applied and this note goes away.
+> **`main` is protected by CONVENTION, not yet by enforcement.** The repo is public, so rulesets are available. The ruleset and its required checks (`ci-ok`, `validate-docs`) are committed in `.github/rulesets/main.json` and explained in `docs/ops/BRANCH-PROTECTION.md`, but it has not been applied, so the guard is not yet mechanically enforced. **Rule until then: never push directly to `main`, never force-push it — always open a PR and merge through the UI.** (Agents are already blocked from pushing to `main` by the Kiro Crew safety policy.) When the ruleset is applied (required PR, required CI, no force-push or deletion; CODEOWNERS review once the teams have members), this note goes away.
 
 - Branch from `main`: `feat/F-01-play-online`, `fix/X-2-reconnect`, `docs/adr-11-matchmaking`, `chore/ci`.
 - Never push directly to `main` — open a PR.

@@ -28,7 +28,9 @@
 - **Fail-safe filters (#160, closes #86 and #87).** `services`, `web` and `web-e2e` run on every change except docs and other applications, so a `protocol/` or `engine/` change always runs them. `rest-contract` and `ci-filter-audit` run on every change. Leaf jobs (`engine`, `protocol`, `mobile`, `platform`, `protocol-parity`) keep owner filters. `platform/ci/check_ci_filters.py` enforces the policy.
 - **Nightly runs every job** (each gate has a schedule bypass), plus the slow perft corpus and the perf bench.
 - `protocol-parity` (macOS, Swift run + Kotlin compile) is a **hard gate**.
-- **Known CI gaps (open issues):** `engine-cgo` has no gate (#114); toolchains, images and actions are not pinned (#115); nightly failures are silent (#116); branch protection is not enforced (#117); stub jobs pass by finding nothing (#146).
+- **Security gates (#192), run on every change:** `govulncheck` (both Go modules), `npm-audit` (web runtime deps), `cargo-deny` (advisories and sources, every `Cargo.lock`, policy in `deny.toml`) and `secret-scan` (gitleaks over the full history, policy in `.gitleaks.toml`). CodeQL runs in its own workflow (`codeql.yml`) and is not part of `ci-ok`. Dependabot security updates and GitHub secret scanning with push protection are on. Not covered yet: licence checks (no project licence is decided) and dependency-review on PRs.
+- **Required-check design (#117):** one aggregate job, `ci-ok`, needs every other `ci` job and fails on a failure, a cancellation, or a skip its path gate does not justify (`platform/ci/ci_ok.py`). `docs-check` now runs on every PR so `validate-docs` always reports.
+- **Known CI gaps (open issues):** `engine-cgo` has no gate (#114); toolchains, images and actions are not pinned (#115); nightly failures are silent (#116); branch protection is designed but not yet applied (#117, `docs/ops/BRANCH-PROTECTION.md`); stub jobs pass by finding nothing (#146).
 - **Flaky (closed):** `TestRedis_ConcurrentMutualPairCreatesOneGame`. The 2026-11-10 nightly failed with 2 matches, the #90 race that #165 fixed, and the first nightly after the fix (2026-11-11) was green, so #76 is closed. #76 originally reported 0 matches, which #90 does not obviously explain, so one green night is weak evidence: reopen #76 if a 0-match failure returns.
 
 ## Open work (62 open issues on 2026-11-12, after #172)
@@ -46,16 +48,16 @@
 | Domain | `playglobalchess.com` at **Cloudflare** (DNS authoritative). |
 | Email | Zoho Mail, **India data center** (`.zoho.in`). Primary mailbox `chess@playglobalchess.com`. MX = `mx.zoho.in`/`mx2`/`mx3`. DKIM/DMARC and aliases/groups per `email-domain-setup.md` were still to finish (not re-checked). |
 | GitHub org | `playglobalchess`, owned by `playglobalchess-admin`. A personal account `geniiashu-chessarena` also has CLI auth on this machine. |
-| Repo | `playglobalchess/playglobalchess`, PRIVATE, default branch `main`. PRs are squash-merged. |
+| Repo | `playglobalchess/playglobalchess`, PUBLIC (since 2026-11-26), default branch `main`. PRs are squash-merged. |
 | Teams | 10 created: engine, realtime, platform-team, platform-eng, web, mobile, trust-safety, learn-content, community, architecture. |
-| Branch protection | **NOT enforced** (#117). The GitHub **Free** plan blocks classic protection and rulesets on private repos. `main` is protected by convention, the Kiro Crew policy and the preToolUse guard hook. Fix: upgrade the org to GitHub Team, then apply a ruleset with a real required-check design. |
+| Branch protection | **NOT applied yet** (#117). The repo is public, so rulesets are available. The ruleset (`.github/rulesets/main.json`) and the required checks (`ci-ok`, `validate-docs`) are committed; applying it is the owner's call, see `docs/ops/BRANCH-PROTECTION.md`. Until then `main` is protected by convention, the Kiro Crew policy and the preToolUse guard hook. |
 | Production data | None exists. Wire and event-format changes need no migration (owner decision Q-V3, 2026-11-09). |
 
 ## Decisions locked (details in MASTER-PLAN ADRs)
 ADR-1 Glicko-2 per pool · ADR-2 anti-cheat in-house · ADR-3 N-seat container · ADR-4 variant rules pinned · ADR-5 1-52 numbering · ADR-6 global launch, COPPA as needed · ADR-7 i18n-ready P0 · ADR-8 freemium · ADR-9 native + shared Rust core · ADR-10 Postgres + event store + Redis + columnar, WS binary · ADR-11 Rust engine · ADR-12 Go services · ADR-14 one wire codec · ADR-15 uniform Go-Rust cgo C-ABI · ADR-17 RESYNC and DRAW_OFFERED · ADR-18 `MOVE_ACCEPTED` carries `uci` · **ADR-19 takeback consent, draw decline, `ClockStarted`, full STATE (DECIDED 2026-11-09 on the owner's attestation that S2, S4, PE, S6 and the architecture group approved).**
 
 ## Outstanding owner/human actions (not buildable by Kiro)
-1. Upgrade the GitHub org to Team, then real branch protection and CODEOWNERS enforcement (#117).
+1. Apply the branch ruleset (`docs/ops/BRANCH-PROTECTION.md`), then turn on CODEOWNERS enforcement once the teams have members (#117).
 2. Finish Zoho DKIM/DMARC and create aliases/groups (`email-domain-setup.md`).
 3. Approve each spec before Kiro implements it (spec-first). GS-7 is approved; the X-3 handle spec (#134) needs a decision before sign-up work.
 4. Legal: confirm per-market compliance specifics before G-F (ADR-6).
