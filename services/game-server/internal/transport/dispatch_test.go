@@ -19,7 +19,10 @@ import (
 // lets the whole message flow be driven without a real WebSocket (Q-GS6a: the
 // Conn interface exists for exactly this).
 type fakeConn struct {
-	in     chan []byte
+	in chan []byte
+	// gone is closed by Close. Senders select on it, so feeding a connection
+	// the server has closed neither panics nor races with the close (#204).
+	gone   chan struct{}
 	mu     sync.Mutex
 	out    [][]byte
 	seen   int // how many out frames have been consumed by waitForServer
@@ -30,16 +33,23 @@ type fakeConn struct {
 	stall atomic.Bool
 }
 
-func newFakeConn() *fakeConn { return &fakeConn{in: make(chan []byte, 16)} }
+func newFakeConn() *fakeConn {
+	return &fakeConn{in: make(chan []byte, 16), gone: make(chan struct{})}
+}
 
 func (f *fakeConn) Read(ctx context.Context) ([]byte, error) {
+	// Frames queued before Close are still delivered first, as before.
+	select {
+	case b := <-f.in:
+		return b, nil
+	default:
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case b, ok := <-f.in:
-		if !ok {
-			return nil, context.Canceled
-		}
+	case <-f.gone:
+		return nil, context.Canceled
+	case b := <-f.in:
 		return b, nil
 	}
 }
@@ -62,7 +72,7 @@ func (f *fakeConn) Close() error {
 	defer f.mu.Unlock()
 	if !f.closed {
 		f.closed = true
-		close(f.in)
+		close(f.gone)
 	}
 	return nil
 }
@@ -76,7 +86,10 @@ func (f *fakeConn) feedClient(t *testing.T, m codec.ClientMsg) {
 	if err != nil {
 		t.Fatalf("encode client: %v", err)
 	}
-	f.in <- frame
+	select {
+	case f.in <- frame:
+	case <-f.gone:
+	}
 }
 
 // sent returns a copy of all server messages written to this conn, decoded.

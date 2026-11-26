@@ -362,6 +362,15 @@ jobs:
           else
             echo "::notice::services/accounts has no go.mod yet — stub, no build."
           fi
+      - name: Fuzz the WebSocket dispatch (#204)
+        run: |
+          # `make test` above already replays the committed seeds. This step
+          # mutates them: 30 s per commit, 10 min on the nightly schedule. A
+          # crash writes testdata/fuzz/FuzzDispatch/<hash>; commit it as a
+          # regression seed with the fix.
+          if [ "${{ github.event_name }}" = "schedule" ]; then t=10m; else t=30s; fi
+          cd services/game-server
+          go test -count=1 ./internal/transport/ -run '^$' -fuzz=FuzzDispatch -fuzztime="$t" -parallel=2
 
   web:
     needs: changes
