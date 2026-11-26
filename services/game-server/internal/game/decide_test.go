@@ -1139,6 +1139,21 @@ func TestFirstMoveRule(t *testing.T) {
 		assertAborted(t, m.do(CmdTickFlag{}, 1))
 	})
 
+	t.Run("a takeback to ply 1 stops the clock and restarts the timeout", func(t *testing.T) {
+		m := newSim(t, false)
+		m.move(1_000)
+		m.move(1_000)
+		m.do(CmdProposeTakeback{By: black}, 10) // black undoes its own first move
+		m.do(CmdAcceptTakeback{By: white, AtPly: 2}, 10)
+		if m.s.Ply != 1 || m.s.RunningSeat() != NoSeat {
+			t.Fatalf("ply %d running %d, want ply 1 and no running clock", m.s.Ply, m.s.RunningSeat())
+		}
+		if d := m.do(CmdTickFlag{}, blitzTimeout); len(d.Events) != 0 {
+			t.Fatalf("timeout counted from before the rewind: %+v", d)
+		}
+		assertAborted(t, m.do(CmdTickFlag{}, 1))
+	})
+
 	t.Run("the override beats the time control", func(t *testing.T) {
 		m := newSim(t, false)
 		m.opts.FirstMoveTimeoutMs = 100

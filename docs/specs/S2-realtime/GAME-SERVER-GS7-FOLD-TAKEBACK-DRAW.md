@@ -204,6 +204,13 @@ sides without charging time or granting increment while no timer runs):
 4. The join window (`joinTTL`, 30 s) no longer drains a clock, because none runs.
    It still aborts a game nobody joined.
 
+The timeout baseline is the durable `LastChangeTS`, not a node's start time, so a
+failover after an outage longer than the remaining window aborts on the new
+node's first tick: nobody is penalised and the abort carries no result. The
+window includes the time to connect and join (`ClockStarted` is appended at
+`deliverMatched`). A future rating consumer must treat `Termination == ABORT`
+as unrated: its `[Draw, Draw]` result vector must not count as a draw.
+
 No event shape changes (`ClockStarted`, `MovePlayed`, `TakebackRewound` carry what
 they carried). Rebuild is exact: the rule reads only `Ply`, `LastChangeTS` and the
 time control. `FoldOptions.FirstMoveTimeoutMs` overrides the timeout for tests.
