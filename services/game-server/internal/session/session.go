@@ -51,6 +51,10 @@ type Session struct {
 	// needReload is set after a command panicked: the next command rebuilds
 	// the projection from the store first.
 	needReload bool
+	// stale is set when a write could not be confirmed: the projection may be
+	// behind the store. The next command tries to rebuild, and carries on if
+	// it cannot (a seq conflict on its write heals it).
+	stale bool
 }
 
 // Config bundles a Session's dependencies. Now may be nil (time.Now).
@@ -186,6 +190,10 @@ func (s *Session) exec(ctx context.Context, cmd game.Command) (game.Decision, er
 			if s.committedAnyway(ctx, s.st.NextSeq, d.Events) {
 				return d, nil
 			}
+			// Unconfirmed: the write may have landed (the deadline or an outage
+			// can also fail the re-read), so the projection may be behind the
+			// store. Try a rebuild before the next command (#125).
+			s.stale = true
 			return game.Decision{}, fmt.Errorf("session: persist: %w", err)
 		}
 		if attempt >= maxConflictRetries {
@@ -280,6 +288,13 @@ func (s *Session) applyRecovered(ctx context.Context, cmd command) {
 		}
 		s.needReload = false
 	}
+	if s.stale {
+		// Best effort: during an outage the rebuild fails too, and the command
+		// then runs as before so its write is still attempted.
+		if err := s.reload(cctx); err == nil {
+			s.stale = false
+		}
+	}
 	cmd.apply(cctx, s)
 }
 
@@ -308,10 +323,17 @@ func (s *Session) dispatch(ctx context.Context, c command, done <-chan struct{})
 	case s.commands <- c:
 	}
 	select {
-	case <-s.quit:
-		return errSessionClosed
 	case <-done:
 		return nil
+	case <-s.quit:
+		// Run's exit closes quit right after a command's finish closes done, so
+		// both can be ready: a command that finished is never reported closed.
+		select {
+		case <-done:
+			return nil
+		default:
+			return errSessionClosed
+		}
 	}
 }
 

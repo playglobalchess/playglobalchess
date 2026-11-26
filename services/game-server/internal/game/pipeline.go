@@ -81,9 +81,9 @@ type MoveOutcome struct {
 var (
 	// ErrGameNotLive: the action needs a live game (its events are Live-only).
 	ErrGameNotLive = errors.New("game: action requires a live game")
-	// ErrAbortTooLate: past abortBeforePly a quit is a resign, not an abort.
+	// ErrSeatOutOfRange: a command named a seat the game does not have.
 	ErrSeatOutOfRange = errors.New("game: seat out of range")
-
+	// ErrAbortTooLate: past abortBeforePly a quit is a resign, not an abort.
 	ErrAbortTooLate = errors.New("game: too late to abort (game started) — resign instead")
 	// ErrNoDrawToAccept: AcceptDraw found no pending offer from the other seat.
 	ErrNoDrawToAccept = errors.New("game: no pending draw offer to accept")

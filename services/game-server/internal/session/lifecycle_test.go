@@ -145,3 +145,77 @@ func TestHungStoreBoundedByCommandTimeout(t *testing.T) {
 		t.Fatalf("game stayed frozen after the store recovered: %v", err)
 	}
 }
+
+type cancelCmd struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (c *cancelCmd) apply(context.Context, *Session) { c.cancel() }
+func (c *cancelCmd) fail(error)                      {}
+func (c *cancelCmd) finish()                         { close(c.done) }
+
+// A command that finished is never reported as closed, even when Run exits
+// right after it (review of #208: done and quit were both ready).
+func TestFinishedCommandNotReportedClosed(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		s, _, cancel := seedLive(t, startFEN, false, time.Now)
+		c := &cancelCmd{cancel: cancel, done: make(chan struct{})}
+		if err := s.dispatch(context.Background(), c, c.done); err != nil {
+			t.Fatalf("run %d: finished command reported %v", i, err)
+		}
+	}
+}
+
+// ambiguousStore commits the write, then reports the deadline error, and
+// fails reads once the context has ended: the re-read cannot confirm.
+type ambiguousStore struct {
+	*game.MemStore
+	on atomic.Bool
+}
+
+func (a *ambiguousStore) Append(ctx context.Context, id string, seq uint32, ev game.Event) error {
+	if a.on.Load() {
+		if err := a.MemStore.Append(context.Background(), id, seq, ev); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return a.MemStore.Append(ctx, id, seq, ev)
+}
+
+func (a *ambiguousStore) Load(ctx context.Context, id string) ([]game.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return a.MemStore.Load(ctx, id)
+}
+
+// A write that landed but could not be confirmed leaves the projection to be
+// rebuilt, so the next command sees it instead of a stale state.
+func TestUnconfirmedWriteRebuildsBeforeNextCommand(t *testing.T) {
+	_, mem, cancel0 := seedLive(t, startFEN, false, time.Now)
+	cancel0()
+	as := &ambiguousStore{MemStore: mem}
+	s, err := NewSession(context.Background(), Config{
+		GameID: gameID, Store: as, Oracle: mustOracle(t),
+		Opts:           game.FoldOptions{TimeControl: clock.TimeControl{BaseMs: 300_000, IncrementMs: 3_000}},
+		CommandTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(rctx)
+	as.on.Store(true)
+	if _, err := s.SubmitMove(context.Background(), 0, 1, "e2e4", 1); err == nil {
+		t.Fatal("unconfirmed write reported success")
+	}
+	as.on.Store(false)
+	snap, err := s.StateSnapshot(context.Background())
+	if err != nil || snap.Ply != 1 {
+		t.Fatalf("snapshot after the unconfirmed write: ply=%d err=%v, want ply 1", snap.Ply, err)
+	}
+}

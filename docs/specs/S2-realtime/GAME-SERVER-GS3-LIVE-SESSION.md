@@ -295,8 +295,15 @@ tweak.
     then untrusted, so the next command first rebuilds it from the store. A
     failed rebuild fails that command and is retried on the next.
   - *Seats:* `Resign` and `Abort` refuse an out-of-range seat with
-    `ErrSeatOutOfRange` before any append. `SystemActor` (0xFF) is allowed
-    only for the join-timeout abort.
+    `ErrSeatOutOfRange` before any append. `SystemActor` (0xFF) is also
+    accepted as the aborter (the fold allows it); today's join timeout aborts
+    with seat 0, and no wire path can send 0xFF.
+  - *Unconfirmed writes:* a persist error whose re-read cannot confirm the
+    write (the deadline or an outage can fail the re-read too) makes the
+    next command try a rebuild first (best effort: if the store is still
+    down it runs anyway, and a seq conflict on its write heals the
+    projection), so a stale projection is not served once the store is back. A command that finished is never
+    reported as closed, even when Run exits at that moment.
 - **Q-GS3B — where the repetition plumbing lands — PROPOSED (a: one coordinated
   interface change here).** Closing Q-GS5 needs the `LegalityOracle` to accept
   the prior Zobrist history and the `LegalityVerdict` to carry the resulting
