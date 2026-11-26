@@ -122,6 +122,8 @@ function GameView({ token }: { token: string }): React.JSX.Element {
         <button
           type="button"
           disabled={state.phase === "seeking"}
+          // Unrated because the UI offers no rated game yet. The server decides
+          // whether rated is allowed (#179); this is not the gate.
           onClick={() => commands.seek(DEV_POOL, DEV_TIME_CONTROL, false)}
         >
           {t("seek.action")}

@@ -117,6 +117,14 @@ func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec
 		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "empty SEEK"))
 		return true
 	}
+	// Rated play is a server policy, never the client's choice (#179): with the
+	// switch off, a rated SEEK is refused before any pool lookup and nothing is
+	// enqueued, so a client cannot start a rated game by setting a bit.
+	if p.Rated && !s.ratedEnabled.Load() {
+		log.Printf("transport: SEEK refused for user %s: rated play is not enabled", st.userID)
+		s.send(ctx, c, errorMsg(codec.ECProtocolViolation, "rated play is not available"))
+		return true
+	}
 	// The pool decides the clock, not the client (#93): refuse an unknown pool or
 	// a time_control other than the pool's, and check the control resolves,
 	// all BEFORE enqueue, so a bad value can never create a durable game.

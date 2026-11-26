@@ -119,6 +119,7 @@ takes at most two deadlines.
 
 ### 3.2 Dispatch & matchmaking
 
+- **Rated play is a server switch (#179), off by default** (`Server.SetRatedEnabled`). While it is off, a `SEEK` with `rated=true` is refused with `ERROR{PROTOCOL_VIOLATION}` ("rated play is not available"), logged, before the pool lookup, with nothing enqueued and no game created. The connection stays open. MASTER-PLAN Part V: nothing ships to a rated environment until G-A, G-B and G-C are green, so the server, not the web client, enforces it. Nothing enables it yet; the operator setting arrives with the rating service (X-3).
 - `SEEK` is validated BEFORE enqueue (#93): `pool_id` must be in the pool
   catalogue (interim: `transport.DefaultPools`, until `GET /v1/pools`, X-13; see
   GS5 §3.1) and `time_control` must equal that pool's, else
