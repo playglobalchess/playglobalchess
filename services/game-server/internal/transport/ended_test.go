@@ -187,6 +187,7 @@ func TestMissedEnd_FlagWhileOffline(t *testing.T) {
 	ma := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
 	gameID := ma.Matched.GameID
+	openTiny(t, ca, cb, ma)
 	white, whiteUser := ca, "alice"
 	if ma.Matched.SeatIdx != 0 {
 		white, whiteUser = cb, "bob"

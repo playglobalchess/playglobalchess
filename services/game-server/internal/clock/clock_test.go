@@ -212,3 +212,31 @@ func TestFlagBoundary(t *testing.T) {
 		t.Errorf("flagged remaining = %d, want 0", over.RemainingMs[0])
 	}
 }
+
+// #124: Lichess's first-move timeout table, keyed by estimated duration
+// BaseMs + 40*IncrementMs (scalachess Speed ranges).
+func TestFirstMoveTimeoutMs(t *testing.T) {
+	cases := []struct {
+		name      string
+		base, inc int64
+		want      int64
+	}{
+		{"ultrabullet 15+0", 15_000, 0, 15_000},
+		{"ultrabullet edge 29s", 29_000, 0, 15_000},
+		{"bullet 30s", 30_000, 0, 20_000},
+		{"bullet 1+0", 60_000, 0, 20_000},
+		{"bullet 2+1 (estimate 160 s)", 120_000, 1_000, 20_000},
+		{"blitz edge 180 s", 180_000, 0, 25_000},
+		{"blitz 5+3 (estimate 420 s)", 300_000, 3_000, 25_000},
+		{"rapid edge 480 s", 480_000, 0, 30_000},
+		{"rapid 10+5 (estimate 800 s)", 600_000, 5_000, 30_000},
+		{"classical edge 1500 s", 1_500_000, 0, 35_000},
+		{"classical 30+20", 1_800_000, 20_000, 35_000},
+		{"correspondence 6 h", 21_600_000, 0, 0},
+	}
+	for _, c := range cases {
+		if got := (TimeControl{BaseMs: c.base, IncrementMs: c.inc}).FirstMoveTimeoutMs(); got != c.want {
+			t.Errorf("%s: %d, want %d", c.name, got, c.want)
+		}
+	}
+}

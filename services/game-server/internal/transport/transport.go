@@ -181,6 +181,9 @@ type Registry struct {
 	oracle   game.LegalityOracle
 	resolver TimeControlResolver
 	now      func() time.Time // optional clock injector for tests; nil = session default (time.Now)
+	// firstMoveTimeoutMs overrides the time control's first-move timeout (#124)
+	// when > 0. Tests only; production leaves it zero.
+	firstMoveTimeoutMs int64
 
 	mu       sync.Mutex
 	sessions map[string]*registered
@@ -222,7 +225,7 @@ func (r *Registry) GetOrCreate(gameID, timeControlID string) (*session.Session, 
 		GameID: gameID,
 		Store:  r.store,
 		Oracle: r.oracle,
-		Opts:   game.FoldOptions{TimeControl: tc},
+		Opts:   game.FoldOptions{TimeControl: tc, FirstMoveTimeoutMs: r.firstMoveTimeoutMs},
 	}
 	if r.now != nil {
 		cfg.Now = r.now
@@ -305,7 +308,7 @@ func (r *Registry) loadEnded(ctx context.Context, gameID, uid string) (st game.S
 	if err != nil {
 		return game.State{}, opts, seat, true, err
 	}
-	opts = game.FoldOptions{TimeControl: tc}
+	opts = game.FoldOptions{TimeControl: tc, FirstMoveTimeoutMs: r.firstMoveTimeoutMs}
 	st, err = game.FoldWithEngine(ctx, events, opts, r.oracle)
 	if err != nil {
 		return game.State{}, opts, seat, true, err

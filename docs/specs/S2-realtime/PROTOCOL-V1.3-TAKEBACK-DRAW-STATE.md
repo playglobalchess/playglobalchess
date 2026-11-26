@@ -165,4 +165,4 @@ the new codes are in `PROTOCOL.md` §4A.2.
 
 None blocking. Decided by the owner on 2026-11-09: Q-V1 (drop undecodable server
 frames), Q-V2 (full #101 STATE in this amendment), Q-V3 (no production data). Deferred
-by ADR-19: opponent identity in `STATE` (#131), first-clock rule (#124).
+by ADR-19: opponent identity in `STATE` (#131), first-clock rule (#124, decided in GS-7 §3.5: no clock before both seats have moved).

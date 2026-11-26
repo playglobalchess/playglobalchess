@@ -171,9 +171,10 @@ func (s State) LastMoveTerminal() *Termination {
 }
 
 // RunningSeat is the seat whose clock is running, or NoSeat: none before the
-// clock has started, after a flag, and once the game has ended.
+// clock has started, before both seats have moved (#124), after a flag, and
+// once the game has ended.
 func (s State) RunningSeat() int {
-	if s.Phase != PhaseLive || !s.ClockStartedSet || s.HalfTerminal != nil || s.Clock.Flagged() {
+	if s.Phase != PhaseLive || !s.ClockStartedSet || s.Ply < firstMovePlies || s.HalfTerminal != nil || s.Clock.Flagged() {
 		return NoSeat
 	}
 	return int(s.TurnIdx)
@@ -210,6 +211,22 @@ func (s State) ClocksAt(nowMs uint64, tc clock.TimeControl) []int64 {
 // (the stream carries only the TimeControlId string).
 type FoldOptions struct {
 	TimeControl clock.TimeControl
+	// FirstMoveTimeoutMs overrides TimeControl.FirstMoveTimeoutMs when > 0
+	// (tests with tiny clocks; production leaves it zero).
+	FirstMoveTimeoutMs int64
+}
+
+// firstMovePlies is the number of plies played without a running clock: each
+// side's first move is clockless (#124, as on Lichess). The clocks start once
+// both seats have moved.
+const firstMovePlies = 2
+
+// firstMoveTimeoutMs is the first-move timeout in force (0: none).
+func (o FoldOptions) firstMoveTimeoutMs() int64 {
+	if o.FirstMoveTimeoutMs > 0 {
+		return o.FirstMoveTimeoutMs
+	}
+	return o.TimeControl.FirstMoveTimeoutMs()
 }
 
 // initialState is the state before any event.

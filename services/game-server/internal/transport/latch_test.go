@@ -117,6 +117,7 @@ func TestEveryEndingReclaimsTheGame(t *testing.T) {
 		seekTC(t, cb, "bob", "tiny")
 		m := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 		cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+		openTiny(t, ca, cb, m)
 		ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
 		cb.waitForServer(t, codec.SMGameEnd, 2*time.Second)
 		wantReclaimed(t, h, w, m.Matched.GameID)

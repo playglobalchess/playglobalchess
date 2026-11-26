@@ -239,6 +239,7 @@ func TestFlagWithStalledPeerStillEndsGame(t *testing.T) {
 	seekTC(t, cb, "bob", "tiny")
 	ma := ca.waitForServer(t, codec.SMMatched, 2*time.Second)
 	cb.waitForServer(t, codec.SMMatched, 2*time.Second)
+	openTiny(t, ca, cb, ma)
 	cb.stall.Store(true)
 
 	ge := ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)

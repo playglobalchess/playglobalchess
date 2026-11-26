@@ -25,7 +25,8 @@ func tableSim(t *testing.T, upTo uint32) *sim {
 	for i := uint32(0); i < upTo; i++ {
 		m.move(think[i])
 	}
-	want := []int64{301_000, 298_000, 294_000, 297_000, 291_000}
+	// Plies 1 and 2 are clockless (#124): no charge, no increment.
+	want := []int64{300_000, 300_000, 293_000, 299_000, 290_000}
 	for i := uint32(0); i < upTo; i++ {
 		if got := int64(m.s.History[i].ClockAfterMs); got != want[i] {
 			t.Fatalf("ply %d clock_after = %d, want %d", i+1, got, want[i])
@@ -51,10 +52,10 @@ func TestTakebackClockTable(t *testing.T) {
 		toPly      uint32
 		w, b       int64
 	}{
-		{"B proposes after ply4, W accepts", 4, black, 0, 3, 294_000, 297_000},
-		{"W proposes after ply4, B accepts", 4, white, 0, 2, 294_000, 298_000},
-		{"W proposes after ply4, plays ply5, B accepts", 4, white, 1, 2, 294_000, 298_000},
-		{"W proposes at ply2, B accepts", 2, white, 0, 0, 301_000, 300_000},
+		{"B proposes after ply4, W accepts", 4, black, 0, 3, 293_000, 299_000},
+		{"W proposes after ply4, B accepts", 4, white, 0, 2, 293_000, 300_000},
+		{"W proposes after ply4, plays ply5, B accepts", 4, white, 1, 2, 293_000, 300_000},
+		{"W proposes at ply2, B accepts", 2, white, 0, 0, 300_000, 300_000},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -79,7 +80,12 @@ func TestTakebackClockTable(t *testing.T) {
 			if m.s.Clock.RemainingMs[white] != c.w || m.s.Clock.RemainingMs[black] != c.b {
 				t.Fatalf("clocks W %d B %d, want W %d B %d", m.s.Clock.RemainingMs[0], m.s.Clock.RemainingMs[1], c.w, c.b)
 			}
-			if m.s.LastChangeTS != m.now || m.s.PendingTakeback != nil || m.s.RunningSeat() != int(m.s.TurnIdx) {
+			// After a rewind to ply 0 or 1 no clock runs again (#124).
+			wantRunning := int(m.s.TurnIdx)
+			if c.toPly < firstMovePlies {
+				wantRunning = NoSeat
+			}
+			if m.s.LastChangeTS != m.now || m.s.PendingTakeback != nil || m.s.RunningSeat() != wantRunning {
 				t.Fatalf("baseline/pending/running wrong: ts %d now %d pend %v", m.s.LastChangeTS, m.now, m.s.PendingTakeback)
 			}
 		})
@@ -729,7 +735,13 @@ func TestClockStartAndCharging(t *testing.T) {
 	t.Run("ClocksAt charges only the running seat", func(t *testing.T) {
 		m := newSim(t, false)
 		tc := baseOpts().TimeControl
-		cl := m.s.ClocksAt(m.now+10_000, tc) // white to move
+		// Before both seats have moved nobody is charged (#124).
+		if cl := m.s.ClocksAt(m.now+10_000, tc); cl[0] != 300_000 || cl[1] != 300_000 {
+			t.Fatalf("clocks before the first moves %v", cl)
+		}
+		m.move(2_000)                        // white's first move: clockless
+		m.move(2_000)                        // black's first move: clockless
+		cl := m.s.ClocksAt(m.now+10_000, tc) // white to move, clock running
 		if cl[0] != 290_000 || cl[1] != 300_000 {
 			t.Fatalf("clocks %v", cl)
 		}
@@ -1038,4 +1050,98 @@ func TestReackAfterNonMoveEndIsNotEndedGame(t *testing.T) {
 	if d.Move.EndedGame {
 		t.Fatalf("EndedGame set for a move that did not end the game")
 	}
+}
+
+// (g) The first-move rule (#124, Lichess): each side's first move is clockless,
+// the clocks start once both have moved, and a side that does not make its
+// first move within the timeout aborts the game with no result.
+func TestFirstMoveRule(t *testing.T) {
+	const blitzTimeout = 25_000 // blitz-5+3: estimated 420 s -> 25 s
+
+	assertAborted := func(t *testing.T, d Decision) {
+		t.Helper()
+		if d.Effect != EffectEnded || len(d.Events) != 2 || d.Events[0].Type != EvAborted ||
+			d.Events[0].Aborted.By != SystemActor || d.Events[1].GameEnded.Termination != TermAbort {
+			t.Fatalf("want Aborted{SystemActor}+GameEnded{ABORT}, got %+v", d)
+		}
+		for _, r := range d.Events[1].GameEnded.ResultVector {
+			if r != ResultDraw {
+				t.Fatalf("abort must carry no winner: %+v", d.Events[1].GameEnded.ResultVector)
+			}
+		}
+	}
+
+	t.Run("no first move in time aborts, never flags", func(t *testing.T) {
+		m := newSim(t, false)
+		if d := m.do(CmdTickFlag{}, blitzTimeout); len(d.Events) != 0 {
+			t.Fatalf("aborted at exactly the timeout: %+v", d)
+		}
+		assertAborted(t, m.do(CmdTickFlag{}, 1))
+	})
+
+	t.Run("black gets the full timeout from white's move", func(t *testing.T) {
+		m := newSim(t, false)
+		m.move(20_000) // white moves late, but inside its timeout
+		if d := m.do(CmdTickFlag{}, blitzTimeout); len(d.Events) != 0 {
+			t.Fatalf("black aborted at exactly its timeout: %+v", d)
+		}
+		assertAborted(t, m.do(CmdTickFlag{}, 1))
+	})
+
+	t.Run("a first move is not charged and earns no increment", func(t *testing.T) {
+		m := newSim(t, false)
+		m.move(24_000)
+		m.move(24_000)
+		for i, e := range m.s.History {
+			if e.ClockAfterMs != 300_000 {
+				t.Fatalf("ply %d clock_after = %d, want 300000", i+1, e.ClockAfterMs)
+			}
+		}
+		if m.s.RunningSeat() != int(white) {
+			t.Fatal("the clock must run once both seats have moved")
+		}
+	})
+
+	t.Run("a late first move is accepted, not flagged", func(t *testing.T) {
+		m := newSim(t, false)
+		m.move(1_000_000) // far beyond the 300 s clock, before any tick aborted
+		if m.s.Ply != 1 || m.s.Clock.Flagged() {
+			t.Fatalf("ply %d flagged %v", m.s.Ply, m.s.Clock.Flagged())
+		}
+	})
+
+	t.Run("no abort and no running clock after both have moved; flag applies", func(t *testing.T) {
+		m := newSim(t, false)
+		m.move(1_000)
+		m.move(1_000)
+		if d := m.do(CmdTickFlag{}, 200_000); len(d.Events) != 0 {
+			t.Fatalf("tick at ply 2 with time left: %+v", d)
+		}
+		m.o.material[m.s.CurFEN+"#0"] = true
+		d := m.do(CmdTickFlag{}, 200_000)
+		if d.Effect != EffectEnded || d.Events[0].Type != EvClockFlagged {
+			t.Fatalf("white should flag: %+v", d)
+		}
+	})
+
+	t.Run("a takeback to ply 0 restarts the first-move timeout", func(t *testing.T) {
+		m := newSim(t, false)
+		m.move(1_000)
+		m.move(1_000)
+		m.do(CmdProposeTakeback{By: white}, 10)
+		m.do(CmdAcceptTakeback{By: black, AtPly: 2}, 10)
+		if m.s.Ply != 0 {
+			t.Fatalf("ply %d", m.s.Ply)
+		}
+		if d := m.do(CmdTickFlag{}, blitzTimeout); len(d.Events) != 0 {
+			t.Fatalf("timeout counted from before the rewind: %+v", d)
+		}
+		assertAborted(t, m.do(CmdTickFlag{}, 1))
+	})
+
+	t.Run("the override beats the time control", func(t *testing.T) {
+		m := newSim(t, false)
+		m.opts.FirstMoveTimeoutMs = 100
+		assertAborted(t, m.do(CmdTickFlag{}, 101))
+	})
 }

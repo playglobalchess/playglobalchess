@@ -180,12 +180,39 @@ same instant as today. Every later build reads the persisted value. Two nodes
 building at once: one append wins, the other gets `ErrSeqConflict`, reloads and
 finds it set. Matchmaking's opening batch is unchanged (still 3 events).
 
-Not decided here (#124): whether the clock should start at first session build,
-at match time, or at a first-move timer as lichess does, and whether the join
-window (`joinTTL`, 30 s) should drain a bullet clock. GS-7 keeps today's answer.
+**First-move rule (#124, decided 2026-11-26; amends the rule above).** Follows
+Lichess (lila `Game.timeForFirstMove`; scalachess `Clock.step`, which switches
+sides without charging time or granting increment while no timer runs):
+
+1. **Each side's first move is clockless.** While `Ply < 2` no clock runs:
+   `running_seat` is `0xFF`, `ClocksAt` charges nobody, and a move at ply 0 or 1
+   is neither charged nor granted the increment, so its `clock_after_ms` equals
+   the clock before it. The clocks start running for White after ply 2 (Black's
+   first move), charged from that move's `ServerTS`.
+2. **First-move timeout.** While `Ply < 2` the side to move has
+   `TimeControl.FirstMoveTimeoutMs()` from `LastChangeTS` (`ClockStarted`, the
+   first move, or a takeback rewind) to move: 15 s ultrabullet, 20 s bullet,
+   25 s blitz, 30 s rapid, 35 s classical, by the estimated duration
+   `base + 40 * increment` (scalachess speed ranges: <30 s, <180 s, <480 s,
+   <1500 s, <21600 s); none at 6 h or more. When it is exceeded, the next tick
+   ends the game with `Aborted{by: SystemActor}` + `GameEnded{ABORT}`: no
+   result, no flag, no rating change. A move that arrives before that tick is
+   still accepted (tick granularity is `flagInterval`). Lichess's tournament
+   (5 s shorter) and Chess960 (x1.5) variants are not applicable yet.
+3. **A takeback to ply 0 or 1** restarts the first-move timeout from the rewind
+   (`TakebackRewound.server_ts`), and no clock runs again until ply 2.
+4. The join window (`joinTTL`, 30 s) no longer drains a clock, because none runs.
+   It still aborts a game nobody joined.
+
+No event shape changes (`ClockStarted`, `MovePlayed`, `TakebackRewound` carry what
+they carried). Rebuild is exact: the rule reads only `Ply`, `LastChangeTS` and the
+time control. `FoldOptions.FirstMoveTimeoutMs` overrides the timeout for tests.
+Differences from Chess.com are unknown (closed source). Part of the old
+behaviour this replaces: White was charged from the first build, so a bullet game
+could lose time before a first move.
 
 If `ClockStartedSet == false` (only possible before the first build has appended
-it), no idle time is charged.
+it), no idle time is charged and no first-move timeout runs.
 
 Clock baselines are cross-node wall-clock instants (already true for
 `ServerTS`). Operational requirement: game-server nodes keep clock skew under
@@ -535,7 +562,7 @@ fields, appended in this order after `clocks`:
 | `pending_draw_by` | `u8` | seat with a pending draw offer; `0xFF` none |
 | `takeback_by` | `u8` | seat with a pending takeback request; `0xFF` none |
 | `takeback_at_ply` | `u32` | that request's `at_ply`; `0` iff `takeback_by == 0xFF` |
-| `running_seat` | `u8` | seat whose clock is running; `0xFF` if none (not started, or ended) |
+| `running_seat` | `u8` | seat whose clock is running; `0xFF` if none (not started, before both seats have moved, or ended) |
 | `server_t` | `u64` | server epoch ms at which `clocks` are valid |
 
 **Clock semantics (fixes #123, enables #112).** `clocks` are charged UP TO
@@ -654,7 +681,7 @@ pre-launch, web is the only client.
 | Takeback `at_ply` | at proposal (fold ply) | at accept/decline | Survives the proposer's own move only. Cleared by the responder's move, decline, cancel, rewind, game end. A mismatched or absent `at_ply` on accept/decline is a no-op plus STATE push. |
 | `to_ply` | at accept | every reader | Stored in the event; `evolve` rejects it if it differs from the formula. |
 | Clocks after rewind | at accept | after | From stored `clockAfterMs` (§5.4), never wall time. Flag is checked before the accept is applied. |
-| Idle baseline | each move or rewind | flag ticker, next move, rebuild | `LastChangeTS` from event bodies (§3.1); rebuild reads the same value, and an undone move's `ServerTS` is no longer used because the later `TakebackRewound.server_ts` supersedes it. First-clock-start: #124. |
+| Idle baseline | each move or rewind | flag ticker, next move, rebuild | `LastChangeTS` from event bodies (§3.1); rebuild reads the same value, and an undone move's `ServerTS` is no longer used because the later `TakebackRewound.server_ts` supersedes it. First-clock-start: §3.5 first-move rule (#124). |
 | Pending draw offer | on offer | on accept | Cleared by the responder's move or decline, rewind, game end. In `STATE` (§7.4). |
 | Draw cooldown | on offer | on next offer | Per seat; pruned on rewind; rebuilt by fold. |
 | Pending takeback across reconnect | on proposal | after reconnect | In `STATE` (§7.4). |
@@ -733,7 +760,7 @@ affected: the opening batch stays 3 events).
 Fixed: #84, #85, #94, #67, #89, #122, #107, #101 (protocol half), #123. Made tractable,
 not closed: #95, #88, #97, #98, #99 (harness replaces vacuous tests), #100, #111
 (still needs token persistence), #102 (still needs result delivery after the
-session is dropped). Not touched: #124.
+session is dropped). #124 is decided in §3.5 (first-move rule).
 
 ## 11. Open questions
 

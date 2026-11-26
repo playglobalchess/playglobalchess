@@ -747,15 +747,35 @@ func TestRegression157_FlaggedClockSurvivesRebuild(t *testing.T) {
 }
 
 // TestRegression124_IdleBaselineBeforeFirstMove: no move yet, the clock
-// advances, then a rebuild charges White from the same instant (ClockStarted).
+// advances, then a rebuild measures the first-move timeout from the same
+// instant (ClockStarted); no clock runs before both seats have moved (#124).
 func TestRegression124_IdleBaselineBeforeFirstMove(t *testing.T) {
 	h := newHarness(t, startFEN, false)
 	defer h.close()
-	h.clock.add(5 * time.Second)
+	h.clock.add(20 * time.Second)
 	mustClean(t, h)
 	snap, _ := h.live.StateSnapshot(h.ctx)
-	if snap.RunningSeat != 0 || snap.RemainingMs[0] != 295_000 {
-		t.Fatalf("white must be charged 5 s from the durable clock start: %+v", snap)
+	if snap.RunningSeat != game.NoSeat || snap.RemainingMs[0] != 300_000 || snap.Ended {
+		t.Fatalf("no clock may run before both seats have moved (#124): %+v", snap)
+	}
+	// A rebuild (failover) 20 s in, then 6 s more: the blitz first-move timeout
+	// is 25 s from the durable ClockStarted, so the rebuilt session aborts.
+	rb, stop, err := h.rebuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	h.clock.add(6 * time.Second)
+	if ended, err := rb.TickFlagCheck(h.ctx); err != nil || !ended {
+		t.Fatalf("rebuilt session must abort 26 s after the durable start: ended=%v err=%v", ended, err)
+	}
+	// The original session learns of the abort on its next command (seq conflict, reload).
+	_, _ = h.live.TickFlagCheck(h.ctx)
+	evs, _ := h.store.Load(h.ctx, game.StreamIDFor(gameID))
+	n := len(evs)
+	if evs[n-2].Type != game.EvAborted || evs[n-2].Aborted.By != game.SystemActor ||
+		evs[n-1].GameEnded.Termination != game.TermAbort {
+		t.Fatalf("tail %v,%v, want Aborted{SystemActor},GameEnded{ABORT}", evs[n-2].Type, evs[n-1].Type)
 	}
 }
 

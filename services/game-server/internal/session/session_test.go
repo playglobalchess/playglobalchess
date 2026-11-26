@@ -174,14 +174,21 @@ func TestFlagUsesAdvancedClock(t *testing.T) {
 	defer cancel()
 	go s.Run(rctx)
 
-	// White spends 8s on move 1 (2s left), black spends 1s (9s left).
-	fc.add(8 * time.Second)
+	// Each side's first move is clockless (#124): open with e4 e5, then White
+	// spends 8s on move 2 (2s left) and black spends 1s (9s left).
 	if o1, _ := s.SubmitMove(ctx, 0, 1, "e2e4", 1); !o1.Accepted {
 		t.Fatal("move 1 not accepted")
 	}
-	fc.add(1 * time.Second)
 	if o2, _ := s.SubmitMove(ctx, 1, 2, "e7e5", 2); !o2.Accepted {
 		t.Fatal("move 2 not accepted")
+	}
+	fc.add(8 * time.Second)
+	if o3, _ := s.SubmitMove(ctx, 0, 3, "g1f3", 3); !o3.Accepted {
+		t.Fatal("move 3 not accepted")
+	}
+	fc.add(1 * time.Second)
+	if o4, _ := s.SubmitMove(ctx, 1, 4, "b8c6", 4); !o4.Accepted {
+		t.Fatal("move 4 not accepted")
 	}
 	// Now it's white to move with ~2s left. An idle of 3s MUST flag white — a
 	// stale (base 10s) clock would NOT flag on 3s, so this proves the clock was
@@ -334,7 +341,14 @@ func TestFlagOnTimeout(t *testing.T) {
 	defer cancel()
 	go s.Run(rctx)
 
-	fc.add(2 * time.Second) // side to move idles past its 1s
+	// Open with e4 e5 (clockless, #124); then the side to move idles past 1s.
+	if o, _ := s.SubmitMove(ctx, 0, 1, "e2e4", 1); !o.Accepted {
+		t.Fatal("move 1 not accepted")
+	}
+	if o, _ := s.SubmitMove(ctx, 1, 2, "e7e5", 2); !o.Accepted {
+		t.Fatal("move 2 not accepted")
+	}
+	fc.add(2 * time.Second)
 	ended, err := s.TickFlagCheck(ctx)
 	if err != nil {
 		t.Fatalf("tick: %v", err)
@@ -607,9 +621,14 @@ func TestResyncPreservesIdleThink(t *testing.T) {
 	}
 	rctxA, cancelA := context.WithCancel(ctx)
 	go sA.Run(rctxA)
-	fcA.add(1000 * time.Millisecond) // 1s think -> white has 1s left; it's black to move
+	// Both first moves are clockless (#124); then it is white to move at 200ms.
+	fcA.add(100 * time.Millisecond)
 	if oA, _ := sA.SubmitMove(ctx, 0, 1, "e2e4", 0); !oA.Accepted {
 		t.Fatal("session A move not accepted")
+	}
+	fcA.add(100 * time.Millisecond)
+	if oA, _ := sA.SubmitMove(ctx, 1, 2, "e7e5", 0); !oA.Accepted {
+		t.Fatal("session A reply not accepted")
 	}
 	cancelA()
 
