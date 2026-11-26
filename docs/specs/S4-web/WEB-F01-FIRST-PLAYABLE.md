@@ -106,6 +106,8 @@ A "Play" action sends `SEEK{pool_id, time_control, rated:false}`; on `MATCHED`
 the client stores `{game_id, my_seat, opponent, start_state}` and renders the
 board + both clocks from `start_state`.
 
+The client sends `rated:false` because the product offers no rated game yet; it is not what keeps a game unrated. Whether a rated SEEK is allowed is a server policy (GS-6 §3.2, #179): a client that sends `rated:true` is refused. The rated toggle arrives with X-3 and the rating service.
+
 ### 3.3 Move hot path & social actions
 
 - A board move → `MOVE{game_id, ply_expected, uci}`. Optimistic UX is allowed

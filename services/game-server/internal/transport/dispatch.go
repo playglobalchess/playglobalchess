@@ -72,6 +72,10 @@ type Server struct {
 	writeDeadline time.Duration
 	// pools is the SEEK allow-list: pool id -> its time-control id (#93).
 	pools PoolCatalog
+	// ratedEnabled lets SEEK carry rated=true (#179). Off by default: nothing
+	// ships to a rated environment until G-A, G-B and G-C are green (MASTER-PLAN
+	// Part V), so the server, not the client, refuses a rated SEEK.
+	ratedEnabled bool
 	// missedEnds: user -> game -> the seat that did not get GAME_END live, pushed
 	// on the next AUTHENTICATE (#102, ended.go). missedOrder is its expiry FIFO.
 	missedEnds  map[string]map[string]missedEnd
@@ -102,6 +106,11 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 		missedEnds:    make(map[string]map[string]missedEnd),
 	}
 }
+
+// SetRatedEnabled turns rated SEEKs on or off (#179). It is off after
+// NewServer. Call it before serving; it is not safe to call concurrently with
+// Handle. Nothing in production enables it until G-B and G-C are green.
+func (s *Server) SetRatedEnabled(on bool) { s.ratedEnabled = on }
 
 // conn-local state for one authenticated connection.
 type connState struct {
