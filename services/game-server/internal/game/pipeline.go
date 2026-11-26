@@ -82,6 +82,8 @@ var (
 	// ErrGameNotLive: the action needs a live game (its events are Live-only).
 	ErrGameNotLive = errors.New("game: action requires a live game")
 	// ErrAbortTooLate: past abortBeforePly a quit is a resign, not an abort.
+	ErrSeatOutOfRange = errors.New("game: seat out of range")
+
 	ErrAbortTooLate = errors.New("game: too late to abort (game started) — resign instead")
 	// ErrNoDrawToAccept: AcceptDraw found no pending offer from the other seat.
 	ErrNoDrawToAccept = errors.New("game: no pending draw offer to accept")
@@ -343,7 +345,7 @@ func decideResign(s State, c CmdResign) (Decision, error) {
 		return Decision{}, ErrUnsupportedSeatCount
 	}
 	if int(c.By) >= s.seatCount() {
-		return Decision{}, fmt.Errorf("decide: seat %d out of range", c.By)
+		return Decision{}, fmt.Errorf("%w: resign by seat %d", ErrSeatOutOfRange, c.By)
 	}
 	rv := make([]Result, 2)
 	rv[c.By], rv[1-c.By] = ResultLoss, ResultWin
@@ -365,6 +367,11 @@ func decideAbort(s State, c CmdAbort) (Decision, error) {
 	}
 	if s.seatCount() != 2 {
 		return Decision{}, ErrUnsupportedSeatCount
+	}
+	// Only the system abort (join timeout) may use the sentinel seat; any other
+	// out-of-range seat would write an Aborted the fold rejects (#125, #94).
+	if c.By != SystemActor && int(c.By) >= s.seatCount() {
+		return Decision{}, fmt.Errorf("%w: abort by seat %d", ErrSeatOutOfRange, c.By)
 	}
 	d := Decision{Effect: EffectEnded}
 	d.add(Event{Type: EvAborted, Aborted: &Aborted{By: c.By}}, nil)

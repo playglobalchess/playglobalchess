@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -44,6 +46,11 @@ type Session struct {
 	// abortBeforePly is the exclusive ply ceiling under which Abort is allowed
 	// (GS-3b Q-EG1). Default 2.
 	abortBeforePly uint32
+	// cmdTimeout bounds one command's store and engine calls (#125).
+	cmdTimeout time.Duration
+	// needReload is set after a command panicked: the next command rebuilds
+	// the projection from the store first.
+	needReload bool
 }
 
 // Config bundles a Session's dependencies. Now may be nil (time.Now).
@@ -54,7 +61,14 @@ type Config struct {
 	Opts           game.FoldOptions
 	Now            func() time.Time
 	AbortBeforePly uint32 // zero means the default (2)
+	// CommandTimeout bounds each command's store and engine calls (zero:
+	// defaultCommandTimeout). The caller's ctx never governs a command once
+	// accepted, so this is the only bound on a hung store call.
+	CommandTimeout time.Duration
 }
+
+// defaultCommandTimeout bounds one command (#125).
+const defaultCommandTimeout = 10 * time.Second
 
 // Command errors, re-exported from the game package for callers.
 var (
@@ -95,6 +109,10 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		commands:       make(chan command),
 		quit:           make(chan struct{}),
 		abortBeforePly: cfg.AbortBeforePly,
+	}
+	s.cmdTimeout = cfg.CommandTimeout
+	if s.cmdTimeout <= 0 {
+		s.cmdTimeout = defaultCommandTimeout
 	}
 	if s.abortBeforePly == 0 {
 		s.abortBeforePly = 2 // Q-EG3: before both players have moved once
@@ -224,6 +242,9 @@ func (s *Session) committedAnyway(ctx context.Context, at uint32, evs []game.Eve
 
 // Run is the actor loop. Exactly one Run per Session.
 func (s *Session) Run(ctx context.Context) {
+	// However Run ends, close the session so a pending or later dispatch
+	// returns errSessionClosed instead of blocking on the unread channel (#125).
+	defer s.Close()
 	for {
 		select {
 		case <-ctx.Done():
@@ -236,12 +257,30 @@ func (s *Session) Run(ctx context.Context) {
 	}
 }
 
-// applyRecovered runs one command with a panic barrier, so a handler bug fails
-// that command (its done channel is closed by its own defer) and keeps the
-// actor and every other game on this process alive.
+// applyRecovered runs one command under a per-command deadline and a panic
+// barrier. A panic is logged, fails that command with errCommandPanic (never a
+// silent zero-value success), marks the projection for a rebuild from the store
+// before the next command, and keeps the actor and every other game on this
+// process alive. finish runs last, so the caller wakes after the result is set.
 func (s *Session) applyRecovered(ctx context.Context, cmd command) {
-	defer func() { _ = recover() }()
-	cmd.apply(ctx, s)
+	defer cmd.finish()
+	cctx, cancel := context.WithTimeout(ctx, s.cmdTimeout)
+	defer cancel()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("session %s: command %T panicked: %v\n%s", s.gameID, cmd, r, debug.Stack())
+			s.needReload = true
+			cmd.fail(fmt.Errorf("%w: %v", errCommandPanic, r))
+		}
+	}()
+	if s.needReload {
+		if err := s.reload(cctx); err != nil {
+			cmd.fail(err)
+			return
+		}
+		s.needReload = false
+	}
+	cmd.apply(cctx, s)
 }
 
 // Close stops the actor loop. Idempotent; never closes the commands channel.
@@ -250,6 +289,11 @@ func (s *Session) Close() { s.closeOnce.Do(func() { close(s.quit) }) }
 // command is a unit of work run on the actor goroutine.
 type command interface {
 	apply(ctx context.Context, s *Session)
+	// fail records err as the command's result (a panic, a failed rebuild).
+	fail(err error)
+	// finish releases the waiting caller; the actor calls it exactly once,
+	// after apply or fail, so the caller never reads a half-written result.
+	finish()
 }
 
 // dispatch sends a command to the actor and waits for it. Before the actor
@@ -273,6 +317,9 @@ func (s *Session) dispatch(ctx context.Context, c command, done <-chan struct{})
 
 var errSessionClosed = fmt.Errorf("session: closed")
 
+// errCommandPanic is returned to a caller whose command panicked.
+var errCommandPanic = fmt.Errorf("session: command panicked")
+
 // execCmd marshals a game.Command onto the actor and runs exec.
 type execCmd struct {
 	cmd  game.Command
@@ -283,10 +330,12 @@ type execCmd struct {
 }
 
 func (c *execCmd) apply(ctx context.Context, s *Session) {
-	defer close(c.done)
 	c.d, c.err = s.exec(ctx, c.cmd)
 	c.snap = s.snapshot()
 }
+
+func (c *execCmd) fail(err error) { c.d, c.snap, c.err = game.Decision{}, Snapshot{}, err }
+func (c *execCmd) finish()        { close(c.done) }
 
 // run executes cmd on the actor and returns the decision and the snapshot
 // taken right after it.

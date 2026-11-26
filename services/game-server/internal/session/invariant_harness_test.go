@@ -201,10 +201,9 @@ type stateCmd struct {
 	done chan struct{}
 }
 
-func (c *stateCmd) apply(_ context.Context, s *Session) {
-	defer close(c.done)
-	c.st = s.st
-}
+func (c *stateCmd) apply(_ context.Context, s *Session) { c.st = s.st }
+func (c *stateCmd) fail(error)                          {}
+func (c *stateCmd) finish()                             { close(c.done) }
 
 // readState returns the session's whole game.State (read on its actor).
 func readState(ctx context.Context, s *Session) (game.State, error) {
