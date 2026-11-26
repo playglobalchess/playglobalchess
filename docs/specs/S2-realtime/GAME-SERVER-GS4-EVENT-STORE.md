@@ -204,6 +204,32 @@ the whole batch is all-or-nothing and still seq-conflict-safe), exposed as
 stub stream), but is no longer the primary guarantee once the session uses the
 batch append.
 
+### 3.4a Live-game index and the head guard (GS-8 stage 1, ADR-16 amendment)
+
+`game.IndexedStore` adds `AppendIndexed(stream, seq, evs, ops)` and three reads
+(`LiveGames`, `UserLiveGames`, `UserRecentGames`). The events and the index
+operations commit in **one** `TransactWriteItems` (SPEC-S2-GAME-SERVER-GS8
+§4.3): either all or none. The index tables (`user_live_games`, `live_games`,
+`user_recent_games`) hold hints only; the stream stays the truth.
+
+- **Head guard (contiguity).** Every transactional write at `expectedSeq > 0`
+  also carries a `ConditionCheck` that `seq-1` exists, so a caller that is
+  *ahead* of the stream gets `ErrSeqConflict`, like one that is behind it. The
+  single-event `Append` (a plain conditional `PutItem`) does not carry it; every
+  writer takes `NextSeq` from a folded, contiguous state, and the tests run the
+  same gap cases against `MemStore` and the DynamoDB store.
+- **Error mapping.** A failed condition on the guard or an event put is
+  `ErrSeqConflict`; a failed `IndexUpdate` (its entry is missing) is
+  `ErrIndexMissing`. Neither commits anything, events included.
+- **Reads** are strongly consistent. `user_recent_games` readers filter
+  `expires_at` themselves, because DynamoDB TTL deletion lags by up to 48 hours.
+- `store.New` checks that all four tables exist, so a missing table fails at
+  start and not on the first game's opening write.
+
+Tests: the index contract runs against `MemStore`, the in-process fake, and
+(in CI) DynamoDB Local. The session does not call `AppendIndexed` yet; that is
+GS-8 plan step 2.
+
 ## 4. Interfaces & contracts
 
 GS-4 implements the existing `game.EventStore` with no change to its two

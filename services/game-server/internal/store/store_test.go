@@ -29,8 +29,14 @@ type fakeDynamo struct {
 	// key "stream_id\x00seq" -> item
 	items   map[string]map[string]ddbtypes.AttributeValue
 	noTable bool // when true, DescribeTable fails (startup fail-fast test)
+	// missingTable, when set, makes DescribeTable fail for that one table.
+	missingTable string
 	// inconsistentQueries counts Queries that did not ask for ConsistentRead.
 	inconsistentQueries int
+	// transactions counts committed TransactWriteItems calls.
+	transactions int
+	// idx holds the live-game index tables: table -> partition -> game_id -> item.
+	idx map[string]map[string]map[string]map[string]ddbtypes.AttributeValue
 }
 
 func newFakeDynamo() *fakeDynamo {
@@ -40,7 +46,7 @@ func newFakeDynamo() *fakeDynamo {
 func key(streamID, seq string) string { return streamID + "\x00" + seq }
 
 func (f *fakeDynamo) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, _ ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
-	if f.noTable {
+	if f.noTable || (f.missingTable != "" && in.TableName != nil && *in.TableName == f.missingTable) {
 		return nil, errors.New("ResourceNotFoundException: table not found")
 	}
 	return &dynamodb.DescribeTableOutput{}, nil
@@ -72,24 +78,43 @@ func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.Transa
 	defer f.mu.Unlock()
 	// All-or-nothing: first check EVERY condition against the current state (and
 	// against the batch's own earlier items), then apply. If any fails, cancel
-	// with a ConditionalCheckFailed reason and mutate nothing.
+	// with a ConditionalCheckFailed reason and mutate nothing. Models the three
+	// event-table shapes (Put, ConditionCheck) and the index-table shapes (Put,
+	// Delete, Update) the store emits.
 	staged := map[string]map[string]ddbtypes.AttributeValue{}
+	var applyIdx []func()
 	reasons := make([]ddbtypes.CancellationReason, len(in.TransactItems))
 	failed := false
+	fail := func(i int) {
+		reasons[i] = ddbtypes.CancellationReason{Code: aws.String("ConditionalCheckFailed")}
+		failed = true
+	}
 	for i, ti := range in.TransactItems {
-		p := ti.Put
-		sid := p.Item["stream_id"].(*ddbtypes.AttributeValueMemberS).Value
-		seq := p.Item["seq"].(*ddbtypes.AttributeValueMemberN).Value
-		k := key(sid, seq)
-		_, inStore := f.items[k]
-		_, inStaged := staged[k]
-		if p.ConditionExpression != nil && *p.ConditionExpression == "attribute_not_exists(seq)" && (inStore || inStaged) {
-			reasons[i] = ddbtypes.CancellationReason{Code: aws.String("ConditionalCheckFailed")}
-			failed = true
-			continue
-		}
 		reasons[i] = ddbtypes.CancellationReason{Code: aws.String("None")}
-		staged[k] = p.Item
+		switch {
+		case ti.ConditionCheck != nil:
+			c := ti.ConditionCheck
+			k := key(c.Key["stream_id"].(*ddbtypes.AttributeValueMemberS).Value, c.Key["seq"].(*ddbtypes.AttributeValueMemberN).Value)
+			if _, ok := f.items[k]; !ok {
+				fail(i)
+			}
+		case ti.Put != nil && *ti.Put.TableName == tableName:
+			p := ti.Put
+			sid := p.Item["stream_id"].(*ddbtypes.AttributeValueMemberS).Value
+			seq := p.Item["seq"].(*ddbtypes.AttributeValueMemberN).Value
+			k := key(sid, seq)
+			_, inStore := f.items[k]
+			_, inStaged := staged[k]
+			if p.ConditionExpression != nil && *p.ConditionExpression == "attribute_not_exists(seq)" && (inStore || inStaged) {
+				fail(i)
+				continue
+			}
+			staged[k] = p.Item
+		default:
+			if !f.stageIndex(ti, &applyIdx) {
+				fail(i)
+			}
+		}
 	}
 	if failed {
 		return nil, &ddbtypes.TransactionCanceledException{
@@ -100,12 +125,19 @@ func (f *fakeDynamo) TransactWriteItems(ctx context.Context, in *dynamodb.Transa
 	for k, it := range staged {
 		f.items[k] = it
 	}
+	for _, fn := range applyIdx {
+		fn()
+	}
+	f.transactions++
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
 
 func (f *fakeDynamo) Query(ctx context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if in.TableName != nil && *in.TableName != tableName {
+		return f.queryIndexLocked(in)
+	}
 	if in.ConsistentRead == nil || !*in.ConsistentRead {
 		f.inconsistentQueries++
 	}
