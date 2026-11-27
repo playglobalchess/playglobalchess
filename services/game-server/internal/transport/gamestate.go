@@ -27,6 +27,8 @@ type gameEntry struct {
 	// endClaimed latches that this game's GAME_END has been claimed, so
 	// concurrent end paths do not each broadcast it.
 	endClaimed bool
+	// ticker latches that this game's flag ticker is running (one per live game).
+	ticker bool
 }
 
 type gameShard struct {

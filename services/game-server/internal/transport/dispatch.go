@@ -39,6 +39,9 @@ type Server struct {
 	// endReadTimeout overrides endBroadcastTimeout (tests only; 0 = default).
 	endReadTimeout time.Duration
 
+	// idxCfg is the live-game index config, set by SetIndex (nil = index off).
+	idxCfg *game.IndexConfig
+
 	// gt is the per-game state, sharded by game id (gamestate.go, #174).
 	gt gameTable
 
@@ -97,6 +100,7 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 // together, from one config, so they cannot disagree on shards or be half on.
 // Call it once, before the server accepts connections.
 func (s *Server) SetIndex(cfg game.IndexConfig) error {
+	s.idxCfg = &cfg
 	if err := s.reg.SetIndex(cfg); err != nil {
 		return err
 	}

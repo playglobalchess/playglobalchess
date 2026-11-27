@@ -177,7 +177,7 @@ func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec
 // through its own handler.
 func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match matchmaking.Match) {
 	// Build (or find) the live session from the just-written opening stream.
-	sess, err := s.reg.GetOrCreate(match.GameID, match.TimeControl)
+	sess, err := s.startGame(ctx, match.GameID, rolePair)
 	if err != nil {
 		// S1 fix: the game exists durably but we could not stand up a session on
 		// this node (bad time-control id, fold failure). Fail LOUDLY to each
@@ -216,7 +216,6 @@ func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match
 		}})
 	}
 	s.armJoinTimeout(match.GameID)
-	s.armFlagTicker(match.GameID)
 }
 
 // armFlagTicker starts the per-game idle/disconnect FORFEIT driver (§3.4). GS-3's
