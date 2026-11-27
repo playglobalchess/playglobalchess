@@ -61,6 +61,9 @@ func (s *Server) startGame(ctx context.Context, gameID, tcID string, players map
 	if err != nil {
 		return nil, err
 	}
+	if s.afterBuild != nil {
+		s.afterBuild(gameID) // tests: run a drop in exactly this window
+	}
 	// Fill the seat map only while this session is still the registered one.
 	// dropGame unregisters before it deletes the entry under the shard lock, so
 	// checking here means a concurrent drop either sees our fill and deletes

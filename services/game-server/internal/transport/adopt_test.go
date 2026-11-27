@@ -237,3 +237,23 @@ func (f *flakyLoad) UserLiveGames(ctx context.Context, u string, n int) ([]game.
 func (f *flakyLoad) UserRecentGames(ctx context.Context, u string, n int) ([]game.UserEntry, error) {
 	return f.inner().UserRecentGames(ctx, u, n)
 }
+
+// A drop that lands after startGame built the session and before it filled the
+// seat map leaves no transport entry and no ticker for the dropped game.
+func TestDropBetweenBuildAndSeatFillLeavesNoEntry(t *testing.T) {
+	h, _ := indexedHarness(t)
+	defer h.cancel()
+	_, _, gameID := pairTiny(t, h)
+	h.srv.dropGame(gameID)
+	waitUntil(t, 2*time.Second, "the old ticker to exit", func() bool { return !running(h.srv, gameID) })
+	h.srv.afterBuild = func(id string) { h.srv.dropGame(id) }
+	_, _ = h.srv.startGame(context.Background(), gameID, "", nil)
+	h.srv.afterBuild = nil
+	if h.srv.gt.tracked(gameID) {
+		t.Fatal("a transport entry was recreated for a dropped game")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if running(h.srv, gameID) {
+		t.Fatal("a ticker is running for a dropped game")
+	}
+}

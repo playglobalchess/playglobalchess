@@ -44,6 +44,10 @@ type Server struct {
 	tickerMu sync.Mutex
 	tickers  map[string]struct{}
 
+	// afterBuild, if set (tests only), runs in startGame after the session is
+	// built and before the seat map is filled.
+	afterBuild func(gameID string)
+
 	// idxCfg is the live-game index config, set by SetIndex (nil = index off).
 	idxCfg *game.IndexConfig
 
