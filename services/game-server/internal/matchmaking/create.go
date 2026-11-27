@@ -219,7 +219,7 @@ func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error)
 		// An error does not prove the write failed (#89, #95): a store can commit
 		// and still time out. If the opening is there, the game exists, and the
 		// seekers must be told, or the index would name a game no client knows.
-		if !m.openingCommitted(ctx, streamID, len(opening)) {
+		if m.index == nil || !m.openingCommitted(streamID, len(opening)) {
 			return Match{}, fmt.Errorf("matchmaking: append opening: %w", err)
 		}
 	}
@@ -243,14 +243,18 @@ func (m *Matchmaker) appendOpening(ctx context.Context, streamID, gameID string,
 	return m.indexed.AppendIndexed(ctx, streamID, 0, opening, ops)
 }
 
-// openingCommitted re-reads the new game's stream to settle an ambiguous write,
-// the way the session confirms a move (a few reads, 50 ms then 100 ms apart).
-// The game id is fresh, so any events at the stream are this opening, and the
-// transaction is atomic, so the index rows are there with them.
-func (m *Matchmaker) openingCommitted(ctx context.Context, streamID string, want int) bool {
-	for i, wait := 0, 50*time.Millisecond; i < 3; i, wait = i+1, wait*2 {
-		if evs, err := m.store.Load(ctx, streamID); err == nil {
-			return len(evs) == want
+// openingCommitted re-reads the new game's stream to settle an ambiguous write
+// (index on only; with the index off the old behaviour is kept). The game id is
+// fresh, so any events at the stream are this opening, and the transaction is
+// atomic, so the index rows are there with them. It uses its own short context,
+// because the caller's may be the very thing that was cancelled, and it retries
+// an empty read, since a commit can still be landing.
+func (m *Matchmaker) openingCommitted(streamID string, want int) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i, wait := 0, 50*time.Millisecond; i < 4; i, wait = i+1, wait*2 {
+		if evs, err := m.store.Load(ctx, streamID); err == nil && len(evs) == want {
+			return true
 		}
 		select {
 		case <-ctx.Done():

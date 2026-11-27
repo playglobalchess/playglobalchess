@@ -205,3 +205,21 @@ func TestSeek_GameIDCollisionIsAbandonedNotAdopted(t *testing.T) {
 		t.Fatalf("%d claims left after the abandoned creation", claimed)
 	}
 }
+
+// With the index off, an ambiguous opening keeps the old behaviour: the error
+// is returned, no confirmation read is made.
+func TestSeek_IndexOffAmbiguousOpeningStillFails(t *testing.T) {
+	st := &failAfterBatch{MemStore: game.NewMemStore()}
+	m := New(newMemPool(), st, nil)
+	m.Seek(context.Background(), seeker("s1", "alice"))
+	if _, matched, err := m.Seek(context.Background(), seeker("s2", "bob")); err == nil || matched {
+		t.Fatalf("index off, ambiguous commit: matched=%v err=%v, want the old error", matched, err)
+	}
+}
+
+type failAfterBatch struct{ *game.MemStore }
+
+func (s *failAfterBatch) AppendBatch(ctx context.Context, id string, seq uint32, evs []game.Event) error {
+	_ = s.MemStore.AppendBatch(ctx, id, seq, evs)
+	return errors.New("fault: timeout after commit")
+}

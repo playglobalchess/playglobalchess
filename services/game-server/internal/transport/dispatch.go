@@ -93,6 +93,16 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 	}
 }
 
+// SetIndex turns on the live-game index for the matchmaker and the registry
+// together, from one config, so they cannot disagree on shards or be half on.
+// Call it once, before the server accepts connections.
+func (s *Server) SetIndex(cfg game.IndexConfig) error {
+	if err := s.mm.SetIndex(cfg); err != nil {
+		return err
+	}
+	return s.reg.SetIndex(cfg)
+}
+
 // SetRatedEnabled turns rated SEEKs on or off (#179). It is off after
 // NewServer. It is safe to call at any time (atomic); a change applies to the
 // next SEEK. Nothing in production enables it until G-B and G-C are green.

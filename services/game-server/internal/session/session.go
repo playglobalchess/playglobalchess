@@ -452,10 +452,16 @@ func (s *Session) run(ctx context.Context, cmd game.Command) (game.Decision, Sna
 func (s *Session) persist(ctx context.Context, evs []game.Event, nowMs uint64) error {
 	if s.index != nil && game.HasEnding(evs) {
 		ops, err := s.index.EndingOps(s.gameID, s.st.Players, time.UnixMilli(int64(nowMs)))
-		if err != nil {
+		if err == nil {
+			err = s.indexed.AppendIndexed(ctx, s.stream, s.st.NextSeq, evs, ops)
+		}
+		// The index rows are hints (GS-8 §4.3); a game must always be able to end.
+		// A refusal that is deterministic (a bad op or config) can never succeed on
+		// retry, so end the game with the plain write instead of wedging it.
+		if !errors.Is(err, game.ErrBadIndexOp) && !errors.Is(err, game.ErrBadIndexConfig) {
 			return err
 		}
-		return s.indexed.AppendIndexed(ctx, s.stream, s.st.NextSeq, evs, ops)
+		log.Printf("session %s: index refused, ending without rows: %v", s.gameID, err)
 	}
 	if len(evs) == 1 {
 		return s.store.Append(ctx, s.stream, s.st.NextSeq, evs[0]) // the move hot path

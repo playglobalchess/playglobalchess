@@ -320,3 +320,18 @@ func TestIndexNeedsAnIndexedStore(t *testing.T) {
 		t.Fatalf("zero index config: %v, want ErrBadIndexConfig", err)
 	}
 }
+
+// A deterministic refusal of the index rows must not wedge the game: it ends
+// with the plain write (the rows are hints, GS-8 section 4.3).
+func TestBadIndexOpDoesNotStopAGameEnding(t *testing.T) {
+	s, st, fc := indexedGame(t)
+	playIndexed(t, s, fc, "e2e4")
+	st.arm(nil, game.ErrBadIndexOp)
+	if err := s.Resign(context.Background(), 1); err != nil {
+		t.Fatalf("resign with a refused index write: %v", err)
+	}
+	evs, err := st.Load(context.Background(), game.StreamIDFor(gameID))
+	if err != nil || !game.HasEnding(evs) {
+		t.Fatalf("the stream has no GameEnded after the resign (err=%v)", err)
+	}
+}
