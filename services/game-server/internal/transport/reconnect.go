@@ -219,11 +219,14 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 	// Pass 4: bind, then read the state again. An ending commits before
 	// broadcastGameEnd looks up the seats' connections, so a game that ends
 	// around the bind is either seen ended here or sends its GAME_END to this
-	// connection; a live STATE for an ended game cannot slip through. Nothing
-	// from here on refuses the login: a game that ended (or was dropped) in
-	// this window is shown through its ended view if it can be read now, and
-	// otherwise keeps its rows for the next login (a game dropped while still
-	// live means this node is shutting down, which closes this connection).
+	// connection; a live STATE for an ended game cannot slip through. Both can
+	// happen in one narrow interleaving (the bind lands after the ending
+	// commits but before broadcastGameEnd looks up the seats), so a client may
+	// get GAME_END and an ended STATE for the same game; both describe the same
+	// final state. Apart from a live game that cannot be read after its bind,
+	// nothing from here on refuses the login: a game that ended (or was
+	// dropped) in this window is shown through its ended view if it can be
+	// read now, and otherwise keeps its rows for the next login.
 	for _, g := range states {
 		if s.beforeBind != nil {
 			s.beforeBind(g.gameID)
@@ -233,6 +236,19 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 		bound := s.bindSeat(c, st, g.gameID, g.seat)
 		if bound {
 			snap, err = g.sess.StateSnapshot(ctx)
+			if err != nil {
+				snap, err = g.sess.StateSnapshot(ctx) // one retry
+			}
+			if err != nil {
+				if _, live := s.reg.Get(g.gameID); live {
+					// Bound to a live game we cannot read: refuse, so the
+					// client reconnects rather than sitting in a game it was
+					// never told about. This is the one refusal after a bind;
+					// the teardown unbinds only this connection, and the seat
+					// already moved here as on any later login.
+					return fmt.Errorf("reading live game %s after the bind: %w", g.gameID, err)
+				}
+			}
 		}
 		if bound && err == nil && !snap.Ended {
 			s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
@@ -304,7 +320,10 @@ func permanentRowErr(ctx context.Context, err error) bool {
 	}
 	if errors.Is(err, game.ErrUnknownEvent) {
 		// Written by a newer build (a rollback, or a mixed deploy): this
-		// build cannot read it, but a newer one can. Never delete on it.
+		// build cannot read it, but a newer one can. Never delete on it. For
+		// a live row this refuses the user's login on this build until the
+		// upgrade is back: a temporary lockout, chosen over deleting the
+		// player's live game for good. An ended row is only skipped.
 		return false
 	}
 	return errors.Is(err, errNoStream) || errors.Is(err, errBadTimeControl) || errors.Is(err, session.ErrFold)

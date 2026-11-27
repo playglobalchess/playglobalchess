@@ -233,7 +233,7 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 		if err := s.resyncFromIndex(ctx, c, st, ix); err != nil {
 			log.Printf("transport: AUTHENTICATE of %s: %v", uid, err)
 			s.send(ctx, c, errorMsg(codec.ECInternal, "could not restore your game, reconnect"))
-			return false // nothing was bound or registered
+			return false // not registered; bound only in the one case resyncFromIndex names
 		}
 		// Registered only once the login succeeded, so a refused login never
 		// replaces (and then, on teardown, removes) a healthy other connection.

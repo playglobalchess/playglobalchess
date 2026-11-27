@@ -98,3 +98,29 @@ func TestUnknownEventIsNotPermanent(t *testing.T) {
 		t.Fatal("an unknown event type counted as a permanent error")
 	}
 }
+
+// Confirming review, SF1: a live game that cannot be read after the bind
+// refuses the login, so the client reconnects instead of sitting in a game it
+// was never told about.
+func TestUnreadableLiveGameAfterBindRefusesTheLogin(t *testing.T) {
+	h, st := indexedHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	gid := "01ac0000-0000-7000-8000-00000000c004"
+	seedGame(t, st, gid, "blitz-5+3", "cal", "dee")
+	var once atomic.Bool
+	h.srv.beforeBind = func(id string) {
+		if once.CompareAndSwap(false, true) {
+			if sess, ok := h.srv.reg.Get(id); ok {
+				sess.Close() // still registered, but its actor no longer answers
+			}
+		}
+	}
+	c := reconnect(t, h, ctx, "cal")
+	if m := c.waitForServer(t, codec.SMError, 2*time.Second); m.Error.Code != codec.ECInternal {
+		t.Fatalf("login with an unreadable live game: %+v", m.Error)
+	}
+	if rows, _ := st.UserLiveGames(ctx, "cal", 5); len(rows) != 1 {
+		t.Fatalf("live rows: %v, want the row kept", rows)
+	}
+}
