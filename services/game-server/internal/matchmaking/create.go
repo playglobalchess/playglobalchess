@@ -66,6 +66,26 @@ type Matchmaker struct {
 	// coin flips white/black for the two seekers (Q-MM3). Injectable so tests are
 	// deterministic. Returns true if the NEW seeker takes white (seat 0).
 	coin func() bool
+	// index, with indexed, adds the live-game index rows to the opening write
+	// (GS-8 §4.3). Nil means events only.
+	index   *game.IndexConfig
+	indexed game.IndexedStore
+	// newID allocates a game id. Tests replace it to force a collision.
+	newID func() (string, error)
+}
+
+// SetIndex turns on the live-game index writes for new games. The store must
+// implement game.IndexedStore. Call it before the first Seek.
+func (m *Matchmaker) SetIndex(cfg game.IndexConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	is, ok := m.store.(game.IndexedStore)
+	if !ok {
+		return fmt.Errorf("matchmaking: %T does not implement game.IndexedStore", m.store)
+	}
+	m.index, m.indexed = &cfg, is
+	return nil
 }
 
 // New builds a Matchmaker with the default window and a time-seeded coin for
@@ -83,6 +103,7 @@ func New(pool SeekPool, store game.EventStore, ratings RatingSource) *Matchmaker
 		window:  DefaultWindow,
 		now:     time.Now,
 		coin:    func() bool { return r.Intn(2) == 0 },
+		newID:   game.NewGameID,
 	}
 }
 
@@ -160,7 +181,7 @@ func (m *Matchmaker) Seek(ctx context.Context, s Seeker) (Match, bool, error) {
 // AppendBatch — Q-MM4). seat 0 = white, seat 1 = black; the coin decides which
 // seeker takes white (Q-MM3).
 func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error) {
-	gameID, err := game.NewGameID()
+	gameID, err := m.newID()
 	if err != nil {
 		return Match{}, fmt.Errorf("matchmaking: %w", err)
 	}
@@ -185,14 +206,22 @@ func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error)
 		{Type: game.EvPlayerJoined, PlayerJoined: &game.PlayerJoined{SeatIdx: 1, UserID: blackSeeker.UserID}},
 	}
 
-	// Append the opening ATOMICALLY at seq 0 (Q-MM4). A fresh UUID cannot collide,
-	// but a seq conflict here means a game_id reuse — abandon rather than
-	// overwrite (never clobber an existing stream).
-	if err := m.store.AppendBatch(ctx, streamID, 0, opening); err != nil {
+	// Append the opening ATOMICALLY at seq 0 (Q-MM4), with the index rows when
+	// the index is on (one transaction: a game never exists without its rows, or
+	// the rows without the game). A fresh UUID cannot collide, but a seq
+	// conflict here means a game_id reuse: abandon rather than overwrite (never
+	// clobber an existing stream).
+	err = m.appendOpening(ctx, streamID, gameID, opening, []string{whiteSeeker.UserID, blackSeeker.UserID})
+	if err != nil {
 		if errors.Is(err, game.ErrSeqConflict) {
 			return Match{}, fmt.Errorf("matchmaking: game_id %s already has a stream (abandoned, not overwritten): %w", gameID, err)
 		}
-		return Match{}, fmt.Errorf("matchmaking: append opening: %w", err)
+		// An error does not prove the write failed (#89, #95): a store can commit
+		// and still time out. If the opening is there, the game exists, and the
+		// seekers must be told, or the index would name a game no client knows.
+		if !m.openingCommitted(ctx, streamID, len(opening)) {
+			return Match{}, fmt.Errorf("matchmaking: append opening: %w", err)
+		}
 	}
 
 	return Match{
@@ -200,4 +229,34 @@ func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error)
 		StartFEN: StandardStartFEN, TimeControl: a.TimeControl, Rated: a.Rated,
 		Seats: seats, Players: players,
 	}, nil
+}
+
+// appendOpening writes the opening events, and the index rows with them.
+func (m *Matchmaker) appendOpening(ctx context.Context, streamID, gameID string, opening []game.Event, players []string) error {
+	if m.index == nil {
+		return m.store.AppendBatch(ctx, streamID, 0, opening)
+	}
+	ops, err := m.index.OpeningOps(gameID, players)
+	if err != nil {
+		return err
+	}
+	return m.indexed.AppendIndexed(ctx, streamID, 0, opening, ops)
+}
+
+// openingCommitted re-reads the new game's stream to settle an ambiguous write,
+// the way the session confirms a move (a few reads, 50 ms then 100 ms apart).
+// The game id is fresh, so any events at the stream are this opening, and the
+// transaction is atomic, so the index rows are there with them.
+func (m *Matchmaker) openingCommitted(ctx context.Context, streamID string, want int) bool {
+	for i, wait := 0, 50*time.Millisecond; i < 3; i, wait = i+1, wait*2 {
+		if evs, err := m.store.Load(ctx, streamID); err == nil {
+			return len(evs) == want
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
+	}
+	return false
 }

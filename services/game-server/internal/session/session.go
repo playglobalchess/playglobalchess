@@ -49,6 +49,9 @@ type Session struct {
 	abortBeforePly uint32
 	// cmdTimeout bounds one command's store and engine calls (#125).
 	cmdTimeout time.Duration
+	// index, with indexed, makes an ending write carry the index changes.
+	index   *game.IndexConfig
+	indexed game.IndexedStore
 	// needReload is set after a command panicked: the next command rebuilds
 	// the projection from the store first.
 	needReload bool
@@ -125,6 +128,10 @@ type Config struct {
 	// defaultCommandTimeout). The caller's ctx never governs a command once
 	// accepted, so this is the only bound on a hung store call.
 	CommandTimeout time.Duration
+	// Index, when set, makes every write that contains GameEnded also delete the
+	// game's live index rows and put its user_recent_games rows, in the same
+	// atomic write (GS-8 §4.3). The store must implement game.IndexedStore.
+	Index *game.IndexConfig
 }
 
 // defaultCommandTimeout bounds one command (#125).
@@ -170,6 +177,17 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 		quit:           make(chan struct{}),
 		tickWake:       make(chan struct{}, 1),
 		abortBeforePly: cfg.AbortBeforePly,
+	}
+	if cfg.Index != nil {
+		if err := cfg.Index.Validate(); err != nil {
+			return nil, fmt.Errorf("session: %w", err)
+		}
+		is, ok := cfg.Store.(game.IndexedStore)
+		if !ok {
+			return nil, fmt.Errorf("session: an index is configured but %T does not implement game.IndexedStore", cfg.Store)
+		}
+		idx := *cfg.Index
+		s.index, s.indexed = &idx, is
 	}
 	s.cmdTimeout = cfg.CommandTimeout
 	if s.cmdTimeout <= 0 {
@@ -230,11 +248,7 @@ func (s *Session) exec(ctx context.Context, cmd game.Command) (game.Decision, er
 				return game.Decision{}, fmt.Errorf("session: decided an unfoldable event %s: %w", d.Events[i].Type, err)
 			}
 		}
-		if len(d.Events) == 1 {
-			err = s.store.Append(ctx, s.stream, s.st.NextSeq, d.Events[0]) // the move hot path
-		} else {
-			err = s.store.AppendBatch(ctx, s.stream, s.st.NextSeq, d.Events)
-		}
+		err = s.persist(ctx, d.Events, nowMs)
 		if err == nil {
 			s.st = next
 			return d, nil
@@ -428,4 +442,23 @@ func (s *Session) run(ctx context.Context, cmd game.Command) (game.Decision, Sna
 		return game.Decision{}, Snapshot{}, err
 	}
 	return c.d, c.snap, c.err
+}
+
+// persist commits one decision's events. A decision that ends the game also
+// carries the index changes (GS-8 §4.3) in the same atomic write, whichever
+// path produced the GameEnded (a move, a resign, a flag, an abort, or the lone
+// GameEnded of the half-terminal repair). Everything else takes the same writes
+// as before.
+func (s *Session) persist(ctx context.Context, evs []game.Event, nowMs uint64) error {
+	if s.index != nil && game.HasEnding(evs) {
+		ops, err := s.index.EndingOps(s.gameID, s.st.Players, time.UnixMilli(int64(nowMs)))
+		if err != nil {
+			return err
+		}
+		return s.indexed.AppendIndexed(ctx, s.stream, s.st.NextSeq, evs, ops)
+	}
+	if len(evs) == 1 {
+		return s.store.Append(ctx, s.stream, s.st.NextSeq, evs[0]) // the move hot path
+	}
+	return s.store.AppendBatch(ctx, s.stream, s.st.NextSeq, evs)
 }
