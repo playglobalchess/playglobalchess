@@ -177,7 +177,7 @@ func (s *Server) handleSeek(ctx context.Context, c Conn, st *connState, p *codec
 // through its own handler.
 func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match matchmaking.Match) {
 	// Build (or find) the live session from the just-written opening stream.
-	sess, err := s.reg.GetOrCreate(match.GameID, match.TimeControl)
+	sess, err := s.startGame(ctx, match.GameID, match.TimeControl, match.Players)
 	if err != nil {
 		// S1 fix: the game exists durably but we could not stand up a session on
 		// this node (bad time-control id, fold failure). Fail LOUDLY to each
@@ -216,7 +216,6 @@ func (s *Server) deliverMatched(ctx context.Context, _ Conn, _ *connState, match
 		}})
 	}
 	s.armJoinTimeout(match.GameID)
-	s.armFlagTicker(match.GameID)
 }
 
 // armFlagTicker starts the per-game idle/disconnect FORFEIT driver (§3.4). GS-3's
@@ -253,9 +252,33 @@ func (s *Server) armFlagTicker(gameID string) {
 	if !ok {
 		return
 	}
+	// At most one ticker per game: it follows a replacement session itself.
+	s.tickerMu.Lock()
+	if _, running := s.tickers[gameID]; running {
+		s.tickerMu.Unlock()
+		return
+	}
+	if s.tickers == nil {
+		s.tickers = make(map[string]struct{})
+	}
+	s.tickers[gameID] = struct{}{}
+	s.tickerMu.Unlock()
 	go func() {
 		t := time.NewTimer(time.Hour)
 		defer t.Stop()
+		// Leave the running set on exit. A session registered for the game
+		// meanwhile (a rebuild that saw this ticker still running and so armed
+		// none) gets a ticker now, so a live game is never left without one.
+		defer func() {
+			s.tickerMu.Lock()
+			delete(s.tickers, gameID)
+			s.tickerMu.Unlock()
+			if s.reg.rootCtx.Err() == nil {
+				if next, ok := s.reg.Get(gameID); ok && next != sess {
+					s.armFlagTicker(gameID)
+				}
+			}
+		}()
 		if s.tickerExited != nil {
 			defer s.tickerExited(gameID)
 		}
