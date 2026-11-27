@@ -108,6 +108,7 @@ func (s *Server) AdoptLive(ctx context.Context, concurrency int) (adopted, skipp
 		}
 	}
 	sort.Strings(ids)
+	total := len(ids)
 	for pass := 0; pass < 2 && len(ids) > 0; pass++ {
 		var (
 			mu    sync.Mutex
@@ -141,7 +142,7 @@ func (s *Server) AdoptLive(ctx context.Context, concurrency int) (adopted, skipp
 		}
 		wg.Wait()
 		if ctx.Err() != nil {
-			return adopted, skipped, failed + len(retry), ctx.Err()
+			return adopted, skipped, total - adopted - skipped, ctx.Err()
 		}
 		sort.Strings(retry)
 		ids = retry

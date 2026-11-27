@@ -147,3 +147,93 @@ func TestAdoptSkipsAnEndedGame(t *testing.T) {
 		t.Fatal("an ended game was started")
 	}
 }
+
+// Drops, rebuilds and restarts racing each other: once they stop, the live game
+// has exactly one ticker, and a dropped game leaves no transport entry.
+func TestTickerHammerDropRebuildStart(t *testing.T) {
+	h, _ := indexedHarness(t)
+	defer h.cancel()
+	_, _, gameID := pairTiny(t, h)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if (i+j)%3 == 0 {
+					h.srv.dropGame(gameID)
+				} else {
+					_, _ = h.srv.startGame(ctx, gameID, "", nil)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	if _, err := h.srv.startGame(ctx, gameID, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 2*time.Second, "exactly one ticker for the live game", func() bool {
+		h.srv.tickerMu.Lock()
+		defer h.srv.tickerMu.Unlock()
+		_, ok := h.srv.tickers[gameID]
+		return ok && len(h.srv.tickers) == 1
+	})
+	h.srv.dropGame(gameID)
+	waitUntil(t, 2*time.Second, "the ticker to exit after the last drop", func() bool { return !running(h.srv, gameID) })
+	if h.srv.gt.tracked(gameID) {
+		t.Fatal("transport entry left after the last drop")
+	}
+}
+
+// A game whose first start fails is retried once and adopted on the second pass.
+func TestAdoptRetriesAFailedStartOnce(t *testing.T) {
+	h, _ := indexedHarness(t)
+	_, _, gameID := pairTiny(t, h)
+	srv := restartedNode(t, h, time.Second)
+	flaky := &flakyLoad{EventStore: srv.reg.store, fails: 1}
+	srv.reg.store = flaky
+	adopted, skipped, failed, err := srv.AdoptLive(context.Background(), 4)
+	if err != nil || adopted != 1 || skipped != 0 || failed != 0 {
+		t.Fatalf("AdoptLive: adopted=%d skipped=%d failed=%d err=%v, want 1/0/0", adopted, skipped, failed, err)
+	}
+	if !running(srv, gameID) {
+		t.Fatal("the retried game has no ticker")
+	}
+}
+
+// flakyLoad fails the first n stream loads, then passes through. It keeps the
+// IndexedStore methods of the store it wraps.
+type flakyLoad struct {
+	game.EventStore
+	mu    sync.Mutex
+	fails int
+}
+
+func (f *flakyLoad) Load(ctx context.Context, stream string) ([]game.Event, error) {
+	f.mu.Lock()
+	fail := f.fails > 0
+	if fail {
+		f.fails--
+	}
+	f.mu.Unlock()
+	if fail {
+		return nil, errOutage
+	}
+	return f.EventStore.Load(ctx, stream)
+}
+
+func (f *flakyLoad) inner() game.IndexedStore { return f.EventStore.(game.IndexedStore) }
+
+func (f *flakyLoad) AppendIndexed(ctx context.Context, id string, seq uint32, evs []game.Event, ops []game.IndexOp) error {
+	return f.inner().AppendIndexed(ctx, id, seq, evs, ops)
+}
+func (f *flakyLoad) LiveGames(ctx context.Context, shard int) ([]game.LiveEntry, error) {
+	return f.inner().LiveGames(ctx, shard)
+}
+func (f *flakyLoad) UserLiveGames(ctx context.Context, u string, n int) ([]game.UserEntry, error) {
+	return f.inner().UserLiveGames(ctx, u, n)
+}
+func (f *flakyLoad) UserRecentGames(ctx context.Context, u string, n int) ([]game.UserEntry, error) {
+	return f.inner().UserRecentGames(ctx, u, n)
+}
