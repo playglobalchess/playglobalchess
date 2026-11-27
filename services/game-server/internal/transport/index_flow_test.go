@@ -63,3 +63,19 @@ func TestIndexedGameFromSeekToResign(t *testing.T) {
 		t.Fatalf("live_games still lists the ended game: %v", live)
 	}
 }
+
+// SetIndex fails as a whole: a store with no index support leaves both off.
+func TestServerSetIndexIsAllOrNothing(t *testing.T) {
+	h := newHarness(t)
+	defer h.cancel()
+	cfg := game.IndexConfig{Shards: 4, NodeID: "n", Incarnation: "i", RecentTTL: time.Hour}
+	if err := h.srv.SetIndex(game.IndexConfig{}); err == nil {
+		t.Fatal("accepted an invalid config")
+	}
+	if h.srv.reg.index != nil {
+		t.Fatal("registry left on after a failed SetIndex")
+	}
+	if err := h.srv.SetIndex(cfg); err != nil || h.srv.reg.index == nil {
+		t.Fatalf("SetIndex: %v", err)
+	}
+}

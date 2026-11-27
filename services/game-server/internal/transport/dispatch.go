@@ -97,10 +97,14 @@ func NewServer(auth Authenticator, mm *matchmaking.Matchmaker, reg *Registry) *S
 // together, from one config, so they cannot disagree on shards or be half on.
 // Call it once, before the server accepts connections.
 func (s *Server) SetIndex(cfg game.IndexConfig) error {
-	if err := s.mm.SetIndex(cfg); err != nil {
+	if err := s.reg.SetIndex(cfg); err != nil {
 		return err
 	}
-	return s.reg.SetIndex(cfg)
+	if err := s.mm.SetIndex(cfg); err != nil {
+		s.reg.index = nil // never leave it half on
+		return err
+	}
+	return nil
 }
 
 // SetRatedEnabled turns rated SEEKs on or off (#179). It is off after

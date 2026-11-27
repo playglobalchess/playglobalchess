@@ -219,7 +219,7 @@ func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error)
 		// An error does not prove the write failed (#89, #95): a store can commit
 		// and still time out. If the opening is there, the game exists, and the
 		// seekers must be told, or the index would name a game no client knows.
-		if m.index == nil || !m.openingCommitted(streamID, len(opening)) {
+		if m.index == nil || errors.Is(err, game.ErrBadIndexOp) || errors.Is(err, game.ErrBadIndexConfig) || !m.openingCommitted(streamID, len(opening)) {
 			return Match{}, fmt.Errorf("matchmaking: append opening: %w", err)
 		}
 	}

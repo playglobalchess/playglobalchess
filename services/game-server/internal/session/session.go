@@ -457,7 +457,9 @@ func (s *Session) persist(ctx context.Context, evs []game.Event, nowMs uint64) e
 		}
 		// The index rows are hints (GS-8 §4.3); a game must always be able to end.
 		// A refusal that is deterministic (a bad op or config) can never succeed on
-		// retry, so end the game with the plain write instead of wedging it.
+		// retry, so end the game with the plain write instead of wedging it. The
+		// game's live rows then stay until a reader folds the stream and removes
+		// them (spec: rows are hints); this path is unreachable today.
 		if !errors.Is(err, game.ErrBadIndexOp) && !errors.Is(err, game.ErrBadIndexConfig) {
 			return err
 		}
