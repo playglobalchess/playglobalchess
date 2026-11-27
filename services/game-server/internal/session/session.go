@@ -213,8 +213,17 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 }
 
 // ErrFold marks a stream that the engine cannot fold. Folding is deterministic,
-// so a retry gives the same answer: callers treat it as permanent.
+// so a retry gives the same answer: callers treat it as permanent. A fold cut
+// short by its context (cancelled, deadline) is NOT ErrFold: the engine returns
+// a bare ctx.Err() then, and that says nothing about the stream.
 var ErrFold = errors.New("session: fold")
+
+// IsTransient reports whether err may clear on a retry because it came from a
+// context (the caller's ctx is done, or err wraps context.Canceled or
+// context.DeadlineExceeded). Callers must not delete durable rows on it.
+func IsTransient(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 // reload rebuilds the state from the store with the engine.
 func (s *Session) reload(ctx context.Context) error {
@@ -228,6 +237,10 @@ func (s *Session) reload(ctx context.Context) error {
 	}
 	st, err := game.FoldWithEngine(ctx, events, s.opts, s.oracle)
 	if err != nil {
+		if IsTransient(ctx, err) {
+			// A cancelled or timed-out build is not a property of the stream.
+			return fmt.Errorf("session: fold: %w", err)
+		}
 		return fmt.Errorf("%w: %w", ErrFold, err)
 	}
 	s.st = st

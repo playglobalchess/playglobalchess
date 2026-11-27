@@ -419,12 +419,15 @@ func (r *Registry) loadEnded(ctx context.Context, gameID, uid string) (st game.S
 	}
 	tc, err := r.resolver.Resolve(tcID)
 	if err != nil {
-		return game.State{}, opts, seat, true, err
+		return game.State{}, opts, seat, true, fmt.Errorf("%w: %w", errBadTimeControl, err)
 	}
 	opts = game.FoldOptions{TimeControl: tc, FirstMoveTimeoutMs: r.firstMoveTimeoutMs}
 	st, err = game.FoldWithEngine(ctx, events, opts, r.oracle)
 	if err != nil {
-		return game.State{}, opts, seat, true, err
+		if session.IsTransient(ctx, err) {
+			return game.State{}, opts, seat, true, err
+		}
+		return game.State{}, opts, seat, true, fmt.Errorf("%w: %w", session.ErrFold, err)
 	}
 	if st.Phase != game.PhaseEnded {
 		return game.State{}, opts, seat, true, errNotEnded

@@ -124,6 +124,9 @@ func TestFailedIndexLookupRefusesTheConnection(t *testing.T) {
 		defer c.mu.Unlock()
 		return c.closed
 	})
+	if _, ok := h.srv.userConn("carol"); ok {
+		t.Fatal("a refused login registered the connection")
+	}
 }
 
 // A row is a hint: a user_live_games row naming a game the stream does not seat

@@ -47,6 +47,9 @@ type Server struct {
 	// afterBuild, if set (tests only), runs in startGame after the session is
 	// built and before the seat map is filled.
 	afterBuild func(gameID string)
+	// beforeBind, if set (tests only), runs in resyncFromIndex just before a
+	// live game is bound to the logging-in connection.
+	beforeBind func(gameID string)
 
 	// idxCfg is the live-game index config, set by SetIndex (nil = index off).
 	idxCfg *game.IndexConfig
@@ -201,8 +204,8 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 	// (one connection's view: a game paired for this user on another of their
 	// connections while this lookup runs reaches that connection, not this one)
 	// before the connection counts as authenticated: if it fails, the user gets
-	// a retryable INTERNAL and the connection closes, so no SEEK can pair a user
-	// whose live game could not be found into a second game.
+	// a retryable INTERNAL and the connection closes, so a login never goes
+	// through while a live game or a missed ending could not be read.
 	var ix userIndex
 	idx, indexed := s.indexStore()
 	if indexed {
@@ -339,9 +342,10 @@ func (s *Server) seatOf(c Conn, gameID string) (uint8, bool) {
 
 // bindSeat records that connection c occupies (gameID, seat) for user st.userID,
 // updating both the per-game state and the userID->game index (the latter
-// drives reconnection resync, Option A).
-func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
-	s.bindLocked(c, st.userID, gameID, seat, false, true) // false: the game was dropped meanwhile
+// drives reconnection resync, Option A). It returns false, binding nothing, if
+// the game was dropped meanwhile.
+func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) bool {
+	return s.bindLocked(c, st.userID, gameID, seat, false, true)
 }
 
 // bindLocked binds (gameID, seat) to c for uid in both indices, atomically with

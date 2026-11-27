@@ -109,7 +109,11 @@ func TestRefusedLoginKeepsTheOtherConnection(t *testing.T) {
 	h.srv.reg.store = &flakyLoad{EventStore: h.store, fails: 1}
 	c2 := reconnect(t, h, ctx, "frank")
 	c2.waitForServer(t, codec.SMError, 2*time.Second)
-	time.Sleep(50 * time.Millisecond) // the refused connection's teardown
+	waitUntil(t, 2*time.Second, "the refused connection to close", func() bool {
+		c2.mu.Lock()
+		defer c2.mu.Unlock()
+		return c2.closed
+	})
 	if _, ok := h.srv.userConn("frank"); !ok {
 		t.Fatal("a refused login removed the user's healthy connection")
 	}
