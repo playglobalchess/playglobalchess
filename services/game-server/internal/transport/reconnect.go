@@ -98,11 +98,13 @@ func (s *Server) consumeRecent(ctx context.Context, gameID string, uids []string
 //     the login is refused (the caller sends a retryable INTERNAL) and no row
 //     is deleted: a login never goes through with a live game it lost.
 //
-// Pass 2 binds and sends STATE for the live games, then pushes each missed
-// ending once. A row is deleted only after its ending was handed to the
-// connection, so a refused login or a refused send keeps it. "Sent" means
-// queued on the connection: a connection that dies right after loses that
-// one push, the same as the in-memory missedEnds did.
+// Pass 2 reads each live game's state, and pass 3 resolves every missed
+// ending. Only passes 1 to 3 may refuse the login, and they bind, send and
+// delete nothing that a refusal would lose (pass 1 drops only rows that are
+// wrong for good). Pass 4 binds and sends: STATE for each live game, then
+// each missed ending once, deleting a row only after its ending was handed to
+// the connection. "Handed" means queued: a connection that dies right after
+// loses that one push, the same as the in-memory missedEnds did.
 func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix userIndex) error {
 	uid := st.userID
 	type liveGame struct {
@@ -151,31 +153,33 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 		}
 		live = append(live, liveGame{gameID: row.GameID, sess: sess, seat: seat})
 	}
-	snaps := make([]session.Snapshot, len(live))
-	for i, g := range live {
-		snap, err := g.sess.StateSnapshot(ctx)
-		if err != nil {
-			return fmt.Errorf("reading live game %s: %w", g.gameID, err)
-		}
-		snaps[i] = snap
+	// Pass 2: read each live game's state. One already ended is settled as a
+	// missed ending. Nothing is bound yet.
+	type liveState struct {
+		gameID string
+		sess   *session.Session
+		seat   uint8
 	}
-
-	pushed := map[string]bool{}
-	for i, g := range live {
-		if s.beforeBind != nil {
-			s.beforeBind(g.gameID)
-		}
-		if snaps[i].Ended || !s.bindSeat(c, st, g.gameID, g.seat) {
-			// The game ended (or was dropped) between its start and this bind,
-			// so no GAME_END reaches this connection: settle it as a missed
-			// ending, which shows it once and consumes its rows.
+	var states []liveState
+	for _, g := range live {
+		snap, err := g.sess.StateSnapshot(ctx)
+		switch {
+		case err != nil:
+			return fmt.Errorf("reading live game %s: %w", g.gameID, err)
+		case snap.Ended:
 			staleEnded = append(staleEnded, g.gameID)
 			mustEnd[g.gameID] = true
-			continue
+		default:
+			states = append(states, liveState{gameID: g.gameID, sess: g.sess, seat: g.seat})
 		}
-		s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
-			GameID: g.gameID, State: snapshotToStateBody(snaps[i], g.seat),
-		}})
+	}
+
+	// Pass 3: resolve every ended view. This is the last step that may refuse
+	// the login, and it runs before any bind, send or consume: a refused login
+	// binds nothing (so its teardown cannot unbind the user's other, healthy
+	// connection) and consumes nothing (so no ending is lost with it).
+	pushed := map[string]bool{}
+	for _, g := range states {
 		pushed[g.gameID] = true
 	}
 	fromLive := map[string]bool{}
@@ -185,45 +189,109 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 			ix.recent = append(ix.recent, game.UserEntry{GameID: gid})
 		}
 	}
+	var ended []endedShow
 	for _, row := range ix.recent {
 		if pushed[row.GameID] {
 			continue
 		}
 		pushed[row.GameID] = true
-		snap, seat, seated, err := s.reg.EndedView(ctx, row.GameID, uid)
-		switch {
-		case errors.Is(err, errNotEnded):
-			if mustEnd[row.GameID] {
-				return fmt.Errorf("live game %s left this node during the login", row.GameID)
+		e, err := s.resolveEnded(ctx, uid, row.GameID)
+		if err != nil {
+			if errors.Is(err, errNotEnded) && !mustEnd[row.GameID] {
+				continue // a recent row for a live game cannot be written; ignore it
 			}
-			continue // a recent row for a live game cannot be written; ignore it
-		case permanentRowErr(ctx, err):
-			// An ended game that can never be shown: drop its row, or every
-			// login would fold it again until its TTL.
-			log.Printf("transport: AUTHENTICATE of %s: ended game %s cannot be shown, dropping its rows: %v", uid, row.GameID, err)
-			s.consumeRecent(ctx, row.GameID, []string{uid})
-		case err != nil:
 			if mustEnd[row.GameID] {
-				return fmt.Errorf("reading game %s: %w", row.GameID, err)
+				// Its game was seated here a moment ago and its live row may
+				// be the only record: refuse rather than guess.
+				return fmt.Errorf("settling game %s: %w", row.GameID, err)
 			}
-			// An ended game cannot pair the user anywhere, so this does not
-			// refuse the login; the row stays and a later login retries.
+			// Any other ended game cannot pair the user anywhere, so this does
+			// not refuse the login; the row stays and a later login retries.
 			log.Printf("transport: AUTHENTICATE of %s: ended view of %s: %v", uid, row.GameID, err)
 			continue
-		case !seated:
-			if ctx.Err() == nil {
-				s.consumeRecent(ctx, row.GameID, []string{uid}) // a bad row: drop it
-			}
-		case s.send(ctx, c, endedStateMsg(row.GameID, snap, seat)):
-			s.consumeRecent(ctx, row.GameID, []string{uid})
-		default:
+		}
+		if e != nil {
+			e.fromLive = fromLive[row.GameID]
+			ended = append(ended, *e)
+		}
+	}
+
+	// Pass 4: bind, then read the state again. An ending commits before
+	// broadcastGameEnd looks up the seats' connections, so a game that ends
+	// around the bind is either seen ended here or sends its GAME_END to this
+	// connection; a live STATE for an ended game cannot slip through. Nothing
+	// from here on refuses the login: a game that ended (or was dropped) in
+	// this window is shown through its ended view if it can be read now, and
+	// otherwise keeps its rows for the next login (a game dropped while still
+	// live means this node is shutting down, which closes this connection).
+	for _, g := range states {
+		if s.beforeBind != nil {
+			s.beforeBind(g.gameID)
+		}
+		var snap session.Snapshot
+		var err error
+		bound := s.bindSeat(c, st, g.gameID, g.seat)
+		if bound {
+			snap, err = g.sess.StateSnapshot(ctx)
+		}
+		if bound && err == nil && !snap.Ended {
+			s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
+				GameID: g.gameID, State: snapshotToStateBody(snap, g.seat),
+			}})
+			continue
+		}
+		e, rerr := s.resolveEnded(ctx, uid, g.gameID)
+		if rerr != nil || e == nil {
+			log.Printf("transport: AUTHENTICATE of %s: game %s ended or left during the login, rows kept: %v", uid, g.gameID, rerr)
+			continue
+		}
+		e.fromLive = true
+		ended = append(ended, *e)
+	}
+	for _, e := range ended {
+		if e.show && !s.send(ctx, c, endedStateMsg(e.gameID, e.snap, e.seat)) {
 			continue // not sent: keep the rows for a later login
 		}
-		if fromLive[row.GameID] {
-			s.dropStaleLiveRows(ctx, row.GameID, "") // the shared live_games row
+		s.consumeRecent(ctx, e.gameID, []string{uid})
+		if e.fromLive {
+			s.dropStaleLiveRows(ctx, e.gameID, "") // the shared live_games row
 		}
 	}
 	return nil
+}
+
+// endedShow is one missed ending a login settles: shown and then consumed, or
+// (show false) a row that can never be shown, consumed only.
+type endedShow struct {
+	gameID   string
+	snap     session.Snapshot
+	seat     uint8
+	show     bool
+	fromLive bool // also drop the shared live_games row
+}
+
+// resolveEnded reads gameID's ended view for uid: a missed ending to show, or
+// a row to drop (one that can never be shown, or that does not seat uid). It
+// returns errNotEnded for a game still live, and any error that may pass.
+func (s *Server) resolveEnded(ctx context.Context, uid, gameID string) (*endedShow, error) {
+	snap, seat, seated, err := s.reg.EndedView(ctx, gameID, uid)
+	switch {
+	case errors.Is(err, errNotEnded):
+		return nil, err
+	case permanentRowErr(ctx, err):
+		// An ended game that can never be shown: drop its row, or every login
+		// would fold it again until its TTL.
+		log.Printf("transport: AUTHENTICATE of %s: ended game %s cannot be shown, dropping its rows: %v", uid, gameID, err)
+		return &endedShow{gameID: gameID}, nil
+	case err != nil:
+		return nil, err
+	case !seated:
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return &endedShow{gameID: gameID}, nil // a bad row: drop it
+	}
+	return &endedShow{gameID: gameID, snap: snap, seat: seat, show: true}, nil
 }
 
 // permanentRowErr reports whether err says a game can never be played or
@@ -232,6 +300,11 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 // for a context error, which says nothing about the game.
 func permanentRowErr(ctx context.Context, err error) bool {
 	if err == nil || session.IsTransient(ctx, err) {
+		return false
+	}
+	if errors.Is(err, game.ErrUnknownEvent) {
+		// Written by a newer build (a rollback, or a mixed deploy): this
+		// build cannot read it, but a newer one can. Never delete on it.
 		return false
 	}
 	return errors.Is(err, errNoStream) || errors.Is(err, errBadTimeControl) || errors.Is(err, session.ErrFold)
