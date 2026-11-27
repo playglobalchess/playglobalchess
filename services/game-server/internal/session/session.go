@@ -212,6 +212,10 @@ func NewSession(ctx context.Context, cfg Config) (*Session, error) {
 	return s, nil
 }
 
+// ErrFold marks a stream that the engine cannot fold. Folding is deterministic,
+// so a retry gives the same answer: callers treat it as permanent.
+var ErrFold = errors.New("session: fold")
+
 // reload rebuilds the state from the store with the engine.
 func (s *Session) reload(ctx context.Context) error {
 	events, err := s.store.Load(ctx, s.stream)
@@ -224,7 +228,7 @@ func (s *Session) reload(ctx context.Context) error {
 	}
 	st, err := game.FoldWithEngine(ctx, events, s.opts, s.oracle)
 	if err != nil {
-		return fmt.Errorf("session: fold: %w", err)
+		return fmt.Errorf("%w: %w", ErrFold, err)
 	}
 	s.st = st
 	return nil

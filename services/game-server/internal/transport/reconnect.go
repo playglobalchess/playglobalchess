@@ -8,6 +8,7 @@ import (
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/session"
 )
 
 // reconnect.go: AUTHENTICATE with the live-game index on (GS-8 section 4.4).
@@ -52,7 +53,8 @@ func (s *Server) lookupUser(ctx context.Context, st game.IndexedStore, uid strin
 	return userIndex{live: live, recent: recent}, nil
 }
 
-// consumeRecent deletes the user_recent_games rows of users who have now seen
+// consumeRecent deletes the user_recent_games (and any stale user_live_games)
+// rows of users who have now seen
 // the game's ending, so it is pushed once ("consume once", as missedEnds was).
 // A failure is logged: the worst case is one more ended STATE on a later login.
 func (s *Server) consumeRecent(ctx context.Context, gameID string, uids []string) {
@@ -67,37 +69,54 @@ func (s *Server) consumeRecent(ctx context.Context, gameID string, uids []string
 			continue // one user in both seats: one row, and a repeated item is refused
 		}
 		seen[uid] = true
-		ops = append(ops, game.IndexOp{Table: game.IdxUserRecent, Kind: game.IndexDelete, Key: uid, GameID: gameID})
+		ops = append(ops,
+			game.IndexOp{Table: game.IdxUserRecent, Kind: game.IndexDelete, Key: uid, GameID: gameID},
+			// An ending written without its rows (persist's fallback) leaves a
+			// stale live row, which would replay the ending at the next login.
+			game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexDelete, Key: uid, GameID: gameID})
 	}
 	if err := st.RepairIndex(ctx, ops); err != nil {
 		log.Printf("index: consuming the recent rows of %s: %v", gameID, err)
 	}
 }
 
-// resyncFromIndex restores the user's games from the index after AUTHENTICATE:
-// each live game is started here if it is not running (startGame), the seat is
-// rebound and STATE pushed; each recently ended game is pushed once as an ended
-// STATE and its row consumed. The seat comes from the stream (startGame fills
-// it), never from the row: the row is a hint.
+// resyncFromIndex restores the user's games from the index after AUTHENTICATE.
+// The seat comes from the stream (startGame fills it), never from the row.
 //
-// It returns an error when a live game could not be started or read for a
-// reason that may pass (a store error). The caller then refuses the login, as
-// for a failed lookup: a user whose live game could not be restored must not
-// be able to SEEK into a second one. A row that is wrong for good (no such
-// stream, or a stream that does not seat the user) is deleted instead.
+// Pass 1 resolves every live row and sends nothing:
+//   - a running or startable game is kept for pass 2;
+//   - a game whose stream has ended (a stale row) becomes a missed ending;
+//   - a row that is wrong for good (no stream, a stream that does not seat the
+//     user, a time control that does not resolve, a stream the engine cannot
+//     fold) is logged and its row deleted: such a game cannot be played, so it
+//     must not lock the user out of every login;
+//   - any other error (the store, a timeout) may pass, so the login is refused
+//     (the caller sends a retryable INTERNAL): a user whose live game could not
+//     be restored must not be able to SEEK into a second one.
+//
+// Pass 2 binds and sends STATE for the live games, then pushes each missed
+// ending once. A row is deleted only after its ending was sent, so a refused
+// login or a failed send never loses the only record of an ending.
 func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix userIndex) error {
 	uid := st.userID
-	pushed := map[string]bool{}
+	type liveGame struct {
+		gameID string
+		sess   *session.Session
+		seat   uint8
+	}
+	var live []liveGame
+	var staleEnded []string // games whose user_live row is the only record
 	for _, row := range ix.live {
 		sess, err := s.startGame(ctx, row.GameID, "", nil)
+		if errors.Is(err, errBuildDiscarded) {
+			sess, err = s.startGame(ctx, row.GameID, "", nil) // a racing drop: look again
+		}
 		switch {
 		case errors.Is(err, errGameEnded):
-			// A stale row: the ending was written without its rows. Drop this
-			// user's live row and push the ending below, once.
-			s.dropStaleLiveRows(ctx, row.GameID, uid)
-			ix.recent = append(ix.recent, game.UserEntry{GameID: row.GameID, Seat: row.Seat})
+			staleEnded = append(staleEnded, row.GameID)
 			continue
-		case errors.Is(err, errNoStream):
+		case errors.Is(err, errNoStream), errors.Is(err, errBadTimeControl), errors.Is(err, session.ErrFold):
+			log.Printf("transport: AUTHENTICATE of %s: live game %s cannot be played, dropping its row: %v", uid, row.GameID, err)
 			s.dropUserLiveRow(ctx, row.GameID, uid)
 			continue
 		case err != nil:
@@ -108,15 +127,29 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 			s.dropUserLiveRow(ctx, row.GameID, uid) // the stream does not seat this user
 			continue
 		}
-		snap, err := sess.StateSnapshot(ctx)
+		live = append(live, liveGame{gameID: row.GameID, sess: sess, seat: seat})
+	}
+	snaps := make([]session.Snapshot, len(live))
+	for i, g := range live {
+		snap, err := g.sess.StateSnapshot(ctx)
 		if err != nil {
-			return fmt.Errorf("reading live game %s: %w", row.GameID, err)
+			return fmt.Errorf("reading live game %s: %w", g.gameID, err)
 		}
-		s.bindSeat(c, st, row.GameID, seat)
+		snaps[i] = snap
+	}
+
+	pushed := map[string]bool{}
+	for i, g := range live {
+		s.bindSeat(c, st, g.gameID, g.seat)
 		s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
-			GameID: row.GameID, State: snapshotToStateBody(snap, seat),
+			GameID: g.gameID, State: snapshotToStateBody(snaps[i], g.seat),
 		}})
-		pushed[row.GameID] = true
+		pushed[g.gameID] = true
+	}
+	fromLive := map[string]bool{}
+	for _, gid := range staleEnded {
+		fromLive[gid] = true
+		ix.recent = append(ix.recent, game.UserEntry{GameID: gid})
 	}
 	for _, row := range ix.recent {
 		if pushed[row.GameID] {
@@ -128,14 +161,17 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 		case errors.Is(err, errNotEnded):
 			continue // a recent row for a live game cannot be written; ignore it
 		case err != nil:
-			// An ended game cannot pair the user anywhere, so this is not worth
-			// refusing the login for; the row stays and a later login retries.
+			// An ended game cannot pair the user anywhere, so this does not
+			// refuse the login; the row stays and a later login retries.
 			log.Printf("transport: AUTHENTICATE of %s: ended view of %s: %v", uid, row.GameID, err)
 			continue
 		case !seated:
 			s.consumeRecent(ctx, row.GameID, []string{uid}) // a bad row: drop it
 		case s.send(ctx, c, endedStateMsg(row.GameID, snap, seat)):
 			s.consumeRecent(ctx, row.GameID, []string{uid})
+		}
+		if fromLive[row.GameID] {
+			s.dropStaleLiveRows(ctx, row.GameID, "") // the shared live_games row
 		}
 	}
 	return nil

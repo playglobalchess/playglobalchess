@@ -212,11 +212,16 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 			return false
 		}
 	}
-	// Register this connection as the user's current one (used by MATCHED
-	// delivery to reach an already-waiting seeker, and by reconnect rebinding).
-	s.userMu.Lock()
-	s.userConns[uid] = c
-	s.userMu.Unlock()
+	register := func() {
+		// Register this connection as the user's current one (used by MATCHED
+		// delivery to reach an already-waiting seeker, and by reconnect rebinding).
+		s.userMu.Lock()
+		s.userConns[uid] = c
+		s.userMu.Unlock()
+	}
+	if !indexed {
+		register()
+	}
 	// Reconnection (Option A): §4A has no client resync frame, so on a successful
 	// AUTHENTICATE the server itself restores any live game this user is seated
 	// in — rebind the seat to THIS (new) connection and push STATE folded from the
@@ -225,8 +230,11 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 		if err := s.resyncFromIndex(ctx, c, st, ix); err != nil {
 			log.Printf("transport: AUTHENTICATE of %s: %v", uid, err)
 			s.send(ctx, c, errorMsg(codec.ECInternal, "could not restore your game, reconnect"))
-			return false // Handle's teardown unbinds what was bound
+			return false // nothing was bound or registered
 		}
+		// Registered only once the login succeeded, so a refused login never
+		// replaces (and then, on teardown, removes) a healthy other connection.
+		register()
 	} else {
 		s.resyncUser(ctx, c, st)
 	}
