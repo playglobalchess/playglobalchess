@@ -191,6 +191,10 @@ type Registry struct {
 	// appends). 0 means defaultBuildTimeout. Tests only.
 	buildTimeout time.Duration
 
+	// index, when set, makes every session this registry builds write the
+	// live-game index rows with a game's ending (GS-8 §4.3). Set before serving.
+	index *game.IndexConfig
+
 	// mu guards only the maps below. It is never held across a store or engine
 	// call (#174): a build runs outside it, once per game (singleflight).
 	mu       sync.Mutex
@@ -229,6 +233,20 @@ func NewRegistry(rootCtx context.Context, store game.EventStore, oracle game.Leg
 		building: make(map[string]*build),
 		rootCtx:  rootCtx,
 	}
+}
+
+// SetIndex turns on the live-game index writes for every session built after
+// this call. The store must implement game.IndexedStore, or each build fails.
+// Call it once, before the server accepts connections.
+func (r *Registry) SetIndex(cfg game.IndexConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if _, ok := r.store.(game.IndexedStore); !ok {
+		return fmt.Errorf("transport: %T does not implement game.IndexedStore", r.store)
+	}
+	r.index = &cfg
+	return nil
 }
 
 // GetOrCreate returns the live Session for gameID, building and starting it from
@@ -305,6 +323,7 @@ func (r *Registry) buildSession(gameID, timeControlID string) (*session.Session,
 		Store:  r.store,
 		Oracle: r.oracle,
 		Opts:   game.FoldOptions{TimeControl: tc, FirstMoveTimeoutMs: r.firstMoveTimeoutMs},
+		Index:  r.index,
 	}
 	if r.now != nil {
 		cfg.Now = r.now

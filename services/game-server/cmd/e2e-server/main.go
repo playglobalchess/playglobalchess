@@ -43,11 +43,17 @@ func main() {
 	store := game.NewMemStore()
 	pool := matchmaking.NewMemoryPool()
 	mm := matchmaking.New(pool, store, nil)
+	// The live-game index (GS-8 §4.3): the same config for the opening write and
+	// every ending. The incarnation is per process until GS-9 persists a counter.
+	idx := game.DefaultIndexConfig("e2e-1", fmt.Sprintf("%d", time.Now().UnixNano()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reg := transport.NewRegistry(ctx, store, oracle, transport.ConventionResolver{})
 	srv := transport.NewServer(transport.DevAuthenticator{}, mm, reg)
+	if err := srv.SetIndex(idx); err != nil {
+		log.Fatalf("e2e-server: index: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	// Dev server: accept loopback dev origins. A browser reaching this through
