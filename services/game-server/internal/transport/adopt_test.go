@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/engine"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/game"
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/matchmaking"
@@ -146,6 +147,29 @@ func TestAdoptSkipsAnEndedGame(t *testing.T) {
 	if _, live := srv.reg.Get(gameID); live || running(srv, gameID) || srv.gt.tracked(gameID) {
 		t.Fatal("an ended game was started")
 	}
+	// GS-8 4.4: adoption drops the game's live_games row. Each player's own
+	// live row stays for their login, which pushes the ending once, and no
+	// recent row is written (it could re-create one a player consumed).
+	if l, _ := st.LiveGames(context.Background(), game.IndexShard(gameID, 4)); len(l) != 0 {
+		t.Fatalf("live_games still lists the ended game: %v", l)
+	}
+	for _, u := range []string{"alice", "bob"} {
+		if rows, _ := st.UserRecentGames(context.Background(), u, 10); len(rows) != 0 {
+			t.Fatalf("adoption wrote recent rows for %s: %v", u, rows)
+		}
+	}
+	c := authOn(t, srv, "alice")
+	if m := c.waitForServer(t, codec.SMState, 2*time.Second); m.State.GameID != gameID || m.State.State.Status != codec.StatusEnded {
+		t.Fatalf("alice's login after adoption: %+v", m.State)
+	}
+	waitUntil(t, 2*time.Second, "alice's stale live row to go", func() bool {
+		rows, _ := st.UserLiveGames(context.Background(), "alice", 10)
+		return len(rows) == 0
+	})
+	authOn(t, srv, "alice").noServerMsg(t, codec.SMState, 150*time.Millisecond)
+	if adopted, skipped, _, _ := srv.AdoptLive(context.Background(), 4); adopted+skipped != 0 {
+		t.Fatalf("second AdoptLive found %d games, want none", adopted+skipped)
+	}
 }
 
 // Drops, rebuilds and restarts racing each other: once they stop, the live game
@@ -256,4 +280,7 @@ func TestDropBetweenBuildAndSeatFillLeavesNoEntry(t *testing.T) {
 	if running(h.srv, gameID) {
 		t.Fatal("a ticker is running for a dropped game")
 	}
+}
+func (f *flakyLoad) RepairIndex(ctx context.Context, ops []game.IndexOp) error {
+	return f.inner().RepairIndex(ctx, ops)
 }

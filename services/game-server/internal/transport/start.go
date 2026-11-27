@@ -31,8 +31,7 @@ import (
 // briefly disconnected. A rebuilt game below two plies is bounded by the
 // first-move timeout instead (GS-7 section 3.5).
 //
-// The pairing and adoption routes use it now; the reconnect route moves onto
-// it in step 2c-2.
+// The pairing, adoption and reconnect (index on) routes use it.
 func (s *Server) startGame(ctx context.Context, gameID, tcID string, players map[uint8]string) (*session.Session, error) {
 	if tcID == "" {
 		events, err := s.reg.loadStream(ctx, gameID)
@@ -81,10 +80,31 @@ func (s *Server) startGame(ctx context.Context, gameID, tcID string, players map
 	return sess, nil
 }
 
+// dropStaleLiveRows deletes the live rows of a game whose stream has ended
+// (GS-8 section 4.4): always its live_games row, and the user_live_games row of
+// uid when one is given (the user logging in). It writes no recent rows: a
+// player's ending is pushed from their own stale live row at their own login
+// (resyncFromIndex), so a repair can never re-create a recent row a player
+// already consumed. Other players' live rows stay until their own login. A
+// failure is logged: the next start or login tries again.
+func (s *Server) dropStaleLiveRows(ctx context.Context, gameID, uid string) {
+	st, ok := s.indexStore()
+	if !ok {
+		return
+	}
+	ops := []game.IndexOp{{Table: game.IdxLive, Kind: game.IndexDelete, Key: game.ShardKey(game.IndexShard(gameID, s.idxCfg.Shards)), GameID: gameID}}
+	if uid != "" {
+		ops = append(ops, game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexDelete, Key: uid, GameID: gameID})
+	}
+	if err := st.RepairIndex(ctx, ops); err != nil {
+		log.Printf("index: dropping the stale live rows of ended game %s: %v", gameID, err)
+	}
+}
+
 // AdoptLive starts every game in the live-game index (GS-8 section 4.4), oldest
 // first (UUIDv7 ids sort by time), with bounded concurrency. It needs SetIndex.
-// A game whose stream has already ended is skipped and counted in skipped (its
-// stale row is left: the index rows are hints and readers fold the stream). A
+// A game whose stream has already ended is skipped and counted in skipped; its
+// live_games row is dropped (dropStaleLiveRows). A
 // game that fails to start is retried once after the first pass, then logged;
 // its players' reconnect starts it (2c-2). A store outage on a shard read is
 // retried with capped backoff until ctx ends, so a node that starts while the
@@ -136,6 +156,7 @@ func (s *Server) AdoptLive(ctx context.Context, concurrency int) (adopted, skipp
 				case err == nil:
 					adopted++
 				case errors.Is(err, errGameEnded):
+					s.dropStaleLiveRows(ctx, id, "")
 					skipped++
 				default:
 					log.Printf("adopt: game %s not started (pass %d): %v", id, pass+1, err)

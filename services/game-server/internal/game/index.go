@@ -90,6 +90,11 @@ type IndexedStore interface {
 	// ErrIndexMissing. With no ops it behaves as AppendBatch. At least one event
 	// is required.
 	AppendIndexed(ctx context.Context, streamID string, expectedSeq uint32, evs []Event, ops []IndexOp) error
+	// RepairIndex applies Put and Delete ops with no events, atomically. It is
+	// for cleaning up rows that disagree with the stream (a stale live row of a
+	// game whose stream has ended, GS-8 section 4.4); the caller folds the
+	// stream first. Update is refused: an ownership change is never a repair.
+	RepairIndex(ctx context.Context, ops []IndexOp) error
 	// LiveGames returns every live_games entry of one shard (all pages).
 	LiveGames(ctx context.Context, shard int) ([]LiveEntry, error)
 	// UserLiveGames returns up to limit of the user's live games, newest first
@@ -125,6 +130,20 @@ func WriteItems(expectedSeq uint32, nEvents, nOps int) int {
 		n++
 	}
 	return n
+}
+
+// ValidateRepair checks a RepairIndex write: at least one op, no Update, and the
+// same rules as an indexed write.
+func ValidateRepair(ops []IndexOp) error {
+	if len(ops) == 0 {
+		return fmt.Errorf("%w: a repair needs at least one operation", ErrBadIndexOp)
+	}
+	for _, op := range ops {
+		if op.Kind == IndexUpdate {
+			return fmt.Errorf("%w: a repair cannot Update %s", ErrBadIndexOp, op.Table)
+		}
+	}
+	return ValidateIndexedWrite(0, 0, ops)
 }
 
 // ValidateIndexedWrite checks everything DynamoDB would reject before it

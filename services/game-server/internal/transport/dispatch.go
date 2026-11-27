@@ -47,6 +47,9 @@ type Server struct {
 	// afterBuild, if set (tests only), runs in startGame after the session is
 	// built and before the seat map is filled.
 	afterBuild func(gameID string)
+	// beforeBind, if set (tests only), runs in resyncFromIndex just before a
+	// live game is bound to the logging-in connection.
+	beforeBind func(gameID string)
 
 	// idxCfg is the live-game index config, set by SetIndex (nil = index off).
 	idxCfg *game.IndexConfig
@@ -197,16 +200,47 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 		return false
 	}
 	st.userID = uid
-	// Register this connection as the user's current one (used by MATCHED
-	// delivery to reach an already-waiting seeker, and by reconnect rebinding).
-	s.userMu.Lock()
-	s.userConns[uid] = c
-	s.userMu.Unlock()
+	// With the index on, the user's games come from it (GS-8 4.4). Read it
+	// (one connection's view: a game paired for this user on another of their
+	// connections while this lookup runs reaches that connection, not this one)
+	// before the connection counts as authenticated: if it fails, the user gets
+	// a retryable INTERNAL and the connection closes, so a login never goes
+	// through while a live game or a missed ending could not be read.
+	var ix userIndex
+	idx, indexed := s.indexStore()
+	if indexed {
+		if ix, err = s.lookupUser(ctx, idx, uid); err != nil {
+			log.Printf("transport: AUTHENTICATE of %s: index lookup: %v", uid, err)
+			s.send(ctx, c, errorMsg(codec.ECInternal, "could not look up your games, reconnect"))
+			return false
+		}
+	}
+	register := func() {
+		// Register this connection as the user's current one (used by MATCHED
+		// delivery to reach an already-waiting seeker, and by reconnect rebinding).
+		s.userMu.Lock()
+		s.userConns[uid] = c
+		s.userMu.Unlock()
+	}
+	if !indexed {
+		register()
+	}
 	// Reconnection (Option A): §4A has no client resync frame, so on a successful
 	// AUTHENTICATE the server itself restores any live game this user is seated
 	// in — rebind the seat to THIS (new) connection and push STATE folded from the
 	// durable stream. A fresh user with no live game simply proceeds to SEEK.
-	s.resyncUser(ctx, c, st)
+	if indexed {
+		if err := s.resyncFromIndex(ctx, c, st, ix); err != nil {
+			log.Printf("transport: AUTHENTICATE of %s: %v", uid, err)
+			s.send(ctx, c, errorMsg(codec.ECInternal, "could not restore your game, reconnect"))
+			return false // not registered; bound only in the one case resyncFromIndex names
+		}
+		// Registered only once the login succeeded, so a refused login never
+		// replaces (and then, on teardown, removes) a healthy other connection.
+		register()
+	} else {
+		s.resyncUser(ctx, c, st)
+	}
 	return true
 }
 
@@ -308,9 +342,10 @@ func (s *Server) seatOf(c Conn, gameID string) (uint8, bool) {
 
 // bindSeat records that connection c occupies (gameID, seat) for user st.userID,
 // updating both the per-game state and the userID->game index (the latter
-// drives reconnection resync, Option A).
-func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) {
-	s.bindLocked(c, st.userID, gameID, seat, false, true) // false: the game was dropped meanwhile
+// drives reconnection resync, Option A). It returns false, binding nothing, if
+// the game was dropped meanwhile.
+func (s *Server) bindSeat(c Conn, st *connState, gameID string, seat uint8) bool {
+	return s.bindLocked(c, st.userID, gameID, seat, false, true)
 }
 
 // bindLocked binds (gameID, seat) to c for uid in both indices, atomically with

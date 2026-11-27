@@ -166,8 +166,12 @@ func (s *Server) resyncEnded(ctx context.Context, c Conn, st *connState, gameID 
 	case !seated || errors.Is(err, errNotEnded):
 		s.send(ctx, c, errorMsg(codec.ECUnknownGame, errNoSuchGame))
 	default:
-		s.send(ctx, c, endedStateMsg(gameID, snap, seat))
-		s.clearMissedEnd(uid, gameID)
+		if s.send(ctx, c, endedStateMsg(gameID, snap, seat)) {
+			s.clearMissedEnd(uid, gameID)
+			// With the index on, the missed ending lives in user_recent_games:
+			// the user has now seen it, so consume it (and any stale live row).
+			s.consumeRecent(ctx, gameID, []string{uid})
+		}
 	}
 }
 

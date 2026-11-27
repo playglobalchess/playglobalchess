@@ -17,10 +17,7 @@ func indexedHarness(t *testing.T) (*harness, game.IndexedStore) {
 	t.Helper()
 	h := newHarness(t)
 	cfg := game.IndexConfig{Shards: 4, NodeID: "node-a", Incarnation: "inc-1", RecentTTL: 10 * 365 * 24 * time.Hour}
-	if err := h.srv.mm.SetIndex(cfg); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.srv.reg.SetIndex(cfg); err != nil {
+	if err := h.srv.SetIndex(cfg); err != nil {
 		t.Fatal(err)
 	}
 	return h, h.store.(game.IndexedStore)
@@ -54,10 +51,11 @@ func TestIndexedGameFromSeekToResign(t *testing.T) {
 		if rows, _ := st.UserLiveGames(ctx, user, 10); len(rows) != 0 {
 			t.Fatalf("%s still has live rows after the game ended: %v", user, rows)
 		}
-		rows, err := st.UserRecentGames(ctx, user, 10)
-		if err != nil || len(rows) != 1 || rows[0].GameID != gameID {
-			t.Fatalf("recent rows for %s: %v %v, want %s", user, rows, err, gameID)
-		}
+		// Both saw GAME_END live, so each consumed its recent row.
+		waitUntil(t, 2*time.Second, user+"'s recent row to be consumed", func() bool {
+			rows, err := st.UserRecentGames(ctx, user, 10)
+			return err == nil && len(rows) == 0
+		})
 	}
 	if live, _ := st.LiveGames(ctx, shard); len(live) != 0 {
 		t.Fatalf("live_games still lists the ended game: %v", live)

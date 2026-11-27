@@ -222,6 +222,10 @@ type build struct {
 
 var errBuildDiscarded = errors.New("transport: game dropped while its session was being built")
 
+// errBadTimeControl marks a stream whose time-control id does not resolve. It
+// never resolves on a retry.
+var errBadTimeControl = errors.New("transport: unknown time control")
+
 // NewRegistry builds a Registry. rootCtx bounds every session actor's lifetime
 // (cancel it to stop them all on server shutdown).
 func NewRegistry(rootCtx context.Context, store game.EventStore, oracle game.LegalityOracle, resolver TimeControlResolver) *Registry {
@@ -316,7 +320,7 @@ func (r *Registry) finishBuild(gameID string, b *build, epoch uint64, timeContro
 func (r *Registry) buildSession(gameID, timeControlID string) (*session.Session, context.CancelFunc, error) {
 	tc, err := r.resolver.Resolve(timeControlID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %w", errBadTimeControl, err)
 	}
 	cfg := session.Config{
 		GameID: gameID,
@@ -415,12 +419,15 @@ func (r *Registry) loadEnded(ctx context.Context, gameID, uid string) (st game.S
 	}
 	tc, err := r.resolver.Resolve(tcID)
 	if err != nil {
-		return game.State{}, opts, seat, true, err
+		return game.State{}, opts, seat, true, fmt.Errorf("%w: %w", errBadTimeControl, err)
 	}
 	opts = game.FoldOptions{TimeControl: tc, FirstMoveTimeoutMs: r.firstMoveTimeoutMs}
 	st, err = game.FoldWithEngine(ctx, events, opts, r.oracle)
 	if err != nil {
-		return game.State{}, opts, seat, true, err
+		if session.IsTransient(ctx, err) {
+			return game.State{}, opts, seat, true, err
+		}
+		return game.State{}, opts, seat, true, fmt.Errorf("%w: %w", session.ErrFold, err)
 	}
 	if st.Phase != game.PhaseEnded {
 		return game.State{}, opts, seat, true, errNotEnded

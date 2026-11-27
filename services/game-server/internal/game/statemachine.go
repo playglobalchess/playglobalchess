@@ -49,6 +49,10 @@ func (p Phase) String() string {
 // NoSeat marks "no seat" in the int-valued seat fields of State.
 const NoSeat = -1
 
+// ErrUnknownEvent marks an event type this build does not know: a stream
+// written by a newer build. It is not proof of a corrupt stream.
+var ErrUnknownEvent = errors.New("unknown event type")
+
 var (
 	// ErrLegacyTakeback: a stream holds the pre-GS-7 TakebackReq/TakebackAccepted
 	// events. They stay decodable but are never folded (GS-7 §5.1, Q-V3: no
@@ -300,7 +304,7 @@ func Evolve(s State, ev Event, v *Verdict, opts FoldOptions) (State, error) {
 	case EvRatingApplied:
 		next, err = applyRatingApplied(s, ev)
 	default:
-		return s, fmt.Errorf("unknown event type %d", ev.Type)
+		return s, fmt.Errorf("%w %d", ErrUnknownEvent, ev.Type)
 	}
 	if err != nil {
 		return s, err

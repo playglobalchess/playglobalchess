@@ -393,8 +393,10 @@ func (s *Server) armFlagTicker(gameID string) {
 					// No seat got GAME_END: record both as missed, so each one's
 					// next AUTHENTICATE pushes the ended STATE (#102), before the
 					// drop clears the index that names them.
-					for seat, uid := range s.seatUsers(gameID) {
-						s.recordMissedEnd(uid, gameID, seat)
+					if _, indexed := s.indexStore(); !indexed { // with the index, the recent rows are the record
+						for seat, uid := range s.seatUsers(gameID) {
+							s.recordMissedEnd(uid, gameID, seat)
+						}
 					}
 					s.dropGame(gameID)
 					return
@@ -808,21 +810,32 @@ func (s *Server) broadcastGameEnd(gameID string) endOutcome {
 	}
 	users := s.seatUsers(gameID)
 	msg := gameEndMsg(gameID, sp.ResultVector, sp.Terminal)
+	_, indexed := s.indexStore()
+	var delivered []string
 	for seat := uint8(0); seat < 2; seat++ {
 		if cc, present := s.connFor(gameID, seat); present && s.send(ctx, cc, msg) {
+			if uid := users[seat]; uid != "" {
+				delivered = append(delivered, uid)
+			}
 			continue
 		}
-		// This seat did not get GAME_END (offline, or its write was refused): note
-		// it, so its next AUTHENTICATE pushes the ended STATE once (#102). A seat
-		// that got GAME_END live is never sent the ending again unasked.
-		if uid := users[seat]; uid != "" {
+		// This seat did not get GAME_END (offline, or its write was refused): its
+		// next AUTHENTICATE pushes the ended STATE once (#102). With the index
+		// on, the ending's user_recent_games row is that record; otherwise it
+		// is noted in memory. A seat that got GAME_END live is never sent the
+		// ending again unasked.
+		if uid := users[seat]; uid != "" && !indexed {
 			s.recordMissedEnd(uid, gameID, seat)
 		}
 	}
+
 	// The game is over; drop the live session so the node reclaims it. The stream
 	// persists in the store, and endedState rebuilds a read-only ended view from
 	// it for a late reconnect (missed ending) or a RESYNC (#102).
 	s.dropGame(gameID)
+	// With the index on, a seat that saw GAME_END consumes its recent row. It
+	// runs after the drop, so a slow store holds neither the claim nor the game.
+	s.consumeRecent(ctx, gameID, delivered)
 	return endSent
 }
 
