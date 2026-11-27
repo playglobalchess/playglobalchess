@@ -282,6 +282,7 @@ events write it and whether that event carries everything needed.
 |---|---|---|---|---|
 | Phase, Seats, Rated, StartFEN, PoolID, TimeControl | `GameCreated` | same | event body | yes |
 | Joined | all false | `PlayerJoined` | event body | yes |
+| Players | all empty | `PlayerJoined` (user id of the joining seat) | event body | yes. Added by GS-8 stage 1 step 2 (2026-11-27): the ending write names its index keys from it, and an adopted game rebuilds its seat map from it |
 | Ply, TurnIdx | 0 / seat of white | `MovePlayed` (+1), `TakebackRewound` (= `to_ply`) | event body | yes |
 | Clock per seat | `BaseMs` | `MovePlayed` (mover), `TakebackRewound` (both, §5.4), `ClockFlagged` (flagged seat set to 0) | `ClockAfterMs` in History; 0 on flag | yes |
 | Clock.FlaggedSeat | none | `ClockFlagged` | event body | yes |

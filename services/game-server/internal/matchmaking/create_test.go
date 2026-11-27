@@ -255,3 +255,42 @@ func TestMemoryPool_ClaimerMustStillBeWaiting(t *testing.T) {
 		t.Fatalf("claim = %+v ok=%v, want the partner", got, ok)
 	}
 }
+
+// #227 end to end: the same user seeking twice is never paired with themselves,
+// both seeks stay waiting, and no stream is created. A different user then pairs
+// with one of them.
+func TestSeek_SameUserTwoSeeksNeverPair(t *testing.T) {
+	m, pool, _ := newTestMatchmaker(t, true)
+	ctx := context.Background()
+	if _, matched, err := m.Seek(ctx, seeker("s1", "alice")); err != nil || matched {
+		t.Fatalf("first seek: matched=%v err=%v", matched, err)
+	}
+	if _, matched, err := m.Seek(ctx, seeker("s2", "alice")); err != nil || matched {
+		t.Fatalf("alice's second seek paired with herself: matched=%v err=%v", matched, err)
+	}
+	pool.mu.Lock()
+	waiting := len(pool.waiting)
+	pool.mu.Unlock()
+	if waiting != 2 {
+		t.Fatalf("%d seeks waiting, want both of alice's", waiting)
+	}
+	match, matched, err := m.Seek(ctx, seeker("s3", "bob"))
+	if err != nil || !matched {
+		t.Fatalf("bob did not pair: matched=%v err=%v", matched, err)
+	}
+	if match.Players[0] == match.Players[1] {
+		t.Fatalf("one user in both seats: %v", match.Players)
+	}
+}
+
+func TestMemoryPool_TryClaimSkipsTheSameUser(t *testing.T) {
+	p := NewMemoryPool()
+	ctx := context.Background()
+	a, b := sk("a", 1500, 0, false), sk("b", 1500, 0, false)
+	b.UserID = a.UserID
+	_ = p.Enqueue(ctx, a)
+	_ = p.Enqueue(ctx, b)
+	if _, ok, err := p.TryClaim(ctx, b, DefaultWindow, now); err != nil || ok {
+		t.Fatalf("claimed the same user's other seek: ok=%v err=%v", ok, err)
+	}
+}

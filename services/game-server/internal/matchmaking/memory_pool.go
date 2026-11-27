@@ -52,8 +52,8 @@ func (p *MemoryPool) TryClaim(_ context.Context, newSeeker Seeker, _ Window, _ t
 		return Seeker{}, false, nil
 	}
 	for id, s := range p.waiting {
-		if id == newSeeker.SeekID || p.claimed[id] {
-			continue
+		if id == newSeeker.SeekID || p.claimed[id] || sameUser(s, newSeeker) {
+			continue // never self-pair, by seek or by user (#227)
 		}
 		if s.PoolID != newSeeker.PoolID || s.TimeControl != newSeeker.TimeControl {
 			continue // never pair different clocks (#93)

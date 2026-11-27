@@ -121,3 +121,27 @@ func TestMemoryPool_TimeControlMustMatch(t *testing.T) {
 		t.Fatal("MemoryPool paired across different time controls")
 	}
 }
+
+// #227: one user with two seeks (two tabs, a retry) must never be paired with
+// themselves. The index write refuses a game with one user in both seats.
+func TestBestMatch_NeverPairsOneUserWithThemselves(t *testing.T) {
+	a := sk("a", 1500, 0, true)
+	b := sk("b", 1500, 0, true)
+	b.UserID = a.UserID
+	if _, ok := bestMatch(a, []Seeker{b}, DefaultWindow, now); ok {
+		t.Fatal("paired two seeks of one user")
+	}
+	// A different user at the same rating still pairs.
+	c := sk("c", 1500, 0, true)
+	if got, ok := bestMatch(a, []Seeker{b, c}, DefaultWindow, now); !ok || got.SeekID != "c" {
+		t.Fatalf("got %v %v, want the other user's seek c", got.SeekID, ok)
+	}
+}
+
+func TestBestMatch_EmptyUserIDsAreNotTheSameUser(t *testing.T) {
+	a, b := sk("a", 1500, 0, true), sk("b", 1500, 0, true)
+	a.UserID, b.UserID = "", ""
+	if _, ok := bestMatch(a, []Seeker{b}, DefaultWindow, now); !ok {
+		t.Fatal("two identity-less seekers were blocked from pairing")
+	}
+}

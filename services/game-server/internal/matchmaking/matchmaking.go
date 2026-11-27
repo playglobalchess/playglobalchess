@@ -95,8 +95,8 @@ func bestMatch(newSeeker Seeker, waiting []Seeker, w Window, now time.Time) (See
 	found := false
 	bestDelta := 0
 	for _, c := range waiting {
-		if c.SeekID == newSeeker.SeekID {
-			continue // never self-pair
+		if c.SeekID == newSeeker.SeekID || sameUser(c, newSeeker) {
+			continue // never self-pair: not the same seek, and not the same user (#227)
 		}
 		if c.PoolID != newSeeker.PoolID || c.Rated != newSeeker.Rated || c.TimeControl != newSeeker.TimeControl {
 			// Pool invariant (same pool_id ⇒ same rated-ness and time control);
@@ -128,4 +128,12 @@ func better(delta int, c Seeker, bestDelta int, best Seeker) bool {
 		return c.EnqueuedAt.Before(best.EnqueuedAt)
 	}
 	return c.SeekID < best.SeekID
+}
+
+// sameUser reports whether two seeks belong to one user (two tabs, or a retry
+// after a lost reply). Pairing them would put one user in both seats, which the
+// index write refuses (#227). An empty UserID never matches, so a seeker with no
+// identity is not blocked from pairing.
+func sameUser(a, b Seeker) bool {
+	return a.UserID != "" && a.UserID == b.UserID
 }
