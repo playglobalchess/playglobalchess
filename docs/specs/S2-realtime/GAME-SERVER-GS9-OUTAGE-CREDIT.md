@@ -5,7 +5,7 @@
 | Spec ID | SPEC-S2-GAME-SERVER-GS9 (closes GS-6 Q-GS6f; amends GS-6 §3.5, GS-7 §3.5, GS-8 §4.1, PROTOCOL §4A) |
 | Owner | S2 Real-time |
 | Status | DRAFT |
-| Version | 0.7 (v0.6 plus the v0.6 review: abort answers every command, adoption is part of the start gap, pause signals reach reconnecting clients) |
+| Version | 0.8 (v0.7 plus the v0.7 review: the ticker's no-proof wait, the client release rule, the proof gate after the clock-free rows, merged gaps, bounded abort writes) |
 | Last updated | 2026-11-27 |
 | Fixes (issues) | #207; also supplies the restart-downtime rule GS-8 stage 1 needs (GS-8 Q1) |
 | Depends on | GS-8 stage 1 step 2 (`startGame`, adoption, UUIDv7 game ids); GS-4; GS-6 (ticker, #97, #182); GS-7 (fold, `LastChangeTS`, #124, #183) |
@@ -47,7 +47,7 @@ every citation. v0.7 adds the rows marked new.
 | What happens | What the player sees |
 |---|---|
 | A hiccup under 1.5 s | Nothing. It counts as network lag (#82). |
-| We cannot serve for 1.5 s to 2 min (store outage, process pause, restart, deploy) | A "server problem, clocks paused" notice. Both clocks stop where they were and nobody flags. A move made meanwhile shows as pending on the board and is sent when service returns. The clocks then show exactly what they showed before. |
+| We cannot serve for 1.5 s to 2 min (store outage, process pause, restart, deploy) | A "server problem, clocks paused" notice. Both clocks stop where they were and nobody flags. A move made meanwhile shows as pending on the board and is sent when the notice ends (`paused: false` and a matching STATE). The clocks then show exactly what they showed before. |
 | We cannot serve for more than 2 min | The game is aborted with no rating change and a message saying why. A pending move is discarded. |
 
 Lichess gives +10 to +20 s on a planned restart, nothing for a crash, and never
@@ -245,7 +245,7 @@ command sets it to now (on) or to 0 (off). The command is an `Update` with
 
 ## 5. The clock projection
 
-`game.Gaps` (new) is a sorted, merged list of half-open intervals
+`game.Gaps` (new) is a sorted list of half-open intervals
 `[start, end)` with a `suspect` flag each, already clipped to `enabled_at_ms`.
 `Gaps.Overlap(a, b)` is the length of the union of gaps inside `[a, b]`. It
 uses binary search, so a long gap list stays off the hot path. With the switch
@@ -261,7 +261,9 @@ today.
 |---|---|
 | `State.ElapsedMs(nowMs)` (`game/statemachine.go:185`) | Takes `g Gaps`: `max(0, (nowMs - LastChangeTS) - g.Overlap(LastChangeTS, nowMs))`. Its three callers pass the snapshot's gaps: the move charge (`game/pipeline.go:274`), `firstMoveTimedOut` (`:352`) and `sideToMoveFlagged` (`:398`). |
 | `State.ClocksAt(nowMs, tc)` (`game/statemachine.go:196`) | Takes `g Gaps` and passes it to `ElapsedMs`. |
-| `NextTickMs(s, opts)` (`game/pipeline.go:361`) | Takes `g Gaps`. Both deadlines (`:371,382`) start at `d = LastChangeTS + limit + 1`. Let `L = LastChangeTS`. Walk the gaps in order of start, clip each to `[max(g1, L), g2)`, skip an empty clip, and for each one with `g1' <= d` set `d = d + (g2 - g1')`. One pass. This covers a gap that lies wholly between `L` and `d`, a gap that starts before `L`, and adjacent gaps, because `d` grows as the walk goes on. A gap only pushes a deadline later, so a timer that fired early just finds nothing to do, and the session republishes (`session/session.go:97`). |
+| `NextTickMs(s, opts)` (`game/pipeline.go:361`) | Takes `g Gaps`. Both deadlines (`:371,382`) start at `d = LastChangeTS + limit + 1`. Let `L = LastChangeTS`. Walk the gaps in order of start, clip each to `[max(g1, L), g2)`, skip an empty clip, and for each one with `g1' < d` set `d = d + (g2 - g1')`. A gap that starts exactly
+at `d` does not move it: `ElapsedMs` at `d` overlaps that gap by 0 ms and flags
+at `d`. One pass. This covers a gap that lies wholly between `L` and `d`, a gap that starts before `L`, and adjacent gaps, because `d` grows as the walk goes on. A gap only pushes a deadline later, so a timer that fired early just finds nothing to do, and the session republishes (`session/session.go:97`). |
 | `SnapshotOf(st, now, tc)` (`session/commands.go:45`) | Takes the proof snapshot (section 6). With a fresh proof `effNow = now`; without one `effNow = renewedMs`, so a STATE sent during an unrecorded gap shows the clock frozen at the last proof. `ServerT = effNow`. The ended-game view (`transport/transport.go:425`) passes no gaps; no clock runs on an ended game. |
 | `moveTimeMs` (`game/pipeline.go:317`) | Unchanged. The receipt time `r` is clamped as today, and the charge is `ElapsedMs(r, g)`: a gap before `r` is not charged, and the time between `r` and the decision is charged to nobody, as today (#183). |
 
@@ -275,7 +277,9 @@ today.
   UUIDv4 id, and its `CreatedMs` is **0**, so the abort rule treats it as
   having lived through every gap. That is safe, because every gap is clipped to
   `enabled_at_ms` and a game that existed before the switch was turned on did
-  live through any gap after it. Such games are adopted, never refused. Tests
+  live through any gap after it. Such games are adopted, never refused. GS-8 step 2 mints UUIDv7 ids from its
+  first commit on (section 13 orders it first), so a v4 id is never minted after
+  it. Tests
   pass `CreatedMs` explicitly.
 - **Fair play.** Think time is the `ServerTS` difference minus `Overlap` over
   the same interval. No consumer exists in this tree yet. The first one must
@@ -289,7 +293,7 @@ today.
 atomic pointer:
 
 ```
-Snapshot{ RenewedMs, Gaps, Enabled, Ready, Superseded }
+Snapshot{ RenewedMs, Gaps, LongRealStartMs, Enabled, Ready, Superseded }
 ```
 
 It is replaced after every committed renewal and every lease reread. The
@@ -304,15 +308,18 @@ never fresher.
 and therefore no proof. A node that is still adopting (section 4, Start) is not
 `Ready`, so it has no proof.
 
-**Re-check before the write.** For the four commands that need proof, `exec`
-takes a fresh snapshot and reads `nowMs` again immediately before `Append` or
-`AppendBatch`, and returns `ErrNoProof` if `fresh` no longer holds. This narrows
+**Re-check before the write.** For a decision that was made **under the proof**
+(the four commands of step 2, after their clock-free rows), `exec` takes a
+fresh snapshot and reads `nowMs` again immediately before `Append` or
+`AppendBatch`, and returns `ErrNoProof` if `fresh` no longer holds. It does not
+apply to an outage abort or to any command that needs no proof: the abort reads
+only stored facts, so a lapse of the proof must not turn it into `SERVER_BUSY`. This narrows
 the window in which a pause between `Decide` and the write can let a stale
 decision land to the latency of the append itself. It cannot close it, and the
 residual is the one section 1 states.
 
 **Order inside `Decide` (new, `game/pipeline.go:185`).** With the switch on:
-1. **Outage abort.** If `outageAbortDue(s, createdMs, snap.Gaps)`, `Decide`
+1. **Outage abort.** If `outageAbortDue(s, createdMs, snap)`, `Decide`
    returns the outage abort (section 8) **for every command except
    `CmdFinishHalfTerminal`**, resign and the draw and takeback commands
    included. This replaces v0.5's queued abort. It does not
@@ -321,7 +328,16 @@ residual is the one section 1 states.
 2. **Proof.** These commands need `fresh`, or `Decide` returns
    `game.ErrNoProof` and nothing else: `CmdMove`, `CmdTickFlag`,
    `CmdAcceptTakeback` and `CmdStartClock`. They are the commands that read a
-   running clock or set its baseline.
+   running clock or set its baseline. **The check sits at the first clock read
+   or baseline write inside each decide function, after its clock-free rows.**
+   For `decideMove` (`game/pipeline.go:227-260`) that is after the unknown-game,
+   seat, duplicate re-ack, game-over, stale-ply and not-your-turn rows, and just
+   before `moveTimeMs` (`:266`). A re-ack of a move that landed, a move on an
+   ended game and every other cheap reject are therefore answered with no
+   proof and are never `SERVER_BUSY`. `SERVER_BUSY` is returned only for a move
+   that would otherwise have been applied, so it still guarantees "not
+   applied". `decideTick` on an ended or unstarted game returns its no-op
+   without proof.
 3. Today's decision, with `snap.Gaps` passed to the clock functions of
    section 5.
 
@@ -342,7 +358,9 @@ unrated game.
 **Every command is answered when the rule fires.** `MoveOutcome` gains
 `Voided bool` (`game/pipeline.go:51`): the game was ended by the outage rule
 and the move was not processed. `Decide` sets it for `CmdMove`, and `handleMove`
-adds `case out.Voided: s.broadcastGameEnd(p.GameID)` beside `Flagged`
+adds `case out.Voided: s.broadcastGameEnd(p.GameID)` beside `Flagged`, and the
+comment on `MoveOutcome` ("exactly one of Accepted / Rejected / Flagged") adds
+`Voided`
 (`transport/handlers.go:526-588`). Without it a MOVE gets no reply, because
 `handleMove` has no case for an outcome with no flag set. The ticker, the draw
 and takeback handlers, resign and abort already reply from the state.
@@ -353,7 +371,7 @@ and takeback handlers, resign and abort already reply from the state.
 - `handleMove` maps it to `MOVE_REJECTED{SERVER_BUSY}` (section 7).
 - `handleEnding` maps it to `ERROR{SERVER_BUSY}` for a takeback accept.
 - The flag ticker does not count it as an error or log it
-  (`transport/handlers.go:335-346`). Its loop changes in three ways:
+  (`transport/handlers.go:335-346`). Its loop changes in five ways:
   1. **No lost wakeup.** At the top of every iteration it takes
      `r := node.Restored()` **before** it reads `NextTick` and runs
      `TickGameOver`. `Restored()` returns the current channel, which is closed
@@ -364,12 +382,41 @@ and takeback handlers, resign and abort already reply from the state.
      still wakes, so a game voided by a long gap is ended, and a game whose
      deadline moved is re-armed.
   3. **Bounded wake.** A wake on `r` waits a random delay in a window of
-     `max(1 s, N / R)`, with `N` live games and `R` outage-abort writes per
-     second (default 200, a tuning value for G-E). The abort writes themselves
-     go through a token bucket at `R`, so recovery does not become a write
-     storm. Commands that arrive from players are not rate-limited by it; they
-     are bounded by the connection rate and the abort rule has already stopped
-     everything else for that game.
+     `min(30 s, max(1 s, N / R))`, with `N` live games and `R` outage-abort
+     writes per second (default 200, a tuning value for G-E). The wait is a
+     `select` on the delay timer, server shutdown and `sess.Closed()`, so it
+     never delays a shutdown or outlives its session. The window is capped
+     because pacing is the token bucket's job (below), not the jitter's.
+  4. **`ErrNoProof` parks the ticker; it neither spins nor loses a wake.** When
+     `TickGameOver` returns `ErrNoProof`, the loop does **not** go back to the
+     top. It waits on the `r` it took **before** that failed check, with no
+     timer armed, plus a fallback `retryAt = now + iv` (one tick interval,
+     `handlers.go:380-386`'s "never spin" rule extended to this path). A
+     restoration that landed after `r` was taken has already closed it, so the
+     wait returns at once; a wake that is somehow missed costs one interval.
+     Today's guard runs only after a nil error, so without this rule a due,
+     past deadline would re-arm with `wait = 0` and call `TickGameOver` in a hot
+     loop for the whole pause, once per game.
+  5. **A wake on `r` falls through.** Today only `t.C` falls through to the
+     check, and `TickChanged` does `continue` (`handlers.go:320-324`). A wake on
+     `r` runs `EnsureClockStarted` and then the check, as the timer does.
+- **`Restored()` is an atomic swap, then close.** `Node` holds the channel in an
+  atomic pointer. A restoration stores a new channel and then closes the one it
+  replaced, so a caller never receives a closed channel that will not be
+  replaced. With a nil `Service` (switch off) `Restored()` returns a nil
+  channel, which never fires in a `select`.
+- **Bounded outage-abort writes.** One token bucket at `R` (default 200 per
+  second) guards the two **sweep** sources of outage aborts: the ticker's wake
+  (above) and adoption. Adoption (`NewSession` during GS-8 stage 1 adoption)
+  takes a token before it builds a session whenever the snapshot's
+  `LongRealStartMs` is non-zero, and the adoption pool has a fixed width
+  (default 16). An abort that a player's own command triggers is not limited
+  by the bucket: its rate is the players' command rate, and it is the same
+  single write the sweep would have made. With `N = 100k` and `R = 200` a full
+  sweep takes about 500 s. That is accepted: every voided game already refuses
+  everything but the abort, so the delay costs nobody a clock decision, and an
+  idle game has no running clock because its clock is unstarted or its mover is
+  frozen by the gap. The test measures the write rate.
 - `NewSession` runs `CmdFinishHalfTerminal` and then `CmdStartClock`
   (`session/session.go:187-192`). Today any error from either fails the build.
   v0.7 changes it: `errors.Is(err, game.ErrNoProof)` from `CmdStartClock` is not
@@ -395,13 +442,19 @@ signatures change, and they are edited to pass empty gaps and a nil snapshot.
 connection's resign and resync frames. A command the server cannot decide is
 answered at once:
 - `MOVE` with no proof: `MOVE_REJECTED{reason: SERVER_BUSY}` with the current
-  ply. The rejection is decided in `Decide` before any write, so the move was
-  **not applied**.
+  ply. `Decide` returns `ErrNoProof` before any write and `handleMove` maps it, so
+  the move was **not applied**.
 - `TAKEBACK_ACCEPT` with no proof: `ERROR{SERVER_BUSY}`, through
   `mapSessionErr` (`transport/handlers.go:732`).
-- `SEEK` with no proof: `ERROR{SERVER_BUSY}`. A node without a proof creates no
-  game and runs no matchmaking. The check sits next to the rated-play gate
-  (`transport/handlers.go:123`).
+- `SEEK` with no proof: `ERROR{SERVER_BUSY}`. The check sits next to the
+  rated-play gate (`transport/handlers.go:123`), before any pool lookup. **This
+  is the only creation path.** `matchmaking.Seek` is called only from
+  `handleSeek` (`transport/handlers.go:156`), it creates a game only inside that
+  call (`matchmaking/create.go:142,162`), and no background goroutine pairs
+  queued seekers. A queued seeker is paired only by a later seeker's `Seek`,
+  which is gated. A test pins that no other caller exists. A process pause
+  between the gate and the append can still commit a game stamped before the
+  pause; section 8 says what that costs.
 - `RESIGN`, the draw commands, `TAKEBACK`, `TAKEBACK_DECLINE` and a client
   `ABORT` need no proof and are decided as usual, except that the outage abort
   rule comes first (section 6). `RESYNC` and STATE are served with the frozen
@@ -418,7 +471,9 @@ channels. A watcher checks every P.
   STATE for its game; (4) it sends `SERVICE_STATUS{paused: false}`. A client
   that sees `paused: false` therefore never gets `SERVER_BUSY` for a reason that
   still holds. The fan-out goes through each connection's bounded outbound
-  queue (`transport/pump.go:51`), so a slow client cannot stall it, and it is
+  queue (`transport/pump.go:66`, `Write`), so a slow client cannot stall it (a
+  full queue closes the connection, so a lost `paused: false` cannot strand a
+  client: it reconnects and AUTHENTICATE reports the status), and it is
   paced with the same window as the ticker wake (section 6).
 - **A connection that authenticates during a pause** gets
   `SERVICE_STATUS{paused: true}` **before** its STATE (the STATE push of
@@ -437,28 +492,37 @@ most one send in flight.
 1. On `paused: true`, or while the connection is down: stop the local clock tick
    and show "Server problem, clocks paused". A move the player makes is shown
    on the board as pending and is **not sent**.
-2. **Release.** An unsent pending move is sent when a STATE arrives whose ply
-   **and** position equal the pending move's, and the last `SERVICE_STATUS` on
-   this connection is not `paused: true`. That covers `paused: false`, and a
-   reconnect during which the server sent no `paused: true`. If the ply or the
+2. **Release.** The client keeps the latest STATE and the latest
+   `SERVICE_STATUS` of the connection. It evaluates the release rule on **both**
+   events: an unsent pending move is sent when the latest STATE has the pending
+   move's ply **and** position and the latest status is not `paused: true`. The
+   restoration order is STATE, then `paused: false` (section 7), so the move is
+   normally sent on `paused: false`; a reconnect during which the server sent no
+   `paused: true` releases it on the STATE. If the latest STATE's ply or
    position differs, the pending move is discarded: the game moved on (an outage
    abort, a resign, a takeback).
 3. On `MOVE_REJECTED{SERVER_BUSY}` for the move in flight: it was not applied.
    It becomes unsent again, and is sent on `paused: false`, or after 1 s,
    doubling up to 8 s, until a `GAME_END`, a `MOVE_ACCEPTED` for its ply, or a
    STATE that differs arrives.
-4. **Never resent after a send that got no reply.** If the connection drops after
+4. **Any other reply discards the pending move and resyncs.** A
+   `MOVE_REJECTED` with any reason other than `SERVER_BUSY`, and any `ERROR`
+   (including `ERROR{INTERNAL}`, "move not confirmed", `transport/handlers.go:531`)
+   for the move in flight, clears it and sends RESYNC. The STATE that comes
+   back is the truth.
+5. **Never resent after a send that got no reply.** If the connection drops after
    the frame was written and before any reply, the move may have landed. The
    client discards it and reads the STATE of the reconnect. This is why the
    match is on position as well as ply: after a takeback the same ply recurs,
    and a move that already landed must not be applied a second time.
-5. A pending move is lost if the app closes. The player's clock was stopped, so
+6. A pending move is lost if the app closes. The player's clock was stopped, so
    the cost is one move to play again.
 
 This is the **one exemption** from PROTOCOL's rule that a client never resends
 a `MOVE` (`docs/specs/S2-realtime/PROTOCOL.md:312`). It is safe for three reasons:
-`SERVER_BUSY` is decided before any write; the client resends only a move it
-knows was not applied (rules 3 and 4); and a duplicate of a move that did land
+`SERVER_BUSY` is returned before any write, and only for a move that would have
+been applied (section 6); the client resends only a move it
+knows was not applied (rules 3 and 5); and a duplicate of a move that did land
 is still re-acked by the duplicate-MOVE rule (`game/pipeline.go:234-251`). No
 other rejection or error allows a resend.
 
@@ -474,14 +538,32 @@ section 1 states the residual.
 T is **2 minutes**. A **real** gap longer than T voids every game it overlapped.
 A suspect gap never aborts.
 
-`outageAbortDue(s, createdMs, gaps)` (new, `game` package) is true when all of
+`outageAbortDue(s, createdMs, snap)` (new, `game` package) is true when all of
 these hold:
 - `s.Phase` is `Matched` or `Live`,
 - `s.HalfTerminal == nil` and `s.LastMoveTerminal() == nil` (a game already
   decided is finished by `CmdFinishHalfTerminal`, never aborted),
-- some gap is not suspect, is longer than T, and ends after `createdMs`. No
-  game can be created during a gap (section 7), so such a gap overlapped the
-  game's life.
+- `snap.LongRealStartMs > createdMs`. `LongRealStartMs` is the start of the
+  latest **merged real** interval longer than T (0 when there is none), computed
+  once when a gap is committed, so the check is O(1) and the gap list is not
+  scanned on every `Decide`. A game created before the gap started lived
+  through it. A game created at or after the start was created by a commit
+  inside the interval, which can happen only when a pause fell between the
+  `SEEK` gate and the append (section 7); that game is not voided by that gap.
+  A UUIDv4 game has `CreatedMs = 0` and is voided by any such gap.
+
+**Merging for the abort.** Two interval sets are kept. The **credit set** holds
+every gap, suspect or not, merged where intervals overlap or abut
+(`end == start`); `Overlap` and the clock functions read it. The **abort set**
+holds the real gaps only, merged the same way, and a merged interval longer
+than T voids games. A suspect gap never joins the abort set, so a one-hour
+forward clock step next to a 1 s real gap does not abort anything. The start
+gap (section 4, Start) is always written `suspect = false`, and every
+renewal that extends it rewrites that. A crash during adoption leaves
+`[G0, t_last)` and the next claim writes `[t_last, t2')`, two items that abut:
+the merged interval is their sum, so a crash loop inside the start window
+still adds up and aborts when the total passes T. Serving time between two
+crashes separates the gaps, and they do not add.
 
 **The decision.** `Decide` returns `Aborted{By: SystemActor}` followed by
 `GameEnded{ResultVector: Draw, Draw; Termination: ABORT_OUTAGE}` with
@@ -634,7 +716,13 @@ Serving and clients:
 - A MOVE without a proof gets `MOVE_REJECTED{SERVER_BUSY}` and nothing is
   appended. Sent again after the proof returns, it is applied once and charged
   nothing for the outage. Sent twice after it landed, it is re-acked.
-- A SEEK without a proof is refused and enqueues nothing.
+- A SEEK without a proof is refused and enqueues nothing. A grep-based test
+  fails if `matchmaking.Seek` gains a second caller.
+- A MOVE that is a duplicate of one that landed, a MOVE on an ended game, a
+  stale-ply MOVE and a not-your-turn MOVE without a proof get their normal
+  reply, never `SERVER_BUSY`. Only a move that would be applied gets BUSY.
+- An outage-abort decision does not return `ErrNoProof` when the proof lapses
+  between `Decide` and the append.
 - RESIGN on the same connection right after a BUSY is read and applied.
 - STATE without a proof shows `server_t` equal to the last proof.
 - Pause and restore: every seated connection gets `paused: true`, then a STATE
@@ -642,6 +730,13 @@ Serving and clients:
 - The ticker without a proof logs nothing, backs off nothing, and wakes on
   `Restored()`. A restoration that lands between the ticker's `NextTick` read and
   its sleep still wakes it (fault injection at that point).
+- `ErrNoProof` in the ticker: no hot loop (the call count over a 10 s pause with
+  1,000 due games stays near one per interval), and a restoration injected
+  between the failed check and the wait still wakes it at once.
+- `Restored()` swap: a caller never receives a closed channel that is not
+  replaced; with a nil `Service` it returns a channel that never fires. A wake
+  on `r` runs `EnsureClockStarted` and the check. Shutdown and `sess.Closed()`
+  interrupt the jitter wait.
 - An idle game with an unarmed ticker (clock not started, or no deadline) and a
   real gap over T is ended after restoration. A game whose session was built
   without a clock because of `ErrNoProof` starts it through
@@ -655,13 +750,25 @@ Serving and clients:
 - A superseded node stops serving and closes every session.
 - Recovery herd: N live games, a gap over T, every game aborted at no more than
   R writes per second (token bucket), jitter window `max(1 s, N / R)`, and the
-  STATE fan-out measured against the outbound queue bound.
+  STATE fan-out measured against the outbound queue bound. Adoption of N voided
+  games takes a token per game, and the measured abort write rate stays at or
+  below R.
 - Slow adoption: a node that takes longer than the first-move timeout to adopt
   N games credits each game the time until it is `Ready`, and a crash during
   adoption loses none of it. An adoption longer than T aborts every game.
+- Merged abort set: a 90 s real gap followed by an abutting 90 s real gap
+  aborts; two 90 s gaps with serving time between them do not. A real 1 s gap
+  abutting a one-hour suspect gap does not abort. A restart during adoption
+  loses no time and the start gap stays real. `LongRealStartMs` equals a brute
+  force over the gap list.
+- A game created inside a gap (a pause between the SEEK gate and the append) is
+  not voided by that gap, and one created before it is.
 - A game with a UUIDv4 id has `CreatedMs = 0`; with the switch on, a gap after
   `enabled_at_ms` over T aborts it, and a gap before it does nothing.
-- Web client (amends WEB-F01's contract tests): a pending move is sent on
+- Web client (amends WEB-F01's contract tests): STATE then `paused: false`
+  releases the pending move on the second event, and `paused: false` then a STATE
+  also releases it. Any `MOVE_REJECTED` other than BUSY and any `ERROR` for the
+  move in flight discards it and sends RESYNC. A pending move is sent on
   `paused: false` at the same ply and position, and discarded at a different ply
   or position. It is resent after a BUSY with backoff, never after a send that
   got no reply, and never after any other error. A takeback to the same ply with
@@ -673,7 +780,9 @@ Codec: golden vectors for `0x0B`, reason `0x07`, error `0x07` and
 `SERVICE_STATUS`; parity in every decoder; `negative.rs` updated.
 
 Mutations, each recorded in the PR: overlap ignored; `NextTickMs` shifting only
-when the deadline lies inside a gap; ticker taking `Restored()` after the
+when the deadline lies inside a gap, or shifting for a gap that starts exactly at
+the deadline; `ErrNoProof` re-arming with a zero wait; BUSY returned for a
+re-ack; ticker taking `Restored()` after the
 check; ticker without `Restored()` in the unarmed case; resign exempt from the
 abort rule; flag decided without a
 proof; snapshot taken after `nowMs`; lease written without its gap; gap
@@ -761,6 +870,25 @@ Each step is one PR with its tests. Step 1 needs GS-8 stage 1 step 2 merged.
 | N4 linear scan | §5 binary search |
 | N5 `TransactionConflict` between renewals | §4 at most one in flight; a conflict is a failed renewal, resolved by read-back |
 | N6 herd includes the STATE fan-out | §7 bounded queues; §10 recovery herd |
+
+### v0.7 review (0 blockers, 8 should-fix points, 5 nits)
+
+| Finding | Where answered |
+|---|---|
+| F1 ticker spin or lost wake on `ErrNoProof` | §6 ticker rules 4 and 5; §10 |
+| F2 release rule never releases | §7 client rule 2, evaluated on STATE and on `paused: false`; §10 |
+| F3 stuck pending move; BUSY for a move that landed | §7 client rule 4; §6 proof sits after the clock-free rows; §10 |
+| F4 abort writes bounded only in the ticker | §6 bounded outage-abort writes (ticker and adoption, capped window); §10 |
+| F5 merging, merged suspect, O(1) check | §8 merging for the abort, `LongRealStartMs`; §4 start gap is always real; §10 |
+| F6 creation paths | §7 SEEK: `handleSeek` is the only path (code-checked); §8 rule; §10 |
+| F7 re-check scope | §6 re-check applies to decisions made under proof only; §10 |
+| F8 wake plumbing | §6 swap-then-close, nil channel, fall-through, interruptible wait; §10 |
+| N1 `<=` in the walk | §5 `<` |
+| N2 v4 never minted after step 2 | §5 |
+| N3 one wording for `ErrNoProof` | §7 |
+| N4 §1 table | §1 |
+| N5 `pump.go` citation | §7 |
+| `MoveOutcome` comment | §6 (the comment at `game/pipeline.go:49` is updated with `Voided`) |
 
 ### v0.6 review (0 blockers, 13 should-fix points, 7 nits)
 
