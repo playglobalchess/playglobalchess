@@ -197,6 +197,19 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 		return false
 	}
 	st.userID = uid
+	// With the index on, the user's games come from it (GS-8 4.4). Read it
+	// before the connection counts as authenticated: if it fails, the user gets
+	// a retryable INTERNAL and the connection closes, so no SEEK can pair a user
+	// whose live game could not be found into a second game.
+	var ix userIndex
+	idx, indexed := s.indexStore()
+	if indexed {
+		if ix, err = s.lookupUser(ctx, idx, uid); err != nil {
+			log.Printf("transport: AUTHENTICATE of %s: index lookup: %v", uid, err)
+			s.send(ctx, c, errorMsg(codec.ECInternal, "could not look up your games, reconnect"))
+			return false
+		}
+	}
 	// Register this connection as the user's current one (used by MATCHED
 	// delivery to reach an already-waiting seeker, and by reconnect rebinding).
 	s.userMu.Lock()
@@ -206,7 +219,11 @@ func (s *Server) authenticate(ctx context.Context, c Conn, st *connState) bool {
 	// AUTHENTICATE the server itself restores any live game this user is seated
 	// in — rebind the seat to THIS (new) connection and push STATE folded from the
 	// durable stream. A fresh user with no live game simply proceeds to SEEK.
-	s.resyncUser(ctx, c, st)
+	if indexed {
+		s.resyncFromIndex(ctx, c, st, ix)
+	} else {
+		s.resyncUser(ctx, c, st)
+	}
 	return true
 }
 

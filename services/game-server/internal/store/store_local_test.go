@@ -182,3 +182,16 @@ func TestIntegration_IndexContract(t *testing.T) {
 		return s
 	})
 }
+
+// TestIntegration_RepairContract runs the repair contract against DynamoDB Local.
+func TestIntegration_RepairContract(t *testing.T) {
+	db := dynamoLocal(t)
+	runRepairContract(t, func(t *testing.T) game.IndexedStore {
+		recreateTables(t, db)
+		s, err := New(context.Background(), db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	})
+}

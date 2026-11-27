@@ -89,6 +89,38 @@ func (m *MemStore) AppendIndexed(ctx context.Context, streamID string, expectedS
 	return nil
 }
 
+// RepairIndex applies Put and Delete ops with no events (see IndexedStore).
+func (m *MemStore) RepairIndex(ctx context.Context, ops []IndexOp) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("memstore: context: %w", err)
+	}
+	if err := ValidateRepair(ops); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failAppend != nil {
+		err := m.failAppend
+		m.failAppend = nil
+		return fmt.Errorf("memstore: repair-index failed (not committed): %w", err)
+	}
+	x := m.idx()
+	for _, op := range ops {
+		p := x.part(op.Table, op.Key)
+		switch op.Kind {
+		case IndexPut:
+			p[op.GameID] = memRow{
+				entry: UserEntry{GameID: op.GameID, Seat: op.Seat, EndedAt: op.EndedAt},
+				live:  LiveEntry{GameID: op.GameID, OwnerNode: op.OwnerNode, OwnerIncarnation: op.OwnerIncarnation},
+				exp:   op.ExpiresAt,
+			}
+		case IndexDelete:
+			delete(p, op.GameID)
+		}
+	}
+	return nil
+}
+
 // LiveGames returns the shard's entries in game id order.
 func (m *MemStore) LiveGames(ctx context.Context, shard int) ([]LiveEntry, error) {
 	if err := ctx.Err(); err != nil {

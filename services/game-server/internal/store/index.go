@@ -166,6 +166,26 @@ func (s *Store) AppendIndexed(ctx context.Context, streamID string, expectedSeq 
 	return s.appendTx(ctx, streamID, expectedSeq, evs, ops)
 }
 
+// RepairIndex applies Put and Delete ops in one TransactWriteItems with no
+// events (see game.IndexedStore).
+func (s *Store) RepairIndex(ctx context.Context, ops []game.IndexOp) error {
+	if err := game.ValidateRepair(ops); err != nil {
+		return err
+	}
+	writes := make([]ddbtypes.TransactWriteItem, 0, len(ops))
+	for _, op := range ops {
+		w, err := indexWrite(op)
+		if err != nil {
+			return err
+		}
+		writes = append(writes, w)
+	}
+	if _, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: writes}); err != nil {
+		return fmt.Errorf("store: repair index: %w", err)
+	}
+	return nil
+}
+
 // queryIndex reads every page of one partition (strongly consistent: adoption
 // and AUTHENTICATE decide on what they read) and returns the raw items.
 func (s *Store) queryIndex(ctx context.Context, t game.IndexTable, key string, newestFirst bool) ([]map[string]ddbtypes.AttributeValue, error) {

@@ -146,6 +146,20 @@ func TestAdoptSkipsAnEndedGame(t *testing.T) {
 	if _, live := srv.reg.Get(gameID); live || running(srv, gameID) || srv.gt.tracked(gameID) {
 		t.Fatal("an ended game was started")
 	}
+	// GS-8 4.4: its stale rows are repaired. The live rows go, each player
+	// gets a recent row (the result is delivered once), and a second start
+	// finds nothing to adopt.
+	for _, u := range []string{"alice", "bob"} {
+		if rows, _ := st.UserLiveGames(context.Background(), u, 10); len(rows) != 0 {
+			t.Fatalf("%s still has live rows after the repair: %v", u, rows)
+		}
+		if rows, _ := st.UserRecentGames(context.Background(), u, 10); len(rows) != 1 || rows[0].GameID != gameID {
+			t.Fatalf("%s recent rows after the repair: %v", u, rows)
+		}
+	}
+	if adopted, skipped, _, _ := srv.AdoptLive(context.Background(), 4); adopted+skipped != 0 {
+		t.Fatalf("second AdoptLive found %d games, want none", adopted+skipped)
+	}
 }
 
 // Drops, rebuilds and restarts racing each other: once they stop, the live game
@@ -256,4 +270,7 @@ func TestDropBetweenBuildAndSeatFillLeavesNoEntry(t *testing.T) {
 	if running(h.srv, gameID) {
 		t.Fatal("a ticker is running for a dropped game")
 	}
+}
+func (f *flakyLoad) RepairIndex(ctx context.Context, ops []game.IndexOp) error {
+	return f.inner().RepairIndex(ctx, ops)
 }

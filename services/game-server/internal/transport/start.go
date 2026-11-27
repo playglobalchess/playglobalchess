@@ -40,6 +40,7 @@ func (s *Server) startGame(ctx context.Context, gameID, tcID string, players map
 			return nil, err
 		}
 		if game.HasEnding(events) {
+			s.repairEndedRows(ctx, gameID, events)
 			return nil, fmt.Errorf("%w: %s", errGameEnded, gameID)
 		}
 		players = map[uint8]string{}
@@ -81,10 +82,41 @@ func (s *Server) startGame(ctx context.Context, gameID, tcID string, players map
 	return sess, nil
 }
 
+// repairEndedRows brings the index rows of a game whose stream has ended into
+// line with it (GS-8 section 4.4): its live rows go and each player gets a
+// user_recent_games row, so the result is still delivered once. Rows are left
+// by an ending written without them (persist's fallback) or by a pre-index
+// ending. A failure is logged: the next start or login tries again.
+func (s *Server) repairEndedRows(ctx context.Context, gameID string, events []game.Event) {
+	if s.idxCfg == nil {
+		return
+	}
+	st, ok := s.reg.store.(game.IndexedStore)
+	if !ok {
+		return
+	}
+	var players []string
+	for _, ev := range events {
+		if pj := ev.PlayerJoined; pj != nil {
+			for len(players) <= int(pj.SeatIdx) {
+				players = append(players, "")
+			}
+			players[pj.SeatIdx] = pj.UserID
+		}
+	}
+	ops, err := s.idxCfg.EndingOps(gameID, players, s.now())
+	if err == nil {
+		err = st.RepairIndex(ctx, ops)
+	}
+	if err != nil {
+		log.Printf("index: repairing the rows of ended game %s: %v", gameID, err)
+	}
+}
+
 // AdoptLive starts every game in the live-game index (GS-8 section 4.4), oldest
 // first (UUIDv7 ids sort by time), with bounded concurrency. It needs SetIndex.
-// A game whose stream has already ended is skipped and counted in skipped (its
-// stale row is left: the index rows are hints and readers fold the stream). A
+// A game whose stream has already ended is skipped and counted in skipped; its
+// stale rows are repaired (repairEndedRows). A
 // game that fails to start is retried once after the first pass, then logged;
 // its players' reconnect starts it (2c-2). A store outage on a shard read is
 // retried with capped backoff until ctx ends, so a node that starts while the
