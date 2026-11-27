@@ -143,7 +143,7 @@ unit-testable without Redis:
 On a successful atomic **claim** of A and B (the pair is reserved in Redis, not
 yet removed), in this exact order so a crash never consumes a seeker without a
 created game (Q-MM6):
-1. allocate `game_id` = a v4 UUID; `stream_id = StreamIDFor(game_id)`.
+1. allocate `game_id` = a UUIDv7 (time-ordered; GS-8 stage 1 step 2 changed it from v4, 2026-11-27, so an index keyed by `game_id` sorts newest first and the creation time is recoverable); `stream_id = StreamIDFor(game_id)`.
 2. assign seats + colors (Q-MM3): seat 0 / seat 1, colors white/black.
 3. build `GameCreated{pool_id, rated, seats:[{0,white},{1,black}], start_fen =
    Standard startpos string, time_control}` + `PlayerJoined{0, A}` +
@@ -218,7 +218,7 @@ events.
 ## 8. Test plan
 
 - **Pairing core (pure, no Redis):** closest-rating match within the window;
-  widening over the oldest seeker's age; no self-pair; rated/unrated invariant;
+  widening over the oldest seeker's age; no self-pair, by seek or by user (#227: one user's two seeks never pair); rated/unrated invariant;
   deterministic tie-break — table-driven against fixed waiting sets.
 - **Atomic claim (Redis):** two concurrent `TryClaim` for the same waiting seeker
   → exactly one match, the other re-queued; asserted against a real Redis

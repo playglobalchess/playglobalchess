@@ -104,6 +104,10 @@ type State struct {
 	StartKeyed   bool
 
 	Joined []bool // indexed by seat_idx
+	// Players is the user id of each seat, indexed by seat_idx, from PlayerJoined
+	// (empty until that seat has joined). The ending write names the index keys
+	// from it (GS-8 §4.3), and an adopted game rebuilds its seat map from it.
+	Players []string
 
 	// Live play.
 	Ply     uint32
@@ -336,6 +340,7 @@ func applyGameCreated(s State, ev Event, tc clock.TimeControl) (State, error) {
 	s.CurFEN = b.StartFEN
 	s.BaseMs = tc.BaseMs
 	s.Joined = make([]bool, len(b.Seats))
+	s.Players = make([]string, len(b.Seats))
 	s.Ply = 0
 	s.TurnIdx = 0
 	s.Clock = cl
@@ -363,6 +368,8 @@ func applyPlayerJoined(s State, ev Event) (State, error) {
 	}
 	s.Joined = append([]bool(nil), s.Joined...)
 	s.Joined[b.SeatIdx] = true
+	s.Players = append([]string(nil), s.Players...)
+	s.Players[b.SeatIdx] = b.UserID
 	all := true
 	for _, j := range s.Joined {
 		if !j {

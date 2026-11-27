@@ -160,7 +160,10 @@ func (m *Matchmaker) Seek(ctx context.Context, s Seeker) (Match, bool, error) {
 // AppendBatch — Q-MM4). seat 0 = white, seat 1 = black; the coin decides which
 // seeker takes white (Q-MM3).
 func (m *Matchmaker) createGame(ctx context.Context, a, b Seeker) (Match, error) {
-	gameID := uuid.NewString()
+	gameID, err := game.NewGameID()
+	if err != nil {
+		return Match{}, fmt.Errorf("matchmaking: %w", err)
+	}
 	streamID := game.StreamIDFor(gameID)
 
 	// Coin flip: whiteSeeker takes seat 0 (white), the other seat 1 (black).
