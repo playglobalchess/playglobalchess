@@ -4,12 +4,12 @@
 |---|---|
 | Spec ID | SPEC-S2-GAME-SERVER-GS9 (closes GS-6 Q-GS6f; amends GS-6 §3.5, GS-7 §3.5, GS-8 §4.1, PROTOCOL §4A) |
 | Owner | S2 Real-time |
-| Status | DRAFT |
+| Status | DRAFT (owner approved v0.8 on 2026-11-27, see Owner decisions; v0.8 has had no independent review, and the v0.7 review found 0 blockers; not RATIFIED because no other stream has signed) |
 | Version | 0.8 (v0.7 plus the v0.7 review: the ticker's no-proof wait, the client release rule, the proof gate after the clock-free rows, merged gaps, bounded abort writes) |
 | Last updated | 2026-11-27 |
 | Fixes (issues) | #207; also supplies the restart-downtime rule GS-8 stage 1 needs (GS-8 Q1) |
 | Depends on | GS-8 stage 1 step 2 (`startGame`, adoption, UUIDv7 game ids); GS-4; GS-6 (ticker, #97, #182); GS-7 (fold, `LastChangeTS`, #124, #183) |
-| Owner decisions | 2026-11-27: exact credit, T = 2 min, no bonus time. 2026-11-27: the client, not the server, holds a move made during a pause |
+| Owner decisions | 2026-11-27: exact credit, T = 2 min, no bonus time. 2026-11-27: the client, not the server, holds a move made during a pause. 2026-11-27: Ashikuma approved v0.8 and every item the owner signs in section 12. This records his attestation; no other stream has signed |
 
 Paths in this spec are relative to `services/game-server/internal/` and were
 read at commit 248b9ab (the code is identical at 9f0e8e9, and v0.7 re-read the
