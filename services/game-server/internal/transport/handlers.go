@@ -828,12 +828,14 @@ func (s *Server) broadcastGameEnd(gameID string) endOutcome {
 			s.recordMissedEnd(uid, gameID, seat)
 		}
 	}
-	// With the index on, a seat that saw GAME_END consumes its recent row.
-	s.consumeRecent(ctx, gameID, delivered)
+
 	// The game is over; drop the live session so the node reclaims it. The stream
 	// persists in the store, and endedState rebuilds a read-only ended view from
 	// it for a late reconnect (missed ending) or a RESYNC (#102).
 	s.dropGame(gameID)
+	// With the index on, a seat that saw GAME_END consumes its recent row. It
+	// runs after the drop, so a slow store holds neither the claim nor the game.
+	s.consumeRecent(ctx, gameID, delivered)
 	return endSent
 }
 

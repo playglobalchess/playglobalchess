@@ -147,3 +147,86 @@ func TestForgedLiveRowGivesNoSeat(t *testing.T) {
 		t.Fatalf("mallory's move: %+v", m.MoveRejected)
 	}
 }
+
+// B1 (review): one player's stale live row never re-creates a recent row the
+// other player consumed when they saw GAME_END live.
+func TestRepairNeverRecreatesAConsumedRecentRow(t *testing.T) {
+	h, st := indexedHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	ca, cb, gameID, seatA, _ := pair(t, h, ctx, "alice", "bob")
+	ca.feedClient(t, codec.ClientMsg{Type: codec.CMResign, GameID: gameID})
+	ca.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	cb.waitForServer(t, codec.SMGameEnd, 2*time.Second)
+	waitUntil(t, 2*time.Second, "both recent rows to be consumed", func() bool {
+		a, _ := st.UserRecentGames(ctx, "alice", 5)
+		b, _ := st.UserRecentGames(ctx, "bob", 5)
+		return len(a) == 0 && len(b) == 0
+	})
+	stale := game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexPut, Key: "alice", GameID: gameID, Seat: seatA}
+	if err := st.RepairIndex(ctx, []game.IndexOp{stale}); err != nil {
+		t.Fatal(err)
+	}
+	c := reconnect(t, h, ctx, "alice")
+	c.waitForServer(t, codec.SMState, 2*time.Second) // her own stale row: pushed once
+	time.Sleep(100 * time.Millisecond)
+	if b, _ := st.UserRecentGames(ctx, "bob", 5); len(b) != 0 {
+		t.Fatalf("alice's login re-created bob's consumed recent row: %v", b)
+	}
+	reconnect(t, h, ctx, "bob").noServerMsg(t, codec.SMState, 150*time.Millisecond)
+}
+
+// B2 (review): a live game that cannot be started at login (a store error)
+// refuses the login, so the user cannot SEEK into a second game.
+func TestLiveGameStartFailureRefusesTheLogin(t *testing.T) {
+	h, _ := indexedHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	_, _, gameID, _, _ := pair(t, h, ctx, "alice", "bob")
+	h.srv.dropGame(gameID) // as after a restart: the login must build it
+	h.srv.reg.store = &flakyLoad{EventStore: h.store, fails: 1}
+	c := reconnect(t, h, ctx, "alice")
+	if m := c.waitForServer(t, codec.SMError, 2*time.Second); m.Error.Code != codec.ECInternal {
+		t.Fatalf("error after a failed start: %+v", m.Error)
+	}
+	waitUntil(t, 2*time.Second, "the connection to close", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.closed
+	})
+	if m := reconnect(t, h, ctx, "alice").waitForServer(t, codec.SMState, 2*time.Second); m.State.GameID != gameID {
+		t.Fatalf("login after recovery: %+v", m.State)
+	}
+}
+
+// S1 (review): one user in both seats consumes one row, not a refused write.
+func TestConsumeRecentDedupesUsers(t *testing.T) {
+	h, st := indexedHarness(t)
+	defer h.cancel()
+	ctx := context.Background()
+	gid := "018f0000-0000-7000-8000-00000000cccc"
+	put := game.IndexOp{Table: game.IdxUserRecent, Kind: game.IndexPut, Key: "solo", GameID: gid, EndedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+	if err := st.RepairIndex(ctx, []game.IndexOp{put}); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.consumeRecent(ctx, gid, []string{"solo", "solo"})
+	if r, _ := st.UserRecentGames(ctx, "solo", 5); len(r) != 0 {
+		t.Fatalf("recent row left after consuming a repeated user: %v", r)
+	}
+}
+
+type recentFails struct{ *game.MemStore }
+
+func (recentFails) UserRecentGames(context.Context, string, int) ([]game.UserEntry, error) {
+	return nil, errors.New("fault: index down")
+}
+
+func TestFailedRecentLookupRefusesTheConnection(t *testing.T) {
+	h, _ := indexedHarness(t)
+	defer h.cancel()
+	h.srv.reg.store = recentFails{h.store.(*game.MemStore)}
+	c := reconnect(t, h, context.Background(), "carol")
+	if m := c.waitForServer(t, codec.SMError, 2*time.Second); m.Error.Code != codec.ECInternal {
+		t.Fatalf("error after a failed recent lookup: %+v", m.Error)
+	}
+}

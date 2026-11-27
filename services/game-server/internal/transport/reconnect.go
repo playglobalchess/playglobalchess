@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 
 	"github.com/playglobalchess/playglobalchess/services/game-server/internal/codec"
@@ -17,6 +18,10 @@ import (
 
 // userLiveLimit is how many of a user's live games AUTHENTICATE restores.
 const userLiveLimit = 8
+
+// userRecentLimit bounds the missed endings one login pushes (newest first);
+// older ones are still pushed at a later login, until their TTL.
+const userRecentLimit = 32
 
 // indexStore returns the index store when the index is on.
 func (s *Server) indexStore() (game.IndexedStore, bool) {
@@ -40,7 +45,7 @@ func (s *Server) lookupUser(ctx context.Context, st game.IndexedStore, uid strin
 	if err != nil {
 		return userIndex{}, err
 	}
-	recent, err := st.UserRecentGames(ctx, uid, 0)
+	recent, err := st.UserRecentGames(ctx, uid, userRecentLimit)
 	if err != nil {
 		return userIndex{}, err
 	}
@@ -56,7 +61,12 @@ func (s *Server) consumeRecent(ctx context.Context, gameID string, uids []string
 		return
 	}
 	ops := make([]game.IndexOp, 0, len(uids))
+	seen := map[string]bool{}
 	for _, uid := range uids {
+		if seen[uid] {
+			continue // one user in both seats: one row, and a repeated item is refused
+		}
+		seen[uid] = true
 		ops = append(ops, game.IndexOp{Table: game.IdxUserRecent, Kind: game.IndexDelete, Key: uid, GameID: gameID})
 	}
 	if err := st.RepairIndex(ctx, ops); err != nil {
@@ -69,28 +79,38 @@ func (s *Server) consumeRecent(ctx context.Context, gameID string, uids []string
 // rebound and STATE pushed; each recently ended game is pushed once as an ended
 // STATE and its row consumed. The seat comes from the stream (startGame fills
 // it), never from the row: the row is a hint.
-func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix userIndex) {
+//
+// It returns an error when a live game could not be started or read for a
+// reason that may pass (a store error). The caller then refuses the login, as
+// for a failed lookup: a user whose live game could not be restored must not
+// be able to SEEK into a second one. A row that is wrong for good (no such
+// stream, or a stream that does not seat the user) is deleted instead.
+func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix userIndex) error {
 	uid := st.userID
 	pushed := map[string]bool{}
 	for _, row := range ix.live {
 		sess, err := s.startGame(ctx, row.GameID, "", nil)
 		switch {
 		case errors.Is(err, errGameEnded):
-			// The row was stale and startGame repaired it into a recent row;
-			// push the ending below.
+			// A stale row: the ending was written without its rows. Drop this
+			// user's live row and push the ending below, once.
+			s.dropStaleLiveRows(ctx, row.GameID, uid)
 			ix.recent = append(ix.recent, game.UserEntry{GameID: row.GameID, Seat: row.Seat})
 			continue
-		case err != nil:
-			log.Printf("transport: AUTHENTICATE of %s: starting live game %s: %v", uid, row.GameID, err)
+		case errors.Is(err, errNoStream):
+			s.dropUserLiveRow(ctx, row.GameID, uid)
 			continue
+		case err != nil:
+			return fmt.Errorf("starting live game %s: %w", row.GameID, err)
 		}
 		seat, ok := s.seatOfUser(row.GameID, uid)
 		if !ok {
-			continue // the stream does not seat this user: a bad row
+			s.dropUserLiveRow(ctx, row.GameID, uid) // the stream does not seat this user
+			continue
 		}
 		snap, err := sess.StateSnapshot(ctx)
 		if err != nil {
-			continue
+			return fmt.Errorf("reading live game %s: %w", row.GameID, err)
 		}
 		s.bindSeat(c, st, row.GameID, seat)
 		s.send(ctx, c, codec.ServerMsg{Type: codec.SMState, State: &codec.StatePayload{
@@ -108,13 +128,28 @@ func (s *Server) resyncFromIndex(ctx context.Context, c Conn, st *connState, ix 
 		case errors.Is(err, errNotEnded):
 			continue // a recent row for a live game cannot be written; ignore it
 		case err != nil:
+			// An ended game cannot pair the user anywhere, so this is not worth
+			// refusing the login for; the row stays and a later login retries.
 			log.Printf("transport: AUTHENTICATE of %s: ended view of %s: %v", uid, row.GameID, err)
-			continue // the row stays, so a later login retries
+			continue
 		case !seated:
 			s.consumeRecent(ctx, row.GameID, []string{uid}) // a bad row: drop it
 		case s.send(ctx, c, endedStateMsg(row.GameID, snap, seat)):
 			s.consumeRecent(ctx, row.GameID, []string{uid})
 		}
+	}
+	return nil
+}
+
+// dropUserLiveRow deletes one user_live_games row that is wrong for good.
+func (s *Server) dropUserLiveRow(ctx context.Context, gameID, uid string) {
+	st, ok := s.indexStore()
+	if !ok {
+		return
+	}
+	op := game.IndexOp{Table: game.IdxUserLive, Kind: game.IndexDelete, Key: uid, GameID: gameID}
+	if err := st.RepairIndex(ctx, []game.IndexOp{op}); err != nil {
+		log.Printf("index: dropping a bad live row of %s for %s: %v", gameID, uid, err)
 	}
 }
 
