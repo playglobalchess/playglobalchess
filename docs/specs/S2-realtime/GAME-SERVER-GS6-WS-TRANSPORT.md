@@ -484,8 +484,10 @@ closed by) the §4A v1.1 amendment:
   those players lose on time through no fault of their own. Options: (a) leave
   as is; (b) a grace period, so no flag lands within N seconds of the store
   recovering, where N is at least the outage length; (c) pause every live clock
-  while the node detects a store outage, and resume on recovery. Not decided;
-  today's behaviour is (a).
+  while the node detects a store outage, and resume on recovery. **Decided by the
+  owner 2026-11-26: credit time for short outages, abort after long ones (#207).
+  The design is SPEC-S2-GAME-SERVER-GS9 (DRAFT); until it is built, today's
+  behaviour is (a).**
 - **Q-GS6a — WS library.** `nhooyr.io/websocket` (modern, context-aware, smaller)
   vs `gorilla/websocket` (ubiquitous, battle-tested). **Proposed:
   nhooyr.io/websocket** (context.Context-native, cleaner read/write API fitting
