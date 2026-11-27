@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func TestAdoptAtStartArmsTheDeadlineTicker(t *testing.T) {
 	_, _, gameID := pairTiny(t, h) // alice and bob, two plies in, the old node's clock is frozen
 	srv := restartedNode(t, h, 10*time.Minute)
 
-	adopted, failed, err := srv.AdoptLive(context.Background(), 4)
+	adopted, _, failed, err := srv.AdoptLive(context.Background(), 4)
 	if err != nil || adopted != 1 || failed != 0 {
 		t.Fatalf("AdoptLive: adopted=%d failed=%d err=%v, want 1/0/nil", adopted, failed, err)
 	}
@@ -64,27 +65,85 @@ func TestAdoptAtStartArmsTheDeadlineTicker(t *testing.T) {
 func TestAdoptNeedsTheIndex(t *testing.T) {
 	h := newHarness(t)
 	defer h.cancel()
-	if _, _, err := h.srv.AdoptLive(context.Background(), 4); err == nil {
+	if _, _, _, err := h.srv.AdoptLive(context.Background(), 4); err == nil {
 		t.Fatal("AdoptLive ran with the index off")
 	}
 }
 
-// A second AdoptLive (or a reconnect start) of a running game shares its
-// session and does not arm a second ticker.
+// running reports whether the game's flag ticker goroutine is running.
+func running(s *Server, gameID string) bool {
+	s.tickerMu.Lock()
+	defer s.tickerMu.Unlock()
+	_, ok := s.tickers[gameID]
+	return ok
+}
+
+// Starting a running game again shares its session and starts no second
+// ticker: exactly one goroutine checks the game.
 func TestStartGameArmsOneTicker(t *testing.T) {
 	h, _ := indexedHarness(t)
 	defer h.cancel()
+	var mu sync.Mutex
+	exits := 0
+	h.srv.tickerExited = func(string) { mu.Lock(); exits++; mu.Unlock() }
 	_, _, gameID := pairTiny(t, h)
 	for i := 0; i < 3; i++ {
-		if _, err := h.srv.startGame(context.Background(), gameID, roleResync); err != nil {
+		if _, err := h.srv.startGame(context.Background(), gameID, "", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	sh := h.srv.gt.shard(gameID)
-	sh.mu.Lock()
-	armed := sh.games[gameID].ticker
-	sh.mu.Unlock()
-	if !armed {
-		t.Fatal("ticker latch not set")
+	h.srv.dropGame(gameID)
+	waitUntil(t, 2*time.Second, "the ticker to exit", func() bool { return !running(h.srv, gameID) })
+	time.Sleep(100 * time.Millisecond) // let any second goroutine exit too
+	mu.Lock()
+	defer mu.Unlock()
+	if exits != 1 {
+		t.Fatalf("%d ticker goroutines ran for one game, want 1", exits)
+	}
+}
+
+// B1 (review): a game dropped and then rebuilt gets a ticker again, and no
+// entry is left behind for the dropped game.
+func TestDropThenRebuildRearmsTheTicker(t *testing.T) {
+	h, _ := indexedHarness(t)
+	defer h.cancel()
+	w := watchTickers(h)
+	_, _, gameID := pairTiny(t, h)
+	h.srv.dropGame(gameID)
+	waitUntil(t, 2*time.Second, "the old ticker to exit", func() bool { return w.gone(gameID) && !running(h.srv, gameID) })
+	if h.srv.gt.tracked(gameID) {
+		t.Fatal("transport entry left for a dropped game")
+	}
+	if _, err := h.srv.startGame(context.Background(), gameID, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 2*time.Second, "a ticker for the rebuilt game", func() bool { return running(h.srv, gameID) })
+	if users := h.srv.seatUsers(gameID); len(users) != 2 {
+		t.Fatalf("seat map after rebuild = %v", users)
+	}
+}
+
+// S2 (review): adoption skips a game whose stream already ended (a stale live
+// row) and starts nothing for it.
+func TestAdoptSkipsAnEndedGame(t *testing.T) {
+	h, st := indexedHarness(t)
+	_, _, gameID := pairTiny(t, h)
+	// Leave the live row in place, as a refused index write would, and end the
+	// stream with a plain write.
+	evs, err := st.Load(context.Background(), game.StreamIDFor(gameID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := game.Event{Type: game.EvGameEnded, GameEnded: &game.GameEnded{ResultVector: []game.Result{game.ResultDraw, game.ResultDraw}, Termination: game.TermDrawAgree}}
+	if err := st.AppendBatch(context.Background(), game.StreamIDFor(gameID), uint32(len(evs)), []game.Event{end}); err != nil {
+		t.Fatal(err)
+	}
+	srv := restartedNode(t, h, time.Minute)
+	adopted, skipped, failed, err := srv.AdoptLive(context.Background(), 4)
+	if err != nil || adopted != 0 || skipped != 1 || failed != 0 {
+		t.Fatalf("AdoptLive: adopted=%d skipped=%d failed=%d err=%v, want 0/1/0", adopted, skipped, failed, err)
+	}
+	if _, live := srv.reg.Get(gameID); live || running(srv, gameID) || srv.gt.tracked(gameID) {
+		t.Fatal("an ended game was started")
 	}
 }

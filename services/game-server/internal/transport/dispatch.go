@@ -39,6 +39,11 @@ type Server struct {
 	// endReadTimeout overrides endBroadcastTimeout (tests only; 0 = default).
 	endReadTimeout time.Duration
 
+	// tickers holds the games whose flag ticker goroutine is running, so a game
+	// has at most one, and a rebuild after a drop gets one again (GS-8 4.2).
+	tickerMu sync.Mutex
+	tickers  map[string]struct{}
+
 	// idxCfg is the live-game index config, set by SetIndex (nil = index off).
 	idxCfg *game.IndexConfig
 

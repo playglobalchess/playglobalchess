@@ -57,8 +57,8 @@ func main() {
 	// Restart recovery (GS-8 section 4.4): start every live game in the index.
 	// It runs in the background so connections are served while it works.
 	go func() {
-		n, failed, err := srv.AdoptLive(ctx, 32)
-		log.Printf("e2e-server: adopted %d live games (%d failed to start): %v", n, failed, err)
+		n, skipped, failed, err := srv.AdoptLive(ctx, 32)
+		log.Printf("e2e-server: adopted %d live games (%d already ended, %d failed to start): %v", n, skipped, failed, err)
 	}()
 
 	mux := http.NewServeMux()
